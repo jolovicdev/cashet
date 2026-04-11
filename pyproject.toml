@@ -1,0 +1,69 @@
+[project]
+name = "cashet"
+version = "0.1.1"
+description = "Content-addressable compute cache with git semantics"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "jolovicdev", email = "dusan.jolovic@proton.me" }
+]
+keywords = ["cache", "dag", "compute", "content-addressable", "pipeline"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "rich>=13.0",
+]
+
+[project.urls]
+Repository = "https://github.com/jolovicdev/cashet"
+
+[project.scripts]
+cashet = "cashet.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cashet"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.11",
+    "pyright>=1.1",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 99
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "RUF"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["src/cashet"]
+ignore = ["tests"]
+venvPath = "."
+venv = ".venv"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownLambdaType = "none"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

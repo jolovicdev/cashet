@@ -1,0 +1,40 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Protocol, runtime_checkable
+
+from cashet.models import Commit, ObjectRef, TaskDef, TaskStatus
+
+
+@runtime_checkable
+class Store(Protocol):
+    def put_blob(self, data: bytes) -> ObjectRef: ...
+    def get_blob(self, ref: ObjectRef) -> bytes: ...
+    def put_commit(self, commit: Commit) -> None: ...
+    def get_commit(self, hash: str) -> Commit | None: ...
+    def find_by_fingerprint(self, fingerprint: str) -> Commit | None: ...
+    def list_commits(
+        self,
+        func_name: str | None = None,
+        limit: int = 50,
+        status: TaskStatus | None = None,
+        tags: dict[str, str | None] | None = None,
+    ) -> list[Commit]: ...
+    def get_history(self, hash: str) -> list[Commit]: ...
+    def stats(self) -> dict[str, int]: ...
+    def evict(self, older_than: datetime) -> int: ...
+    def delete_commit(self, hash: str) -> bool: ...
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class Executor(Protocol):
+    def submit(
+        self,
+        func: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        task_def: TaskDef,
+        store: Store,
+        serializer: Any,
+    ) -> tuple[Commit, bool]: ...
