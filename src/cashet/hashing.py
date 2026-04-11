@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import inspect
+import io
 import os
 import site
 import sys
@@ -74,10 +75,7 @@ class SafePickleSerializer:
         import pickle
 
         allowed = self._allowed
-        blocked_msg = (
-            " — not in allowlist. "
-            "Pass it via SafePickleSerializer(extra_classes=[...])."
-        )
+        blocked_msg = " — not in allowlist. Pass it via SafePickleSerializer(extra_classes=[...])."
 
         class _RestrictedUnpickler(pickle.Unpickler):
             def find_class(self, module: str, name: str) -> Any:  # type: ignore[override]
@@ -273,47 +271,125 @@ def hash_function(
     return h.hexdigest()
 
 
-def _stable_repr(obj: Any) -> str:
+def _stable_repr_to(buf: io.StringIO, obj: Any) -> None:
     if obj is None:
-        return "None"
-    if isinstance(obj, (bool, int, float, str, bytes)):
-        return repr(obj)
-    if isinstance(obj, (list, tuple)):
-        items = ", ".join(_stable_repr(item) for item in obj)
-        brackets = "[]" if isinstance(obj, list) else "()"
-        return f"{brackets[0]}{items}{brackets[1]}"
-    if isinstance(obj, set):
-        items = ", ".join(_stable_repr(item) for item in sorted(obj, key=repr))
-        return "{" + items + "}"
-    if isinstance(obj, frozenset):
-        items = ", ".join(_stable_repr(item) for item in sorted(obj, key=repr))
-        return f"frozenset({{{items}}})"
-    if isinstance(obj, dict):
-        pairs = ", ".join(
-            f"{_stable_repr(key)}: {_stable_repr(val)}"
-            for key, val in sorted(obj.items(), key=lambda p: repr(p[0]))
-        )
-        return "{" + pairs + "}"
-    if isinstance(obj, types.FunctionType):
-        return f"<func:{hash_function(obj)}>"
-    if isinstance(obj, type):
-        return f"<type:{obj.__module__}.{obj.__qualname__}>"
-    if hasattr(obj, "__cashet_ref__"):
-        return f"<ref:{obj.__cashet_ref__().hash}>"
-    if hasattr(obj, "__dict__"):
-        return f"<{type(obj).__qualname__}:{_stable_repr(obj.__dict__)}>"
-    return repr(obj)
+        buf.write("None")
+    elif isinstance(obj, (bool, int, float, str, bytes)):
+        buf.write(repr(obj))
+    elif isinstance(obj, (list, tuple)):
+        buf.write("[" if isinstance(obj, list) else "(")
+        first = True
+        for item in obj:
+            if not first:
+                buf.write(", ")
+            first = False
+            _stable_repr_to(buf, item)
+        buf.write("]" if isinstance(obj, list) else ")")
+    elif isinstance(obj, set):
+        buf.write("{")
+        first = True
+        for item in sorted(obj, key=repr):
+            if not first:
+                buf.write(", ")
+            first = False
+            _stable_repr_to(buf, item)
+        buf.write("}")
+    elif isinstance(obj, frozenset):
+        buf.write("frozenset({")
+        first = True
+        for item in sorted(obj, key=repr):
+            if not first:
+                buf.write(", ")
+            first = False
+            _stable_repr_to(buf, item)
+        buf.write("})")
+    elif isinstance(obj, dict):
+        buf.write("{")
+        first = True
+        for key, val in sorted(obj.items(), key=lambda p: repr(p[0])):
+            if not first:
+                buf.write(", ")
+            first = False
+            _stable_repr_to(buf, key)
+            buf.write(": ")
+            _stable_repr_to(buf, val)
+        buf.write("}")
+    elif isinstance(obj, types.FunctionType):
+        buf.write(f"<func:{hash_function(obj)}>")
+    elif isinstance(obj, type):
+        buf.write(f"<type:{obj.__module__}.{obj.__qualname__}>")
+    elif hasattr(obj, "__cashet_ref__"):
+        buf.write(f"<ref:{obj.__cashet_ref__().hash}>")
+    elif hasattr(obj, "__dict__"):
+        buf.write(f"<{type(obj).__qualname__}:")
+        _stable_repr_to(buf, obj.__dict__)
+        buf.write(">")
+    else:
+        buf.write(repr(obj))
+
+
+def _length_prefixed(tag: bytes, data: bytes) -> bytes:
+    return tag + len(data).to_bytes(4, "big") + data
+
+
+def _stable_hash(obj: Any, h: Any) -> None:
+    if obj is None:
+        h.update(b"N")
+    elif isinstance(obj, bool):
+        h.update(b"T" if obj else b"F")
+    elif isinstance(obj, int):
+        h.update(_length_prefixed(b"I", str(obj).encode()))
+    elif isinstance(obj, float):
+        h.update(_length_prefixed(b"F", repr(obj).encode()))
+    elif isinstance(obj, str):
+        h.update(_length_prefixed(b"S", obj.encode()))
+    elif isinstance(obj, bytes):
+        h.update(_length_prefixed(b"B", obj))
+    elif isinstance(obj, (list, tuple)):
+        h.update(b"[" if isinstance(obj, list) else b"(")
+        for item in obj:
+            _stable_hash(item, h)
+        h.update(b"]" if isinstance(obj, list) else b")")
+    elif isinstance(obj, set):
+        h.update(b"set{")
+        for item in sorted(obj, key=repr):
+            _stable_hash(item, h)
+        h.update(b"}")
+    elif isinstance(obj, frozenset):
+        h.update(b"fset{")
+        for item in sorted(obj, key=repr):
+            _stable_hash(item, h)
+        h.update(b"}")
+    elif isinstance(obj, dict):
+        h.update(b"dict{")
+        for key, val in sorted(obj.items(), key=lambda p: repr(p[0])):
+            _stable_hash(key, h)
+            _stable_hash(val, h)
+        h.update(b"}")
+    elif isinstance(obj, types.FunctionType):
+        h.update(b"func:" + hash_function(obj).encode())
+    elif isinstance(obj, type):
+        h.update(b"type:" + f"{obj.__module__}.{obj.__qualname__}".encode())
+    elif hasattr(obj, "__cashet_ref__"):
+        h.update(b"ref:" + obj.__cashet_ref__().hash.encode())
+    elif hasattr(obj, "__dict__"):
+        h.update(type(obj).__qualname__.encode() + b":")
+        _stable_hash(obj.__dict__, h)
+    else:
+        h.update(repr(obj).encode())
 
 
 def hash_args(*args: Any, **kwargs: Any) -> str:
     h = hashlib.sha256()
-    h.update(_stable_repr(args).encode())
-    h.update(_stable_repr(kwargs).encode())
+    _stable_hash(args, h)
+    _stable_hash(kwargs, h)
     return h.hexdigest()
 
 
 def serialize_args(*args: Any, **kwargs: Any) -> bytes:
-    return _stable_repr((args, kwargs)).encode()
+    buf = io.StringIO()
+    _stable_repr_to(buf, (args, kwargs))
+    return buf.getvalue().encode()
 
 
 def build_task_def(

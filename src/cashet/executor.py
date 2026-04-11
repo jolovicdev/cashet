@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import traceback
 from typing import Any
 
@@ -15,6 +16,9 @@ from cashet.protocols import Store
 
 
 class LocalExecutor:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
     def submit(
         self,
         func: Any,
@@ -24,17 +28,18 @@ class LocalExecutor:
         store: Store,
         serializer: Serializer,
     ) -> tuple[Commit, bool]:
-        input_refs = resolve_input_refs(args, kwargs)
-        existing = find_existing_commit(store, task_def)
-        if existing is not None:
-            existing.status = TaskStatus.CACHED
-            store.put_commit(existing)
-            return existing, True
+        with self._lock:
+            input_refs = resolve_input_refs(args, kwargs)
+            existing = find_existing_commit(store, task_def)
+            if existing is not None:
+                existing.status = TaskStatus.CACHED
+                store.put_commit(existing)
+                return existing, True
 
-        parent_hash = find_parent_hash(store, task_def)
-        commit = build_commit(task_def, input_refs, parent_hash=parent_hash)
-        commit = self._execute(func, args, kwargs, commit, store, serializer)
-        return commit, False
+            parent_hash = find_parent_hash(store, task_def)
+            commit = build_commit(task_def, input_refs, parent_hash=parent_hash)
+            commit = self._execute(func, args, kwargs, commit, store, serializer)
+            return commit, False
 
     def _execute(
         self,

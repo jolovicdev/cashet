@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, cast, overload
 
-from cashet.dag import ResultRef
+from cashet.dag import ResultRef, TaskRef
 from cashet.executor import LocalExecutor
 from cashet.hashing import PickleSerializer, Serializer, build_task_def
 from cashet.models import Commit, TaskStatus
@@ -14,6 +15,7 @@ from cashet.protocols import Executor, Store
 from cashet.store import SQLiteStore
 
 _DEFAULT_STORE_DIR = ".cashet"
+_CASHET_DIR_ENV = "CASHET_DIR"
 _DIFF_SIZE_LIMIT = 10 * 1024 * 1024
 _DEFAULT_GC_TTL_DAYS = 30
 
@@ -29,9 +31,13 @@ class Client:
         if store is not None:
             self.store: Store = store
             self.store_dir = (
-                Path(store_dir) if store_dir is not None else Path.cwd() / _DEFAULT_STORE_DIR
+                Path(store_dir)
+                if store_dir is not None
+                else Path(os.environ.get(_CASHET_DIR_ENV) or Path.cwd() / _DEFAULT_STORE_DIR)
             )
         else:
+            if store_dir is None:
+                store_dir = os.environ.get(_CASHET_DIR_ENV) or None
             if store_dir is None:
                 store_dir = Path.cwd() / _DEFAULT_STORE_DIR
             self.store_dir = Path(store_dir)
@@ -81,16 +87,65 @@ class Client:
         cache = _cache if _cache is not None else getattr(raw_func, "_cashet_cache", True)
         tags = _tags if _tags is not None else getattr(raw_func, "_cashet_tags", {})
         task_def = build_task_def(raw_func, args, kwargs, cache=cache, tags=tags)
-        commit, was_cached = self._executor.submit(
+        commit, _was_cached = self._executor.submit(
             raw_func, args, kwargs, task_def, self.store, self.serializer
         )
         if commit.output_ref is None:
             raise RuntimeError(f"Task {commit.task_def.func_name} failed: {commit.error}")
         ref = ResultRef(commit.output_ref, self.store, self.serializer)
-        if was_cached:
-            object.__setattr__(ref, "_value", _load_result(commit, self.store, self.serializer))
-            object.__setattr__(ref, "_loaded", True)
         return ref
+
+    @overload
+    def submit_many(
+        self,
+        tasks: list[
+            Callable[..., Any]
+            | tuple[Callable[..., Any], tuple[Any, ...]]
+            | tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any]]
+        ],
+        *,
+        _cache: bool | None = None,
+        _tags: dict[str, str] | None = None,
+    ) -> list[ResultRef]: ...
+
+    @overload
+    def submit_many(
+        self,
+        tasks: dict[
+            str,
+            Callable[..., Any]
+            | tuple[Callable[..., Any], tuple[Any, ...]]
+            | tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any]],
+        ],
+        *,
+        _cache: bool | None = None,
+        _tags: dict[str, str] | None = None,
+    ) -> dict[str, ResultRef]: ...
+
+    def submit_many(
+        self,
+        tasks: list[Any] | dict[str, Any],
+        *,
+        _cache: bool | None = None,
+        _tags: dict[str, str] | None = None,
+    ) -> list[ResultRef] | dict[str, ResultRef]:
+        is_dict = isinstance(tasks, dict)
+        if is_dict:
+            keys, raw_tasks = _unpack_dict_tasks(tasks)
+        else:
+            keys, raw_tasks = _unpack_list_tasks(tasks)
+
+        key_set = set(keys)
+        normalized = _normalize_tasks(raw_tasks, _cache, _tags)
+        deps, task_refs = _build_deps(keys, normalized, key_set)
+        order = _topological_sort(deps)
+        results = _execute_batch(
+            order, keys, normalized, task_refs, self._executor, self.store, self.serializer
+        )
+
+        if is_dict:
+            return cast(dict[str, ResultRef], {k: results[k] for k in keys})
+        return [results[k] for k in keys]
 
     def log(
         self,
@@ -142,6 +197,154 @@ class Client:
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
+
+
+_BatchKey = int | str
+_NormalizedTask = tuple[Any, tuple[Any, ...], dict[str, Any], bool, dict[str, str]]
+
+
+def _unpack_dict_tasks(
+    tasks: dict[str, Any],
+) -> tuple[list[_BatchKey], list[Any]]:
+    items = list(tasks.items())
+    return [k for k, _ in items], [t for _, t in items]
+
+
+def _unpack_list_tasks(tasks: list[Any]) -> tuple[list[_BatchKey], list[Any]]:
+    return list(range(len(tasks))), list(tasks)
+
+
+def _normalize_tasks(
+    raw_tasks: list[Any],
+    default_cache: bool | None,
+    default_tags: dict[str, str] | None,
+) -> list[_NormalizedTask]:
+    normalized: list[_NormalizedTask] = []
+    for i, task in enumerate(raw_tasks):
+        if callable(task):
+            func, args, kwargs = task, (), {}
+        elif not isinstance(task, tuple):
+            raise TypeError(
+                f"Task {i}: expected callable or tuple, got {type(task).__name__}"
+            )
+        elif len(task) == 2:
+            func, args = task  # type: ignore[misc]
+            kwargs = {}
+        elif len(task) == 3:
+            func, args, kwargs = task  # type: ignore[misc]
+        else:
+            raise TypeError(
+                f"Task {i}: expected tuple of length 2 or 3, got length {len(task)}"
+            )
+        if not callable(func):
+            raise TypeError(f"Task {i}: expected callable, got {type(func).__name__}")
+        if not isinstance(args, tuple):
+            raise TypeError(f"Task {i}: expected args as tuple, got {type(args).__name__}")
+        if not isinstance(kwargs, dict):
+            raise TypeError(f"Task {i}: expected kwargs as dict, got {type(kwargs).__name__}")
+        raw_func = getattr(func, "_cashet_wrapped_func", func)
+        cache = (
+            default_cache
+            if default_cache is not None
+            else getattr(
+                raw_func,
+                "_cashet_cache",
+                True,
+            )
+        )
+        tags = (
+            default_tags
+            if default_tags is not None
+            else getattr(
+                raw_func,
+                "_cashet_tags",
+                {},
+            )
+        )
+        normalized.append((raw_func, args, kwargs, cache, tags))
+    return normalized
+
+
+def _build_deps(
+    keys: list[_BatchKey],
+    normalized: list[_NormalizedTask],
+    key_set: set[_BatchKey],
+) -> tuple[dict[_BatchKey, set[_BatchKey]], dict[_BatchKey, list[tuple[str, Any, _BatchKey]]]]:
+    deps: dict[_BatchKey, set[_BatchKey]] = {k: set() for k in keys}
+    task_refs: dict[_BatchKey, list[tuple[str, Any, _BatchKey]]] = {}
+    for key, (_func, args, kwargs, _cache, _tags) in zip(keys, normalized, strict=True):
+        for j, arg in enumerate(args):
+            if isinstance(arg, TaskRef):
+                deps[key].add(arg.key)
+                task_refs.setdefault(key, []).append(("arg", j, arg.key))
+        for kw_key, val in kwargs.items():
+            if isinstance(val, TaskRef):
+                deps[key].add(val.key)
+                task_refs.setdefault(key, []).append(("kwarg", kw_key, val.key))
+        for d in deps[key]:
+            if d not in key_set:
+                raise ValueError(f"TaskRef({d!r}) not found")
+            if d == key:
+                raise ValueError(f"Task {key!r} cannot depend on itself")
+    return deps, task_refs
+
+
+def _topological_sort(deps: dict[_BatchKey, set[_BatchKey]]) -> list[_BatchKey]:
+    visited: set[_BatchKey] = set()
+    temp: set[_BatchKey] = set()
+    order: list[_BatchKey] = []
+
+    def visit(n: _BatchKey) -> None:
+        if n in temp:
+            raise ValueError("Circular dependency detected in batch tasks")
+        if n in visited:
+            return
+        temp.add(n)
+        for d in deps[n]:
+            visit(d)
+        temp.remove(n)
+        visited.add(n)
+        order.append(n)
+
+    for n in deps:
+        visit(n)
+    return order
+
+
+def _execute_batch(
+    order: list[_BatchKey],
+    keys: list[_BatchKey],
+    normalized: list[_NormalizedTask],
+    task_refs: dict[_BatchKey, list[tuple[str, Any, _BatchKey]]],
+    executor: Executor,
+    store: Store,
+    serializer: Serializer,
+) -> dict[_BatchKey, ResultRef]:
+    pos = {k: i for i, k in enumerate(keys)}
+    results: dict[_BatchKey, ResultRef] = {}
+    for key in order:
+        func, args, kwargs, cache, tags = normalized[pos[key]]
+        resolved_args = list(args)
+        resolved_kwargs = dict(kwargs)
+        for kind, arg_key, target_key in task_refs.get(key, []):
+            target_ref = results.get(target_key)
+            if target_ref is None:
+                raise RuntimeError(f"TaskRef({target_key!r}) unresolved")
+            if kind == "arg":
+                resolved_args[arg_key] = target_ref
+            else:
+                resolved_kwargs[arg_key] = target_ref
+        task_def = build_task_def(
+            func, tuple(resolved_args), resolved_kwargs, cache=cache, tags=tags
+        )
+        commit, _was_cached = executor.submit(
+            func, tuple(resolved_args), resolved_kwargs, task_def, store, serializer
+        )
+        if commit.output_ref is None:
+            raise RuntimeError(f"Task {commit.task_def.func_name} failed: {commit.error}")
+        ref = ResultRef(commit.output_ref, store, serializer)
+        results[key] = ref
+    return results
 
 
 def _load_result(commit: Commit, store: Store, serializer: Serializer) -> Any:

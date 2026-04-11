@@ -92,6 +92,72 @@ class TestStoreOperations:
         assert s["total_commits"] >= 1
         assert s["completed_commits"] >= 1
 
+    def test_stats_disk_bytes(self, client: Client) -> None:
+        def f() -> bytes:
+            return b"x" * 1000
+
+        client.submit(f)
+        s = client.stats()
+        assert "disk_bytes" in s
+        assert s["disk_bytes"] > 0
+
+    def test_thread_safety(self, store_dir: Path) -> None:
+        import threading
+
+        client = Client(store_dir=store_dir)
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def worker(x: int) -> int:
+            return x * x
+
+        def run(x: int) -> None:
+            ref = client.submit(worker, x)
+            with lock:
+                results.append(ref.load())
+
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert sorted(results) == [i * i for i in range(10)]
+
+    def test_thread_safety_dedup(self, store_dir: Path) -> None:
+        import threading
+
+        client = Client(store_dir=store_dir)
+        call_count = 0
+
+        def expensive(x: int) -> int:
+            nonlocal call_count
+            call_count += 1
+            return x * x
+
+        refs: list[Any] = []
+        lock = threading.Lock()
+
+        def run(x: int) -> None:
+            ref = client.submit(expensive, x)
+            with lock:
+                refs.append(ref)
+
+        threads = [threading.Thread(target=run, args=(5,)) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert call_count == 1
+        assert len({r.hash for r in refs}) == 1
+
+    def test_cashet_dir_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        env_dir = tmp_path / "env_cashet"
+        monkeypatch.setenv("CASHET_DIR", str(env_dir))
+        client = Client()
+        assert client.store_dir == env_dir
+
 
 class TestBlobIntegrity:
     def test_valid_blob_reads_back(self, store_dir: Path) -> None:

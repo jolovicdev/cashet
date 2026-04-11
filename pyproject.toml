@@ -1,6 +1,6 @@
 [project]
 name = "cashet"
-version = "0.1.1"
+version = "0.1.2"
 description = "Content-addressable compute cache with git semantics"
 readme = "README.md"
 license = "MIT"

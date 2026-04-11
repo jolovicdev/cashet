@@ -165,6 +165,67 @@ class TestClosureWarning:
         assert len(closure_warnings) == 0
 
 
+class TestProgressiveHash:
+    def test_large_list_same_hash(self, client: Client) -> None:
+        def identity(data: list[int]) -> list[int]:
+            return data
+
+        large = list(range(100000))
+        ref1 = client.submit(identity, large)
+        ref2 = client.submit(identity, large)
+        assert ref1.hash == ref2.hash
+
+    def test_large_dict_same_hash(self, client: Client) -> None:
+        def identity(data: dict[str, int]) -> dict[str, int]:
+            return data
+
+        large = {f"key_{i}": i for i in range(100000)}
+        ref1 = client.submit(identity, large)
+        ref2 = client.submit(identity, large)
+        assert ref1.hash == ref2.hash
+
+    def test_different_large_lists_different_hash(self, client: Client) -> None:
+        def identity(data: list[int]) -> list[int]:
+            return data
+
+        ref1 = client.submit(identity, list(range(100000)))
+        ref2 = client.submit(identity, list(range(100001)))
+        assert ref1.hash != ref2.hash
+
+    def test_str_no_collision_with_concatenated_empty(self, client: Client) -> None:
+        def identity(data: list[str]) -> list[str]:
+            return data
+
+        ref1 = client.submit(identity, ["S"])
+        ref2 = client.submit(identity, ["", ""])
+        assert ref1.hash != ref2.hash
+        assert ref1.load() != ref2.load()
+
+    def test_dict_no_collision_on_swapped_kv(self, client: Client) -> None:
+        def identity(data: dict[str, str]) -> dict[str, str]:
+            return data
+
+        ref1 = client.submit(identity, {"": "S"})
+        ref2 = client.submit(identity, {"S": ""})
+        assert ref1.hash != ref2.hash
+
+    def test_bytes_no_collision_with_split(self, client: Client) -> None:
+        def identity(data: list[bytes]) -> list[bytes]:
+            return data
+
+        ref1 = client.submit(identity, [b"AB"])
+        ref2 = client.submit(identity, [b"A", b"B"])
+        assert ref1.hash != ref2.hash
+
+    def test_set_dict_no_collision(self, client: Client) -> None:
+        def identity(data: Any) -> Any:
+            return data
+
+        ref1 = client.submit(identity, {1, 2})
+        ref2 = client.submit(identity, {1: 2})
+        assert ref1.hash != ref2.hash
+
+
 class TestRecursiveGlobalHashing:
     def test_helper_change_invalidates_caller_hash(self) -> None:
         def helper_v1(x: int) -> int:

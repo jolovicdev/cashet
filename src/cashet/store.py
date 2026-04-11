@@ -275,11 +275,19 @@ class SQLiteStore:
         completed = conn.execute(
             "SELECT COUNT(*) FROM commits WHERE status IN ('completed', 'cached')"
         ).fetchone()[0]
-        obj_count = sum(len(list(p.iterdir())) for p in self.objects_dir.iterdir() if p.is_dir())
+        obj_count = 0
+        total_bytes = 0
+        for p in self.objects_dir.iterdir():
+            if p.is_dir():
+                for f in p.iterdir():
+                    if f.is_file():
+                        obj_count += 1
+                        total_bytes += f.stat().st_size
         return {
             "total_commits": total,
             "completed_commits": completed,
             "stored_objects": obj_count,
+            "disk_bytes": total_bytes,
         }
 
     def evict(self, older_than: datetime) -> int:

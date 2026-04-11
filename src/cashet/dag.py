@@ -9,6 +9,11 @@ from cashet.models import Commit, ObjectRef, TaskDef, TaskStatus
 from cashet.protocols import Store
 
 
+class TaskRef:
+    def __init__(self, key: int | str) -> None:
+        self.key = key
+
+
 def resolve_input_refs(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[ObjectRef]:
     refs: list[ObjectRef] = []
     for arg in args:

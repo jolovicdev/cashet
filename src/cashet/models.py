@@ -61,6 +61,12 @@ class Commit:
     def short_hash(self) -> str:
         return self.hash[:12]
 
+    def __repr__(self) -> str:
+        return (
+            f"Commit({self.short_hash()}, {self.task_def.func_name}, "
+            f"status={self.status.value})"
+        )
+
     def summary(self) -> dict[str, Any]:
         return {
             "hash": self.hash,

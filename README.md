@@ -111,16 +111,16 @@ You already have caches (`functools.lru_cache`, `joblib.Memory`). Here's what's 
 
 | | lru_cache | joblib.Memory | **cashet** |
 |---|---|---|---|
-| Persists across restarts | No | Yes | Yes |
-| Content-addressable storage | No | No | Yes (like git blobs) |
 | AST-normalized hashing | No | No | Yes (comments/formatting don't break cache) |
 | DAG resolution (chain outputs) | No | No | Yes |
+| Content-addressable storage | No | No | Yes (like git blobs) |
 | CLI to inspect history | No | No | Yes |
 | Diff two runs | No | No | Yes |
 | Garbage collection / eviction | No | No | Yes |
 | Pluggable serialization | No | No | Yes |
 | Explicit cache opt-out | No | Partial | Yes |
 | Pluggable store / executor | No | No | Yes |
+| Persists across restarts | No | Yes | Yes |
 
 The core idea: **hash the function's AST-normalized source + arguments = unique cache key**. Comments, docstrings, and formatting changes don't invalidate the cache — only semantic changes do. Same function + same args = same result, stored immutably on disk. The result is a git-like blob you can inspect, diff, and chain.
 
@@ -131,7 +131,7 @@ The core idea: **hash the function's AST-normalized source + arguments = unique 
 You run 200 hyperparameter sweeps overnight. Half crash. You fix a bug and re-run. Without cashet, you re-process the dataset 200 times. With cashet:
 
 ```python
-from cashet import Client
+from cashet import Client, TaskRef
 
 client = Client()
 
@@ -142,11 +142,17 @@ def preprocess(dataset_path, image_size):
 def train(data, learning_rate, dropout):
     ...
 
-data = client.submit(preprocess, "s3://my-bucket/images", 224)
-
-for lr in [0.01, 0.001, 0.0001]:
-    for dropout in [0.2, 0.5]:
-        client.submit(train, data, lr, dropout)
+# Batch submit with topological ordering
+# TaskRef(0) refers to the first task's output
+results = client.submit_many([
+    (preprocess, ("s3://my-bucket/images", 224)),
+    (train, (TaskRef(0), 0.01, 0.2)),
+    (train, (TaskRef(0), 0.01, 0.5)),
+    (train, (TaskRef(0), 0.001, 0.2)),
+    (train, (TaskRef(0), 0.001, 0.5)),
+    (train, (TaskRef(0), 0.0001, 0.2)),
+    (train, (TaskRef(0), 0.0001, 0.5)),
+])
 ```
 
 `preprocess` runs **once** — all 6 training jobs reuse its cached output. Re-run the script tomorrow and even the training results come from cache (same function + same args = instant).
@@ -229,7 +235,10 @@ cashet log --tag env=prod --tag experiment=run-1
 # Show full commit details (source code, args, error)
 cashet show <hash>
 
-# Retrieve a result to file
+# Retrieve a result (pretty-prints strings/dicts/lists)
+cashet get <hash>
+
+# Write a result to file
 cashet get <hash> -o output.bin
 
 # Compare two commits
@@ -244,7 +253,10 @@ cashet rm <hash>
 # Evict old cache entries and orphaned blobs
 cashet gc --older-than 30
 
-# Storage statistics
+# Clear everything (alias for gc --older-than 0)
+cashet clear
+
+# Storage statistics (includes disk size)
 cashet stats
 ```
 
@@ -256,7 +268,8 @@ cashet stats
 from cashet import Client
 
 client = Client(
-    store_dir=".cashet",         # where to store blobs + metadata (SQLiteStore)
+    store_dir=".cashet",       # where to store blobs + metadata (SQLiteStore)
+                               # falls back to $CASHET_DIR env var if set
     store=None,                # or inject any Store implementation
     executor=None,             # or inject any Executor implementation
     serializer=None,           # defaults to PickleSerializer
@@ -333,6 +346,22 @@ ref.load()      # deserialize and return the result
 ```
 
 If the same function + same arguments have been submitted before, returns the cached result **without re-executing**.
+
+### `client.submit_many(tasks) -> list[ResultRef]`
+
+Submit a batch of tasks with automatic topological ordering. Use `TaskRef(index)` to wire outputs between tasks in the batch.
+
+```python
+from cashet import TaskRef
+
+refs = client.submit_many([
+    step1_func,
+    (step2_func, (TaskRef(0),)),
+    (step3_func, (TaskRef(1), "extra_arg")),
+])
+```
+
+This enables parallel fan-out and ensures each task only runs after its dependencies.
 
 **Opt out of caching:**
 
@@ -413,7 +442,7 @@ evicted = client.gc(older_than=timedelta(days=7))
 
 # Storage stats
 stats = client.stats()
-# {'total_commits': 42, 'completed_commits': 40, 'stored_objects': 38}
+# {'total_commits': 42, 'completed_commits': 40, 'stored_objects': 38, 'disk_bytes': 10485760}
 ```
 
 ### `ResultRef`

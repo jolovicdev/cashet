@@ -1,5 +1,5 @@
 from cashet.client import Client
-from cashet.dag import ResultRef
+from cashet.dag import ResultRef, TaskRef
 from cashet.executor import LocalExecutor
 from cashet.hashing import (
     ClosureWarning,
@@ -27,5 +27,6 @@ __all__ = [
     "Serializer",
     "Store",
     "TaskDef",
+    "TaskRef",
     "TaskStatus",
 ]

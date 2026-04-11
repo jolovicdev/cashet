@@ -149,7 +149,17 @@ def get_cmd(hash: str, output: str | None) -> None:
         pathlib.Path(output).write_bytes(ref)
         console.print(f"Written {len(ref)} bytes to {output}")
     else:
-        console.print(f"[dim]{len(ref)} bytes — use -o to write to file[/dim]")
+        try:
+            value = client.serializer.loads(ref)
+        except Exception:
+            console.print(f"[dim]{len(ref)} bytes — use -o to write to file[/dim]")
+            return
+        if isinstance(value, str):
+            console.print(value)
+        elif isinstance(value, bytes):
+            console.print(f"[dim]{len(ref)} bytes — use -o to write to file[/dim]")
+        else:
+            console.print(json.dumps(value, indent=2, default=str))
 
 
 @main.command("diff")
@@ -201,6 +211,15 @@ def history_cmd(hash: str) -> None:
         )
 
 
+def _fmt_bytes(n: int) -> str:
+    val = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if val < 1024:
+            return f"{val:.2f} {unit}" if unit != "B" else f"{int(val)} B"
+        val /= 1024
+    return f"{val:.2f} PB"
+
+
 @main.command("stats")
 def stats_cmd() -> None:
     """Show storage statistics"""
@@ -210,7 +229,12 @@ def stats_cmd() -> None:
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="green", justify="right")
     for k, v in s.items():
-        table.add_row(k, str(v))
+        label = k
+        val = str(v)
+        if k == "disk_bytes":
+            label = "disk_size"
+            val = _fmt_bytes(v)
+        table.add_row(label, val)
     console.print(table)
 
 
@@ -240,6 +264,16 @@ def gc_cmd(older_than: int) -> None:
     client = _client()
     deleted = client.gc(timedelta(days=older_than))
     console.print(f"[green]Evicted {deleted} commit(s) older than {older_than} day(s).[/green]")
+
+
+@main.command("clear")
+def clear_cmd() -> None:
+    """Remove all cache entries and orphaned blobs (alias for gc --older-than 0)"""
+    from datetime import timedelta
+
+    client = _client()
+    deleted = client.gc(timedelta(days=0))
+    console.print(f"[green]Cleared {deleted} commit(s).[/green]")
 
 
 if __name__ == "__main__":

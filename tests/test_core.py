@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from cashet import Client, ResultRef, TaskStatus
+from cashet import Client, ResultRef, TaskRef, TaskStatus
 
 
 class TestBasicSubmit:
@@ -340,6 +340,147 @@ class TestParentHashLineage:
 
         assert history[2].parent_hash == history[1].hash
         assert history[1].parent_hash == history[0].hash
+
+
+class TestSubmitMany:
+    def test_submit_many_basic(self, client: Client) -> None:
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        def mul(x: int, y: int) -> int:
+            return x * y
+
+        refs = client.submit_many([
+            (add, (1, 2)),
+            (mul, (3, 4)),
+        ])
+        assert len(refs) == 2
+        assert refs[0].load() == 3
+        assert refs[1].load() == 12
+
+    def test_submit_many_with_taskref(self, client: Client) -> None:
+        def step1() -> int:
+            return 10
+
+        def step2(x: int) -> int:
+            return x * 3
+
+        def step3(x: int) -> str:
+            return f"result: {x}"
+
+        refs = client.submit_many([
+            step1,
+            (step2, (TaskRef(0),)),
+            (step3, (TaskRef(1),)),
+        ])
+        assert len(refs) == 3
+        assert refs[0].load() == 10
+        assert refs[1].load() == 30
+        assert refs[2].load() == "result: 30"
+
+    def test_submit_many_fan_out(self, client: Client) -> None:
+        def gen() -> int:
+            return 5
+
+        def double(x: int) -> int:
+            return x * 2
+
+        def triple(x: int) -> int:
+            return x * 3
+
+        refs = client.submit_many([
+            gen,
+            (double, (TaskRef(0),)),
+            (triple, (TaskRef(0),)),
+        ])
+        assert len(refs) == 3
+        assert refs[0].load() == 5
+        assert refs[1].load() == 10
+        assert refs[2].load() == 15
+
+    def test_submit_many_circular_raises(self, client: Client) -> None:
+        def noop(x: int) -> int:
+            return x
+
+        with pytest.raises(ValueError, match="Circular dependency"):
+            client.submit_many([
+                (noop, (TaskRef(1),)),
+                (noop, (TaskRef(0),)),
+            ])
+
+    def test_submit_many_self_ref_raises(self, client: Client) -> None:
+        def noop(x: int) -> int:
+            return x
+
+        with pytest.raises(ValueError, match="cannot depend on itself"):
+            client.submit_many([
+                (noop, (TaskRef(0),)),
+            ])
+
+    def test_submit_many_out_of_range_raises(self, client: Client) -> None:
+        def noop(x: int) -> int:
+            return x
+
+        with pytest.raises(ValueError, match="not found"):
+            client.submit_many([
+                (noop, (TaskRef(5),)),
+            ])
+
+    def test_commit_repr(self, client: Client) -> None:
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        client.submit(add, 1, 2)
+        commit = client.log(limit=1)[0]
+        rep = repr(commit)
+        assert "Commit(" in rep
+        assert "add" in rep
+        assert "completed" in rep or "cached" in rep
+
+    def test_submit_many_dict(self, client: Client) -> None:
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        def mul(x: int, y: int) -> int:
+            return x * y
+
+        refs = client.submit_many({
+            "first": (add, (1, 2)),
+            "second": (mul, (TaskRef("first"), 4)),
+        })
+        assert isinstance(refs, dict)
+        assert refs["first"].load() == 3
+        assert refs["second"].load() == 12
+
+    def test_submit_many_dict_circular_raises(self, client: Client) -> None:
+        def noop(x: int) -> int:
+            return x
+
+        with pytest.raises(ValueError, match="Circular dependency"):
+            client.submit_many({
+                "a": (noop, (TaskRef("b"),)),
+                "b": (noop, (TaskRef("a"),)),
+            })
+
+    def test_submit_many_dict_missing_ref_raises(self, client: Client) -> None:
+        def noop(x: int) -> int:
+            return x
+
+        with pytest.raises(ValueError, match="not found"):
+            client.submit_many({
+                "a": (noop, (TaskRef("missing"),)),
+            })
+
+    def test_submit_many_rejects_non_callable(self, client: Client) -> None:
+        with pytest.raises(TypeError, match="expected callable"):
+            client.submit_many(["not a function"])
+
+    def test_submit_many_rejects_non_tuple_args(self, client: Client) -> None:
+        def f(x: int) -> int:
+            return x
+
+        with pytest.raises(TypeError, match="expected args as tuple"):
+            client.submit_many([(f, "not_a_tuple")])
 
 
 class TestDiffSizeLimit:
