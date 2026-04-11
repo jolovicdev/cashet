@@ -483,6 +483,52 @@ class TestSubmitMany:
             client.submit_many([(f, "not_a_tuple")])
 
 
+class TestResultRefCommitHash:
+    def test_commit_hash_works_with_show(self, client: Client) -> None:
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        ref = client.submit(add, 1, 2)
+        commit = client.show(ref.commit_hash)
+        assert commit is not None
+        assert "add" in commit.task_def.func_name
+
+    def test_commit_hash_works_with_get(self, client: Client) -> None:
+        def val() -> int:
+            return 42
+
+        ref = client.submit(val)
+        result = client.get(ref.commit_hash)
+        assert result == 42
+
+    def test_commit_hash_works_with_history(self, client: Client) -> None:
+        def val(x: int) -> int:
+            return x
+
+        ref1 = client.submit(val, 5, _cache=False)
+        client.submit(val, 5, _cache=False)
+        history = client.history(ref1.commit_hash)
+        assert len(history) == 2
+
+    def test_commit_hash_works_with_rm(self, client: Client) -> None:
+        def val() -> int:
+            return 1
+
+        ref = client.submit(val, _cache=False)
+        assert client.rm(ref.commit_hash) is True
+        assert client.show(ref.commit_hash) is None
+
+    def test_hash_is_blob_not_commit(self, client: Client) -> None:
+        def val() -> int:
+            return 42
+
+        ref = client.submit(val)
+        assert ref.hash != ref.commit_hash
+        commit = client.show(ref.commit_hash)
+        assert commit is not None
+        assert ref.hash == commit.output_ref.hash
+
+
 class TestDiffSizeLimit:
     def test_small_outputs_compared_normally(self, client: Client) -> None:
         def make_val(x: int) -> int:

@@ -226,6 +226,43 @@ class TestProgressiveHash:
         assert ref1.hash != ref2.hash
 
 
+class TestRecursiveStructures:
+    def test_recursive_list_does_not_crash(self, client: Client) -> None:
+        def identity(data: list[Any]) -> list[Any]:
+            return data
+
+        a = [1, 2]
+        a.append(a)
+        ref = client.submit(identity, a)
+        result = ref.load()
+        assert result[0] == 1
+        assert result[1] == 2
+        assert result[2] is result
+
+    def test_recursive_dict_does_not_crash(self, client: Client) -> None:
+        def identity(data: dict[str, Any]) -> dict[str, Any]:
+            return data
+
+        d = {"x": 1}
+        d["self"] = d
+        ref = client.submit(identity, d)
+        result = ref.load()
+        assert result["x"] == 1
+        assert result["self"] is result
+
+    def test_same_recursive_structure_same_hash(self, client: Client) -> None:
+        def identity(data: list[Any]) -> list[Any]:
+            return data
+
+        a = [1, 2]
+        a.append(a)
+        b = [1, 2]
+        b.append(b)
+        ref1 = client.submit(identity, a)
+        ref2 = client.submit(identity, b)
+        assert ref1.hash == ref2.hash
+
+
 class TestRecursiveGlobalHashing:
     def test_helper_change_invalidates_caller_hash(self) -> None:
         def helper_v1(x: int) -> int:
@@ -284,3 +321,44 @@ class TestRecursiveGlobalHashing:
         assert hash1 != hash2
 
 
+
+
+class TestDynamicSource:
+    def test_exec_function_hashes_by_bytecode(self, client: Client) -> None:
+        code = "def dynamic_func(x):\n    return x + 1"
+        namespace: dict[str, Any] = {}
+        exec(code, namespace)
+        func = namespace["dynamic_func"]
+        ref1 = client.submit(func, 5)
+        assert ref1.load() == 6
+
+        # Same code should cache
+        ref2 = client.submit(func, 5)
+        assert ref1.hash == ref2.hash
+
+    def test_exec_function_invalidates_on_change(self, client: Client) -> None:
+        namespace1: dict[str, Any] = {}
+        exec("def f(x):\n    return x + 1", namespace1)
+        ref1 = client.submit(namespace1["f"], 5)
+
+        namespace2: dict[str, Any] = {}
+        exec("def f(x):\n    return x + 2", namespace2)
+        ref2 = client.submit(namespace2["f"], 5)
+
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == 6
+        assert ref2.load() == 7
+
+    def test_lambda_hashes_by_bytecode(self, client: Client) -> None:
+        f = lambda x: x * 3  # noqa: E731
+        ref1 = client.submit(f, 4)
+        ref2 = client.submit(f, 4)
+        assert ref1.hash == ref2.hash
+        assert ref1.load() == 12
+
+    def test_different_lambdas_different_hashes(self, client: Client) -> None:
+        f1 = lambda x: x * 3  # noqa: E731
+        f2 = lambda x: x * 4  # noqa: E731
+        ref1 = client.submit(f1, 4)
+        ref2 = client.submit(f2, 4)
+        assert ref1.hash != ref2.hash

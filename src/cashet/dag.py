@@ -26,12 +26,19 @@ def resolve_input_refs(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Ob
 
 
 class ResultRef:
-    __slots__ = ("_loaded", "_ref", "_serializer", "_store", "_value")
+    __slots__ = ("_commit_hash", "_loaded", "_ref", "_serializer", "_store", "_value")
 
-    def __init__(self, ref: ObjectRef, store: Store, serializer: Serializer) -> None:
+    def __init__(
+        self,
+        ref: ObjectRef,
+        store: Store,
+        serializer: Serializer,
+        commit_hash: str = "",
+    ) -> None:
         self._ref = ref
         self._store = store
         self._serializer = serializer
+        self._commit_hash = commit_hash
         self._value: Any = None
         self._loaded = False
 
@@ -41,6 +48,10 @@ class ResultRef:
     @property
     def hash(self) -> str:
         return self._ref.hash
+
+    @property
+    def commit_hash(self) -> str:
+        return self._commit_hash
 
     @property
     def short_hash(self) -> str:
@@ -58,7 +69,8 @@ class ResultRef:
         return self._value
 
     def __repr__(self) -> str:
-        return f"ResultRef(hash={self.short_hash}, size={self.size}, loaded={self._loaded})"
+        ch = self._commit_hash[:12] if self._commit_hash else "?"
+        return f"ResultRef(commit={ch}, blob={self.short_hash}, size={self.size})"
 
 
 def compute_commit_hash(

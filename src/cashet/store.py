@@ -21,6 +21,7 @@ class SQLiteStore:
         self.db_path = root / "meta.db"
         self.objects_dir.mkdir(parents=True, exist_ok=True)
         self._tls = threading.local()
+        self._lock = threading.Lock()
         self._init_db()
 
     def _connect(self, *, immediate: bool = False) -> sqlite3.Connection:

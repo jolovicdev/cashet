@@ -92,7 +92,7 @@ class Client:
         )
         if commit.output_ref is None:
             raise RuntimeError(f"Task {commit.task_def.func_name} failed: {commit.error}")
-        ref = ResultRef(commit.output_ref, self.store, self.serializer)
+        ref = ResultRef(commit.output_ref, self.store, self.serializer, commit_hash=commit.hash)
         return ref
 
     @overload
@@ -168,7 +168,9 @@ class Client:
             raise KeyError(f"No commit found with hash {hash}")
         if commit.output_ref is None:
             raise ValueError(f"Commit {hash[:12]} has no output")
-        ref = ResultRef(commit.output_ref, self.store, self.serializer)
+        ref = ResultRef(
+            commit.output_ref, self.store, self.serializer, commit_hash=commit.hash
+        )
         return ref.load()
 
     def diff(self, hash_a: str, hash_b: str) -> dict[str, Any]:
@@ -188,6 +190,9 @@ class Client:
         ttl = older_than if older_than is not None else timedelta(days=_DEFAULT_GC_TTL_DAYS)
         cutoff = datetime.now(UTC) - ttl
         return self.store.evict(cutoff)
+
+    def clear(self) -> int:
+        return self.gc(timedelta(days=0))
 
     def close(self) -> None:
         self.store.close()
@@ -342,7 +347,7 @@ def _execute_batch(
         )
         if commit.output_ref is None:
             raise RuntimeError(f"Task {commit.task_def.func_name} failed: {commit.error}")
-        ref = ResultRef(commit.output_ref, store, serializer)
+        ref = ResultRef(commit.output_ref, store, serializer, commit_hash=commit.hash)
         results[key] = ref
     return results
 

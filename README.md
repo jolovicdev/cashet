@@ -176,7 +176,7 @@ Fix the `join_crm` function and re-run the script. Steps 1-2 return instantly fr
 
 ### 3. Reproducible Notebook Results
 
-Share a result with a colleague and they can verify exactly how it was produced:
+`cashet` is designed to work in Jupyter notebooks and IPython sessions. Share a result with a colleague and they can verify exactly how it was produced:
 
 ```python
 # your notebook
@@ -340,12 +340,21 @@ Submit a function for execution. Returns a `ResultRef` — a lazy handle to the 
 
 ```python
 ref = client.submit(my_func, arg1, arg2, key="value")
-ref.hash        # content hash of the result
-ref.size        # size in bytes
-ref.load()      # deserialize and return the result
+ref.hash         # content hash of the result blob
+ref.commit_hash  # commit hash (use this for show/history/rm/get)
+ref.size         # size in bytes
+ref.load()       # deserialize and return the result
 ```
 
 If the same function + same arguments have been submitted before, returns the cached result **without re-executing**.
+
+### `client.clear()`
+
+Remove all cache entries and orphaned blobs. Equivalent to `client.gc(timedelta(days=0))`.
+
+```python
+client.clear()
+```
 
 ### `client.submit_many(tasks) -> list[ResultRef]`
 
@@ -443,6 +452,47 @@ evicted = client.gc(older_than=timedelta(days=7))
 # Storage stats
 stats = client.stats()
 # {'total_commits': 42, 'completed_commits': 40, 'stored_objects': 38, 'disk_bytes': 10485760}
+```
+
+### Jupyter & Notebook Support
+
+`cashet` works seamlessly in Jupyter notebooks, IPython, and the Python REPL. It uses a tiered source-resolution strategy:
+
+1. **`inspect.getsource()`** — for normal `.py` files
+2. **`dill.source.getsource()`** — for interactive sessions with live history
+3. **`dis.Bytecode` fallback** — for any live function, even after a kernel restart
+
+This means you can define functions in a notebook cell, rerun the cell with changes, and `cashet` will correctly invalidate the cache based on the new code.
+
+```python
+# In a notebook cell
+client = Client()
+
+def preprocess(data):
+    return [x * 2 for x in data]
+
+ref = client.submit(preprocess, [1, 2, 3])
+```
+
+Change the cell body and rerun — the cache invalidates automatically.
+
+### Thread Safety
+
+`cashet` is safe to use from multiple threads (and processes sharing the same store directory). Concurrent submissions of the same uncached task are deduplicated: the function executes **exactly once** and all callers receive the same cached result.
+
+```python
+import threading
+
+def worker():
+    c = Client()  # separate Client instance, same store
+    c.submit(expensive_func, arg)
+
+threads = [threading.Thread(target=worker) for _ in range(10)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+# expensive_func ran only once
 ```
 
 ### `ResultRef`

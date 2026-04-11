@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import traceback
+from pathlib import Path
 from typing import Any
 
 from cashet.dag import (
@@ -14,11 +15,26 @@ from cashet.hashing import Serializer
 from cashet.models import Commit, ObjectRef, TaskDef, TaskStatus
 from cashet.protocols import Store
 
+_STORE_LOCKS: dict[str, threading.Lock] = {}
+_STORE_LOCKS_GUARD = threading.Lock()
+_FALLBACK_LOCK = threading.Lock()
+
+
+def _get_store_lock(store: Store) -> threading.Lock:
+    root = getattr(store, "root", None)
+    if root is not None:
+        key = str(Path(root).resolve())
+        with _STORE_LOCKS_GUARD:
+            if key not in _STORE_LOCKS:
+                _STORE_LOCKS[key] = threading.Lock()
+            return _STORE_LOCKS[key]
+    store_lock = getattr(store, "_lock", None)
+    if store_lock is not None:
+        return store_lock
+    return _FALLBACK_LOCK
+
 
 class LocalExecutor:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-
     def submit(
         self,
         func: Any,
@@ -28,7 +44,7 @@ class LocalExecutor:
         store: Store,
         serializer: Serializer,
     ) -> tuple[Commit, bool]:
-        with self._lock:
+        with _get_store_lock(store):
             input_refs = resolve_input_refs(args, kwargs)
             existing = find_existing_commit(store, task_def)
             if existing is not None:

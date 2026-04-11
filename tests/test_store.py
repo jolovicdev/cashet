@@ -152,6 +152,33 @@ class TestStoreOperations:
         assert call_count == 1
         assert len({r.hash for r in refs}) == 1
 
+    def test_thread_safety_cross_client_dedup(self, store_dir: Path) -> None:
+        import threading
+
+        # Pre-initialize store to avoid initialization races
+        _ = Client(store_dir=store_dir)
+
+        exec_count = 0
+        lock = threading.Lock()
+
+        def expensive(x: int) -> int:
+            nonlocal exec_count
+            with lock:
+                exec_count += 1
+            return x * x
+
+        def run(x: int) -> None:
+            c = Client(store_dir=store_dir)
+            c.submit(expensive, x)
+
+        threads = [threading.Thread(target=run, args=(7,)) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert exec_count == 1
+
     def test_cashet_dir_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         env_dir = tmp_path / "env_cashet"
         monkeypatch.setenv("CASHET_DIR", str(env_dir))
@@ -257,6 +284,18 @@ class TestGarbageCollection:
         assert client.stats()["total_commits"] == 2
 
         deleted = client.gc(timedelta(days=0))
+        assert deleted == 2
+        assert client.stats()["total_commits"] == 0
+
+    def test_clear_evicts_all(self, client: Client) -> None:
+        def make_val(x: int) -> int:
+            return x
+
+        client.submit(make_val, 1, _cache=False)
+        client.submit(make_val, 2, _cache=False)
+        assert client.stats()["total_commits"] == 2
+
+        deleted = client.clear()
         assert deleted == 2
         assert client.stats()["total_commits"] == 0
 
