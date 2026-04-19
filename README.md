@@ -281,6 +281,8 @@ client = Client(
 Everything is protocol-based. Swap the store, executor, or serializer without touching your task code:
 
 ```python
+from pathlib import Path
+
 from cashet import Client, Store, Executor, Serializer
 from cashet.store import SQLiteStore
 from cashet.executor import LocalExecutor
@@ -306,10 +308,12 @@ class RedisStore:
     def put_commit(self, commit: Commit) -> None: ...
     def get_commit(self, hash: str) -> Commit | None: ...
     def find_by_fingerprint(self, fingerprint: str) -> Commit | None: ...
+    def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None: ...
     def list_commits(self, ...) -> list[Commit]: ...
     def get_history(self, hash: str) -> list[Commit]: ...
     def stats(self) -> dict[str, int]: ...
     def evict(self, older_than: datetime) -> int: ...
+    def delete_commit(self, hash: str) -> bool: ...
     def close(self) -> None: ...
 
 client = Client(store=RedisStore("redis://localhost"))
@@ -398,6 +402,20 @@ def preprocess(raw):
 
 Tags are not part of the cache key — they are metadata for organization and filtering.
 
+**Retry flaky operations:**
+
+```python
+# Per-call
+ref = client.submit(fetch_api, url, _retries=3)
+
+# Per-function via decorator
+@client.task(retries=3)
+def fetch_api(url):
+    ...
+```
+
+Retries wait briefly between attempts. When retries are exhausted, `client.submit` raises `RuntimeError` with the original traceback included in the message.
+
 ### `@client.task`
 
 Register a function with cashet metadata and make it directly callable:
@@ -422,6 +440,9 @@ def other_func(x):
 ```python
 # List commits
 commits = client.log(func_name="preprocess", limit=10)
+
+# Filter by status
+commits = client.log(status="failed")
 
 # Filter by tags
 commits = client.log(tags={"experiment": "v1"})
@@ -478,7 +499,16 @@ Change the cell body and rerun — the cache invalidates automatically.
 
 ### Thread Safety
 
-`cashet` is safe to use from multiple threads (and processes sharing the same store directory). Concurrent submissions of the same uncached task are deduplicated: the function executes **exactly once** and all callers receive the same cached result.
+`cashet` is safe to use from multiple threads and processes sharing the same store directory. Concurrent submissions of the same uncached task are deduplicated: the function executes **exactly once** and all callers receive the same cached result. This works across `multiprocessing.Process`, `ProcessPoolExecutor`, and multiple independent Python interpreters.
+
+> **Note:** Cross-process dedup uses a 5-minute timeout by default. If a process dies while running a task, its claim is automatically reclaimed after that timeout so other workers are not blocked forever. You can adjust this via `LocalExecutor(running_ttl=...)`:
+>
+> ```python
+> from datetime import timedelta
+> from cashet.executor import LocalExecutor
+>
+> client = Client(executor=LocalExecutor(running_ttl=timedelta(minutes=10)))
+> ```
 
 ```python
 import threading
@@ -591,7 +621,7 @@ client.submit(func, arg1, arg2)
 
 ## Project Status
 
-**Experimental.** The core (hashing, DAG resolution, fingerprint dedup) is stable. The defaults work reliably for single-machine workflows. The protocol layer (`Store`, `Executor`, `Serializer`) is ready for alternative backends — implementing a Redis store or Celery executor is a single-file job.
+**Beta.** The core (hashing, DAG resolution, fingerprint dedup) is stable. The defaults work reliably for single-machine and multiprocess workflows. The protocol layer (`Store`, `Executor`, `Serializer`) is ready for alternative backends — implementing a Redis store or Celery executor is a single-file job.
 
 Built-in: `SQLiteStore` + `LocalExecutor` + `PickleSerializer`.
 Not yet built: Redis, RocksDB, S3 stores; Celery/Kafka executors. PRs welcome.

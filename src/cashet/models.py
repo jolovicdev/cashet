@@ -12,6 +12,10 @@ class StorageTier(enum.Enum):
     EXTERNAL = "external"
 
 
+class TaskError(RuntimeError):
+    pass
+
+
 class TaskStatus(enum.Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -40,6 +44,11 @@ class TaskDef:
     dep_versions: dict[str, str] = field(default_factory=dict[str, str])
     cache: bool = True
     tags: dict[str, str] = field(default_factory=dict[str, str])
+    retries: int = 0
+
+    @property
+    def fingerprint(self) -> str:
+        return f"{self.func_hash}:{self.args_hash}"
 
 
 @dataclass
@@ -51,6 +60,7 @@ class Commit:
     parent_hash: str | None = None
     status: TaskStatus = TaskStatus.PENDING
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    claimed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     error: str | None = None
     tags: dict[str, str] = field(default_factory=dict[str, str])
 

@@ -9,7 +9,6 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from cashet.client import Client
-from cashet.models import TaskStatus
 
 console = Console()
 
@@ -49,15 +48,11 @@ def main() -> None:
 def log_cmd(func: str | None, limit: int, status: str | None, tag: tuple[str, ...]) -> None:
     """Show commit history"""
     client = _client()
-    status_enum: TaskStatus | None = None
-    if status:
-        try:
-            status_enum = TaskStatus(status)
-        except ValueError:
-            valid = ", ".join(s.value for s in TaskStatus)
-            console.print(f"[red]Invalid status '{status}'. Valid values: {valid}[/red]")
-            raise SystemExit(1) from None
-    commits = client.log(func_name=func, limit=limit, status=status_enum, tags=_parse_tags(tag))
+    try:
+        commits = client.log(func_name=func, limit=limit, status=status, tags=_parse_tags(tag))
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1) from None
     if not commits:
         console.print("[dim]No commits found.[/dim]")
         return
@@ -170,7 +165,7 @@ def diff_cmd(hash_a: str, hash_b: str) -> None:
     client = _client()
     try:
         d = client.diff(hash_a, hash_b)
-    except ValueError as e:
+    except (ValueError, KeyError) as e:
         console.print(f"[red]{e}[/red]")
         raise SystemExit(1) from None
     console.print(Panel(json.dumps(d, indent=2, default=str), title="Diff"))

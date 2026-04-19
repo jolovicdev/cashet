@@ -529,6 +529,73 @@ class TestResultRefCommitHash:
         assert ref.hash == commit.output_ref.hash
 
 
+class TestRetries:
+    def test_retry_succeeds_eventually(self, client: Client) -> None:
+        attempts = 0
+
+        def flaky() -> int:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise ValueError("not yet")
+            return 42
+
+        ref = client.submit(flaky, _retries=3)
+        assert ref.load() == 42
+        assert attempts == 3
+
+    def test_retry_exhausted_raises(self, client: Client) -> None:
+        attempts = 0
+
+        def always_fails() -> int:
+            nonlocal attempts
+            attempts += 1
+            raise ValueError("always fails")
+
+        with pytest.raises(RuntimeError, match="always fails"):
+            client.submit(always_fails, _retries=2)
+        assert attempts == 3
+
+    def test_task_decorator_retries(self, client: Client) -> None:
+        attempts = 0
+
+        @client.task(retries=2)
+        def flaky_task() -> int:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 2:
+                raise RuntimeError("retry me")
+            return 7
+
+        ref = client.submit(flaky_task)
+        assert ref.load() == 7
+        assert attempts == 2
+
+    def test_zero_retries_no_retry(self, client: Client) -> None:
+        attempts = 0
+
+        def once() -> int:
+            nonlocal attempts
+            attempts += 1
+            raise ValueError("once")
+
+        with pytest.raises(RuntimeError, match="once"):
+            client.submit(once, _retries=0)
+        assert attempts == 1
+
+    def test_negative_retries_treated_as_zero(self, client: Client) -> None:
+        attempts = 0
+
+        def once() -> int:
+            nonlocal attempts
+            attempts += 1
+            raise ValueError("once")
+
+        with pytest.raises(RuntimeError, match="once"):
+            client.submit(once, _retries=-1)
+        assert attempts == 1
+
+
 class TestDiffSizeLimit:
     def test_small_outputs_compared_normally(self, client: Client) -> None:
         def make_val(x: int) -> int:

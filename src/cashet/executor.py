@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import threading
+import time
 import traceback
+from collections.abc import Generator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from filelock import FileLock
 
 from cashet.dag import (
     build_commit,
@@ -18,9 +24,10 @@ from cashet.protocols import Store
 _STORE_LOCKS: dict[str, threading.Lock] = {}
 _STORE_LOCKS_GUARD = threading.Lock()
 _FALLBACK_LOCK = threading.Lock()
+_DEFAULT_RUNNING_TTL = timedelta(seconds=300)
 
 
-def _get_store_lock(store: Store) -> threading.Lock:
+def _get_thread_lock(store: Store) -> threading.Lock:
     root = getattr(store, "root", None)
     if root is not None:
         key = str(Path(root).resolve())
@@ -34,7 +41,26 @@ def _get_store_lock(store: Store) -> threading.Lock:
     return _FALLBACK_LOCK
 
 
+@contextlib.contextmanager
+def _store_lock(store: Store) -> Generator[None, None, None]:
+    tlock = _get_thread_lock(store)
+    root = getattr(store, "root", None)
+    if root is not None:
+        lock_path = Path(root) / ".lock"
+        with FileLock(str(lock_path)), tlock:
+            yield
+    else:
+        with tlock:
+            yield
+
+def _is_stale_claim(commit: Commit, ttl: timedelta) -> bool:
+    return datetime.now(UTC) - commit.claimed_at > ttl
+
+
 class LocalExecutor:
+    def __init__(self, running_ttl: timedelta | None = None) -> None:
+        self._running_ttl = running_ttl or _DEFAULT_RUNNING_TTL
+
     def submit(
         self,
         func: Any,
@@ -44,17 +70,47 @@ class LocalExecutor:
         store: Store,
         serializer: Serializer,
     ) -> tuple[Commit, bool]:
-        with _get_store_lock(store):
-            input_refs = resolve_input_refs(args, kwargs)
+        with _store_lock(store):
             existing = find_existing_commit(store, task_def)
             if existing is not None:
                 existing.status = TaskStatus.CACHED
                 store.put_commit(existing)
                 return existing, True
 
-            parent_hash = find_parent_hash(store, task_def)
-            commit = build_commit(task_def, input_refs, parent_hash=parent_hash)
-            commit = self._execute(func, args, kwargs, commit, store, serializer)
+        while True:
+            with _store_lock(store):
+                existing = find_existing_commit(store, task_def)
+                if existing is not None:
+                    existing.status = TaskStatus.CACHED
+                    store.put_commit(existing)
+                    return existing, True
+
+                claim = store.find_running_by_fingerprint(task_def.fingerprint)
+                if claim is not None:
+                    if _is_stale_claim(claim, self._running_ttl):
+                        # NOTE: refreshing claimed_at before execution creates a small race —
+                        # if this process crashes before _execute runs, the claim looks fresh
+                        # and will block others for another TTL cycle.
+                        claim.claimed_at = datetime.now(UTC)
+                        claim.task_def.retries = task_def.retries
+                        store.put_commit(claim)
+                        break
+                else:
+                    input_refs = resolve_input_refs(args, kwargs)
+                    parent_hash = find_parent_hash(store, task_def)
+                    claim = build_commit(task_def, input_refs, parent_hash=parent_hash)
+                    claim.status = TaskStatus.RUNNING
+                    store.put_commit(claim)
+                    break
+            time.sleep(0.1)
+
+        commit = self._execute(func, args, kwargs, claim, store, serializer)
+
+        with _store_lock(store):
+            latest = find_existing_commit(store, task_def)
+            if latest is not None:
+                return latest, False
+            store.put_commit(commit)
             return commit, False
 
     def _execute(
@@ -66,20 +122,43 @@ class LocalExecutor:
         store: Store,
         serializer: Serializer,
     ) -> Commit:
-        store.put_commit(commit)
+        stop_event = threading.Event()
+
+        def _heartbeat() -> None:
+            interval = self._running_ttl.total_seconds() / 2
+            while not stop_event.wait(interval):
+                if commit.status != TaskStatus.RUNNING:
+                    break
+                with _store_lock(store):
+                    if commit.status != TaskStatus.RUNNING:
+                        break
+                    commit.claimed_at = datetime.now(UTC)
+                    store.put_commit(commit)
+
+        heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+        heartbeat_thread.start()
+
         try:
-            commit.status = TaskStatus.RUNNING
-            store.put_commit(commit)
-            resolved_args = self._resolve_args(args)
-            resolved_kwargs = self._resolve_kwargs(kwargs)
-            result = func(*resolved_args, **resolved_kwargs)
-            output_ref = self._store_result(result, store, serializer)
-            commit.output_ref = output_ref
-            commit.status = TaskStatus.COMPLETED
-        except Exception:
-            commit.status = TaskStatus.FAILED
-            commit.error = traceback.format_exc()
-        store.put_commit(commit)
+            retries = max(0, commit.task_def.retries)
+            for attempt in range(retries + 1):
+                try:
+                    resolved_args = self._resolve_args(args)
+                    resolved_kwargs = self._resolve_kwargs(kwargs)
+                    result = func(*resolved_args, **resolved_kwargs)
+                    output_ref = self._store_result(result, store, serializer)
+                    commit.output_ref = output_ref
+                    commit.status = TaskStatus.COMPLETED
+                    break
+                except Exception:
+                    if attempt < retries:
+                        time.sleep(0.5 * attempt)
+                        continue
+                    commit.status = TaskStatus.FAILED
+                    commit.error = traceback.format_exc()
+                    break
+        finally:
+            stop_event.set()
+            heartbeat_thread.join(timeout=self._running_ttl.total_seconds() * 2)
         return commit
 
     def _resolve_args(self, args: tuple[Any, ...]) -> tuple[Any, ...]:

@@ -10,7 +10,7 @@ from typing import Any, cast, overload
 from cashet.dag import ResultRef, TaskRef
 from cashet.executor import LocalExecutor
 from cashet.hashing import PickleSerializer, Serializer, build_task_def
-from cashet.models import Commit, TaskStatus
+from cashet.models import Commit, TaskError, TaskStatus
 from cashet.protocols import Executor, Store
 from cashet.store import SQLiteStore
 
@@ -53,12 +53,14 @@ class Client:
         cache: bool = True,
         name: str | None = None,
         tags: dict[str, str] | None = None,
+        retries: int = 0,
     ) -> Callable[..., Any]:
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             task_name = name or fn.__qualname__
             fn._cashet_cache = cache  # pyright: ignore[reportFunctionMemberAccess]
             fn._cashet_name = task_name  # pyright: ignore[reportFunctionMemberAccess]
             fn._cashet_tags = tags or {}  # pyright: ignore[reportFunctionMemberAccess]
+            fn._cashet_retries = retries  # pyright: ignore[reportFunctionMemberAccess]
             self._registered_tasks[task_name] = fn
 
             @wraps(fn)
@@ -69,6 +71,7 @@ class Client:
             wrapper._cashet_cache = cache  # pyright: ignore[reportAttributeAccessIssue]
             wrapper._cashet_name = task_name  # pyright: ignore[reportAttributeAccessIssue]
             wrapper._cashet_tags = tags or {}  # pyright: ignore[reportAttributeAccessIssue]
+            wrapper._cashet_retries = retries  # pyright: ignore[reportAttributeAccessIssue]
             return wrapper
 
         if func is not None:
@@ -81,17 +84,19 @@ class Client:
         *args: Any,
         _cache: bool | None = None,
         _tags: dict[str, str] | None = None,
+        _retries: int | None = None,
         **kwargs: Any,
     ) -> ResultRef:
         raw_func = getattr(func, "_cashet_wrapped_func", func)
         cache = _cache if _cache is not None else getattr(raw_func, "_cashet_cache", True)
         tags = _tags if _tags is not None else getattr(raw_func, "_cashet_tags", {})
-        task_def = build_task_def(raw_func, args, kwargs, cache=cache, tags=tags)
+        retries = _retries if _retries is not None else getattr(raw_func, "_cashet_retries", 0)
+        task_def = build_task_def(raw_func, args, kwargs, cache=cache, tags=tags, retries=retries)
         commit, _was_cached = self._executor.submit(
             raw_func, args, kwargs, task_def, self.store, self.serializer
         )
         if commit.output_ref is None:
-            raise RuntimeError(f"Task {commit.task_def.func_name} failed: {commit.error}")
+            raise TaskError(f"Task {commit.task_def.func_name} failed: {commit.error}")
         ref = ResultRef(commit.output_ref, self.store, self.serializer, commit_hash=commit.hash)
         return ref
 
@@ -106,6 +111,7 @@ class Client:
         *,
         _cache: bool | None = None,
         _tags: dict[str, str] | None = None,
+        _retries: int | None = None,
     ) -> list[ResultRef]: ...
 
     @overload
@@ -120,6 +126,7 @@ class Client:
         *,
         _cache: bool | None = None,
         _tags: dict[str, str] | None = None,
+        _retries: int | None = None,
     ) -> dict[str, ResultRef]: ...
 
     def submit_many(
@@ -128,6 +135,7 @@ class Client:
         *,
         _cache: bool | None = None,
         _tags: dict[str, str] | None = None,
+        _retries: int | None = None,
     ) -> list[ResultRef] | dict[str, ResultRef]:
         is_dict = isinstance(tasks, dict)
         if is_dict:
@@ -136,7 +144,7 @@ class Client:
             keys, raw_tasks = _unpack_list_tasks(tasks)
 
         key_set = set(keys)
-        normalized = _normalize_tasks(raw_tasks, _cache, _tags)
+        normalized = _normalize_tasks(raw_tasks, _cache, _tags, _retries)
         deps, task_refs = _build_deps(keys, normalized, key_set)
         order = _topological_sort(deps)
         results = _execute_batch(
@@ -151,10 +159,21 @@ class Client:
         self,
         func_name: str | None = None,
         limit: int = 50,
-        status: TaskStatus | None = None,
+        status: TaskStatus | str | None = None,
         tags: dict[str, str | None] | None = None,
     ) -> list[Commit]:
-        return self.store.list_commits(func_name=func_name, limit=limit, status=status, tags=tags)
+        resolved_status: TaskStatus | None = None
+        if isinstance(status, str):
+            try:
+                resolved_status = TaskStatus(status)
+            except ValueError as e:
+                valid = ", ".join(s.value for s in TaskStatus)
+                raise ValueError(f"Invalid status '{status}'. Valid values: {valid}") from e
+        else:
+            resolved_status = status
+        return self.store.list_commits(
+            func_name=func_name, limit=limit, status=resolved_status, tags=tags
+        )
 
     def show(self, hash: str) -> Commit | None:
         return self.store.get_commit(hash)
@@ -205,7 +224,7 @@ class Client:
 
 
 _BatchKey = int | str
-_NormalizedTask = tuple[Any, tuple[Any, ...], dict[str, Any], bool, dict[str, str]]
+_NormalizedTask = tuple[Any, tuple[Any, ...], dict[str, Any], bool, dict[str, str], int]
 
 
 def _unpack_dict_tasks(
@@ -223,6 +242,7 @@ def _normalize_tasks(
     raw_tasks: list[Any],
     default_cache: bool | None,
     default_tags: dict[str, str] | None,
+    default_retries: int | None = None,
 ) -> list[_NormalizedTask]:
     normalized: list[_NormalizedTask] = []
     for i, task in enumerate(raw_tasks):
@@ -266,7 +286,16 @@ def _normalize_tasks(
                 {},
             )
         )
-        normalized.append((raw_func, args, kwargs, cache, tags))
+        retries = (
+            default_retries
+            if default_retries is not None
+            else getattr(
+                raw_func,
+                "_cashet_retries",
+                0,
+            )
+        )
+        normalized.append((raw_func, args, kwargs, cache, tags, retries))
     return normalized
 
 
@@ -277,7 +306,7 @@ def _build_deps(
 ) -> tuple[dict[_BatchKey, set[_BatchKey]], dict[_BatchKey, list[tuple[str, Any, _BatchKey]]]]:
     deps: dict[_BatchKey, set[_BatchKey]] = {k: set() for k in keys}
     task_refs: dict[_BatchKey, list[tuple[str, Any, _BatchKey]]] = {}
-    for key, (_func, args, kwargs, _cache, _tags) in zip(keys, normalized, strict=True):
+    for key, (_func, args, kwargs, _cache, _tags, _retries) in zip(keys, normalized, strict=True):
         for j, arg in enumerate(args):
             if isinstance(arg, TaskRef):
                 deps[key].add(arg.key)
@@ -328,7 +357,7 @@ def _execute_batch(
     pos = {k: i for i, k in enumerate(keys)}
     results: dict[_BatchKey, ResultRef] = {}
     for key in order:
-        func, args, kwargs, cache, tags = normalized[pos[key]]
+        func, args, kwargs, cache, tags, retries = normalized[pos[key]]
         resolved_args = list(args)
         resolved_kwargs = dict(kwargs)
         for kind, arg_key, target_key in task_refs.get(key, []):
@@ -340,13 +369,13 @@ def _execute_batch(
             else:
                 resolved_kwargs[arg_key] = target_ref
         task_def = build_task_def(
-            func, tuple(resolved_args), resolved_kwargs, cache=cache, tags=tags
+            func, tuple(resolved_args), resolved_kwargs, cache=cache, tags=tags, retries=retries
         )
         commit, _was_cached = executor.submit(
             func, tuple(resolved_args), resolved_kwargs, task_def, store, serializer
         )
         if commit.output_ref is None:
-            raise RuntimeError(f"Task {commit.task_def.func_name} failed: {commit.error}")
+            raise TaskError(f"Task {commit.task_def.func_name} failed: {commit.error}")
         ref = ResultRef(commit.output_ref, store, serializer, commit_hash=commit.hash)
         results[key] = ref
     return results

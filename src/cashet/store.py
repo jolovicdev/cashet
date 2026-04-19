@@ -62,6 +62,7 @@ class SQLiteStore:
                 func_source TEXT,
                 dep_versions TEXT,
                 cache INTEGER NOT NULL DEFAULT 1,
+                retries INTEGER NOT NULL DEFAULT 0,
                 input_refs TEXT,
                 output_hash TEXT,
                 output_size INTEGER,
@@ -71,6 +72,7 @@ class SQLiteStore:
                 error TEXT,
                 tags TEXT,
                 created_at TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
                 last_accessed_at TEXT,
                 FOREIGN KEY (parent_hash) REFERENCES commits(hash)
             )
@@ -82,6 +84,8 @@ class SQLiteStore:
             "CREATE INDEX IF NOT EXISTS idx_last_accessed_at ON commits(last_accessed_at)"
         )
         self._migrate_last_accessed_at(conn)
+        self._migrate_retries(conn)
+        self._migrate_claimed_at(conn)
 
     def _migrate_last_accessed_at(self, conn: sqlite3.Connection) -> None:
         col_names = [r[1] for r in conn.execute("PRAGMA table_info(commits)").fetchall()]
@@ -91,6 +95,23 @@ class SQLiteStore:
             )
             conn.execute(
                 "UPDATE commits SET last_accessed_at = created_at WHERE last_accessed_at IS NULL"
+            )
+
+    def _migrate_retries(self, conn: sqlite3.Connection) -> None:
+        col_names = [r[1] for r in conn.execute("PRAGMA table_info(commits)").fetchall()]
+        if "retries" not in col_names:
+            conn.execute(
+                "ALTER TABLE commits ADD COLUMN retries INTEGER NOT NULL DEFAULT 0"
+            )
+
+    def _migrate_claimed_at(self, conn: sqlite3.Connection) -> None:
+        col_names = [r[1] for r in conn.execute("PRAGMA table_info(commits)").fetchall()]
+        if "claimed_at" not in col_names:
+            conn.execute(
+                "ALTER TABLE commits ADD COLUMN claimed_at TEXT NOT NULL DEFAULT ''"
+            )
+            conn.execute(
+                "UPDATE commits SET claimed_at = created_at WHERE claimed_at = ''"
             )
 
     def put_blob(self, data: bytes) -> ObjectRef:
@@ -146,10 +167,10 @@ class SQLiteStore:
         conn.execute(
             """INSERT OR REPLACE INTO commits
                (hash, fingerprint, func_name, func_hash, args_hash, args_snapshot,
-                func_source, dep_versions, cache, input_refs, output_hash, output_size,
+                func_source, dep_versions, cache, retries, input_refs, output_hash, output_size,
                 output_tier, parent_hash, status, error, tags, created_at,
-                last_accessed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                claimed_at, last_accessed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 commit.hash,
                 commit.fingerprint,
@@ -160,6 +181,7 @@ class SQLiteStore:
                 commit.task_def.func_source,
                 json.dumps(commit.task_def.dep_versions),
                 int(commit.task_def.cache),
+                commit.task_def.retries,
                 json.dumps([r.hash for r in commit.input_refs]),
                 output_hash,
                 output_size,
@@ -169,6 +191,7 @@ class SQLiteStore:
                 commit.error,
                 json.dumps(commit.tags),
                 commit.created_at.isoformat(),
+                commit.claimed_at.isoformat(),
                 accessed_at,
             ),
         )
@@ -187,6 +210,18 @@ class SQLiteStore:
             "UPDATE commits SET last_accessed_at = ? WHERE hash = ?",
             (datetime.now(UTC).isoformat(), row["hash"]),
         )
+        return self._row_to_commit(row)
+
+    def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
+        conn = self._connect()
+        row = conn.execute(
+            """SELECT * FROM commits
+               WHERE fingerprint = ? AND status = 'running'
+               ORDER BY claimed_at DESC LIMIT 1""",
+            (fingerprint,),
+        ).fetchone()
+        if row is None:
+            return None
         return self._row_to_commit(row)
 
     def get_commit(self, hash: str) -> Commit | None:
@@ -429,10 +464,14 @@ class SQLiteStore:
             dep_versions=dep_versions,
             cache=bool(row["cache"]),
             tags=tags,
+            retries=row["retries"] if "retries" in row.keys() else 0,  # noqa: SIM118
         )
         created_at = row["created_at"]
         if isinstance(created_at, str):
             created_at = datetime.fromisoformat(created_at)
+        claimed_at = row["claimed_at"]
+        if isinstance(claimed_at, str):
+            claimed_at = datetime.fromisoformat(claimed_at)
         return Commit(
             hash=row["hash"],
             task_def=task_def,
@@ -441,6 +480,7 @@ class SQLiteStore:
             parent_hash=row["parent_hash"],
             status=TaskStatus(row["status"]),
             created_at=created_at,
+            claimed_at=claimed_at,
             error=row["error"],
             tags=tags,
         )

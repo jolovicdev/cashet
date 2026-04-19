@@ -7,9 +7,244 @@ from typing import Any
 import pytest
 
 from cashet import Client
+from cashet.executor import LocalExecutor
 from cashet.hashing import PickleSerializer
 from cashet.models import ObjectRef, StorageTier
 from cashet.store import SQLiteStore
+
+
+class TestProcessSafety:
+    def test_cross_process_dedup(self, store_dir: Path) -> None:
+        import multiprocessing
+
+        # Pre-initialize store to avoid initialization races
+        _ = Client(store_dir=store_dir)
+
+        def worker(store_dir_str: str, x: int) -> None:
+            c = Client(store_dir=store_dir_str)
+
+            def expensive(v: int) -> int:
+                return v * v
+
+            c.submit(expensive, x)
+
+        processes = [
+            multiprocessing.Process(target=worker, args=(str(store_dir), 7))
+            for _ in range(4)
+        ]
+        for p in processes:
+            p.start()
+        for p in processes:
+            p.join()
+
+        client = Client(store_dir=store_dir)
+        log = client.log()
+        assert len(log) == 1
+
+    def test_store_lock_released_during_execution(self, store_dir: Path) -> None:
+        import threading
+        import time
+
+        client = Client(store_dir=store_dir)
+
+        def slow() -> int:
+            time.sleep(0.5)
+            return 1
+
+        def fast() -> int:
+            return 2
+
+        slow_done = threading.Event()
+        fast_done = threading.Event()
+
+        def run_slow() -> None:
+            client.submit(slow)
+            slow_done.set()
+
+        def run_fast() -> None:
+            time.sleep(0.1)
+            client.submit(fast)
+            fast_done.set()
+
+        t1 = threading.Thread(target=run_slow)
+        t2 = threading.Thread(target=run_fast)
+        t1.start()
+        t2.start()
+
+        assert fast_done.wait(timeout=1.0), "Fast task was blocked by slow task"
+        assert not slow_done.is_set(), "Slow task should not be done yet"
+
+        t1.join(timeout=2.0)
+        t2.join(timeout=2.0)
+
+    def test_running_claim_blocks_then_resolves(self, store_dir: Path) -> None:
+        import threading
+        import time
+
+        client = Client(store_dir=store_dir)
+        exec_count = 0
+
+        def slow() -> int:
+            nonlocal exec_count
+            exec_count += 1
+            time.sleep(0.3)
+            return 42
+
+        results: list[int] = []
+
+        def submitter() -> None:
+            ref = client.submit(slow)
+            results.append(ref.load())
+
+        t1 = threading.Thread(target=submitter)
+        t2 = threading.Thread(target=submitter)
+        t1.start()
+        time.sleep(0.05)
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert results == [42, 42]
+        assert exec_count == 1
+
+    def test_stale_running_claim_reclaimed(self, store_dir: Path) -> None:
+        import cashet.dag as dag
+        import cashet.hashing as hashing
+        from cashet.models import TaskStatus
+
+        client = Client(store_dir=store_dir)
+
+        def simple() -> int:
+            return 42
+
+        task_def = hashing.build_task_def(simple, (), {})
+        input_refs = dag.resolve_input_refs((), {})
+        commit = dag.build_commit(task_def, input_refs)
+        commit.status = TaskStatus.RUNNING
+        commit.created_at = datetime.now(UTC) - timedelta(seconds=400)
+        commit.claimed_at = datetime.now(UTC) - timedelta(seconds=400)
+        client.store.put_commit(commit)
+
+        ref = client.submit(simple)
+        assert ref.load() == 42
+
+        log = client.log()
+        assert len(log) == 1
+        assert log[0].status.value == "completed"
+
+    def test_running_claim_heartbeat_prevents_reclaim(self, store_dir: Path) -> None:
+        import threading
+        import time
+
+        client = Client(
+            store_dir=store_dir,
+            executor=LocalExecutor(running_ttl=timedelta(milliseconds=100)),
+        )
+        exec_count = 0
+
+        def slow() -> int:
+            nonlocal exec_count
+            exec_count += 1
+            time.sleep(0.3)
+            return 42
+
+        results: list[int] = []
+
+        def submitter() -> None:
+            ref = client.submit(slow)
+            results.append(ref.load())
+
+        t1 = threading.Thread(target=submitter)
+        t2 = threading.Thread(target=submitter)
+        t1.start()
+        time.sleep(0.05)
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert results == [42, 42]
+        assert exec_count == 1
+
+    def test_heartbeat_preserves_created_at(self, store_dir: Path) -> None:
+        import time
+
+        client = Client(
+            store_dir=store_dir,
+            executor=LocalExecutor(running_ttl=timedelta(milliseconds=100)),
+        )
+
+        def slow() -> int:
+            time.sleep(0.3)
+            return 42
+
+        ref = client.submit(slow)
+        assert ref.load() == 42
+
+        commit = client.log(limit=1)[0]
+        age = datetime.now(UTC) - commit.created_at
+        assert age >= timedelta(milliseconds=250)
+
+    def test_reclaimed_stale_claim_uses_current_retries(self, store_dir: Path) -> None:
+        import cashet.dag as dag
+        import cashet.hashing as hashing
+        from cashet.models import TaskStatus
+
+        client = Client(store_dir=store_dir)
+        attempts = 0
+
+        def flaky() -> int:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 2:
+                raise RuntimeError("boom")
+            return 7
+
+        task_def = hashing.build_task_def(flaky, (), {}, retries=0)
+        input_refs = dag.resolve_input_refs((), {})
+        commit = dag.build_commit(task_def, input_refs)
+        commit.status = TaskStatus.RUNNING
+        commit.created_at = datetime.now(UTC) - timedelta(seconds=400)
+        commit.claimed_at = datetime.now(UTC) - timedelta(seconds=400)
+        client.store.put_commit(commit)
+
+        ref = client.submit(flaky, _retries=3)
+        assert ref.load() == 7
+        assert attempts == 2
+
+    def test_running_claim_lookup_is_not_limited_to_1000_rows(self, store_dir: Path) -> None:
+        import cashet.dag as dag
+        import cashet.hashing as hashing
+        from cashet.models import TaskStatus
+
+        client = Client(
+            store_dir=store_dir,
+            executor=LocalExecutor(running_ttl=timedelta(seconds=10)),
+        )
+
+        def target(x: int) -> int:
+            return x + 1
+
+        target_def = hashing.build_task_def(target, (1,), {})
+        target_commit = dag.build_commit(target_def, [])
+        target_commit.status = TaskStatus.RUNNING
+        target_commit.created_at = datetime.now(UTC) - timedelta(seconds=2)
+        target_commit.claimed_at = datetime.now(UTC)
+        client.store.put_commit(target_commit)
+
+        for i in range(1001):
+            def other(v: int = i) -> int:
+                return v
+
+            task_def = hashing.build_task_def(other, (i,), {}, cache=False)
+            commit = dag.build_commit(task_def, [])
+            commit.status = TaskStatus.RUNNING
+            commit.created_at = datetime.now(UTC) + timedelta(milliseconds=i + 1)
+            commit.claimed_at = datetime.now(UTC) + timedelta(milliseconds=i + 1)
+            client.store.put_commit(commit)
+
+        claim = client.store.find_running_by_fingerprint(target_def.fingerprint)
+        assert claim is not None
+        assert claim.hash == target_commit.hash
 
 
 class TestStoreOperations:
@@ -22,6 +257,15 @@ class TestStoreOperations:
         client.submit(f, 3)
         log = client.log()
         assert len(log) == 3
+
+    def test_retries_roundtrip(self, client: Client) -> None:
+        def stable() -> int:
+            return 42
+
+        ref = client.submit(stable, _retries=3)
+        assert ref.load() == 42
+        commit = client.log(limit=1)[0]
+        assert commit.task_def.retries == 3
 
     def test_log_filter_by_func(self, client: Client) -> None:
         def foo(x: int) -> int:
@@ -476,6 +720,20 @@ class TestTags:
         filtered = client.log(tags={"env": ""})
         assert len(filtered) == 1
         assert "a" in filtered[0].task_def.func_name
+
+    def test_log_accepts_string_status(self, client: Client) -> None:
+        def boom() -> None:
+            raise ValueError("fail")
+
+        with pytest.raises(RuntimeError):
+            client.submit(boom)
+
+        filtered = client.log(status="failed")
+        assert len(filtered) == 1
+
+    def test_log_rejects_invalid_string_status(self, client: Client) -> None:
+        with pytest.raises(ValueError, match="Invalid status"):
+            client.log(status="nope")
 
 
 class TestDeleteCommit:

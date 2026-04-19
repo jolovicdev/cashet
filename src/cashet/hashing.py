@@ -479,6 +479,7 @@ def build_task_def(
     kwargs: dict[str, Any],
     cache: bool = True,
     tags: dict[str, str] | None = None,
+    retries: int = 0,
 ) -> TaskDef:
     func_hash = hash_function(func)
     args_hash_val = hash_args(*args, **kwargs)
@@ -494,4 +495,5 @@ def build_task_def(
         dep_versions=dep_versions,
         cache=cache,
         tags=tags or {},
+        retries=retries,
     )
