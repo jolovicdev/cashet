@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from cashet import Client, ResultRef, TaskRef, TaskStatus
+from cashet import Client, ResultRef, TaskError, TaskRef, TaskStatus
 
 
 class TestBasicSubmit:
@@ -296,6 +296,98 @@ class TestNonDeterministicOptOut:
         assert r1.load() != r2.load()
 
 
+class TestForceRerun:
+    def test_force_reruns_cached_task(self, client: Client) -> None:
+        call_count = 0
+
+        def compute(x: int) -> int:
+            nonlocal call_count
+            call_count += 1
+            return x * 2
+
+        r1 = client.submit(compute, 5)
+        assert r1.load() == 10
+        assert call_count == 1
+
+        r2 = client.submit(compute, 5, _force=True)
+        assert r2.load() == 10
+        assert call_count == 2
+
+    def test_force_decorator(self, client: Client) -> None:
+        call_count = 0
+
+        @client.task(force=True)
+        def compute() -> int:
+            nonlocal call_count
+            call_count += 1
+            return call_count
+
+        r1 = client.submit(compute)
+        r2 = client.submit(compute)
+        assert r1.load() == 1
+        assert r2.load() == 2
+
+    def test_force_preserves_parent_hash(self, client: Client) -> None:
+        def compute(x: int) -> int:
+            return x + 1
+
+        r1 = client.submit(compute, 5)
+        r2 = client.submit(compute, 5, _force=True)
+        assert r2.commit_hash != r1.commit_hash
+        c2 = client.show(r2.commit_hash)
+        assert c2 is not None
+        assert c2.parent_hash == r1.commit_hash
+
+
+class TestTimeout:
+    def test_task_times_out(self, client: Client) -> None:
+        import time
+
+        def slow() -> str:
+            time.sleep(5)
+            return "done"
+
+        with pytest.raises(TaskError, match="TimeoutError"):
+            client.submit(slow, _timeout=0.1)
+
+    def test_task_within_timeout_succeeds(self, client: Client) -> None:
+        import time
+
+        def fast() -> str:
+            time.sleep(0.01)
+            return "done"
+
+        ref = client.submit(fast, _timeout=1)
+        assert ref.load() == "done"
+
+    def test_timeout_with_retry(self, client: Client) -> None:
+        import time
+
+        attempts = 0
+
+        def flaky() -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 2:
+                time.sleep(5)
+            return "ok"
+
+        ref = client.submit(flaky, _timeout=0.1, _retries=1)
+        assert ref.load() == "ok"
+        assert attempts == 2
+
+    def test_timeout_decorator(self, client: Client) -> None:
+        import time
+
+        @client.task(timeout=0.1)
+        def slow() -> str:
+            time.sleep(5)
+            return "done"
+
+        with pytest.raises(TaskError, match="TimeoutError"):
+            slow()
+
+
 class TestParentHashLineage:
     def test_second_commit_has_parent(self, client: Client) -> None:
         def compute(x: int) -> int:
@@ -481,6 +573,55 @@ class TestSubmitMany:
 
         with pytest.raises(TypeError, match="expected args as tuple"):
             client.submit_many([(f, "not_a_tuple")])
+
+    def test_submit_many_parallel_fan_out(self, client: Client) -> None:
+        import threading
+        import time
+
+        barrier = threading.Barrier(2)
+
+        def gen() -> int:
+            return 5
+
+        def double(x: int) -> int:
+            time.sleep(0.05)
+            barrier.wait(timeout=2)
+            return x * 2
+
+        def triple(x: int) -> int:
+            time.sleep(0.05)
+            barrier.wait(timeout=2)
+            return x * 3
+
+        refs = client.submit_many([
+            gen,
+            (double, (TaskRef(0),)),
+            (triple, (TaskRef(0),)),
+        ], max_workers=2)
+        assert refs[0].load() == 5
+        assert refs[1].load() == 10
+        assert refs[2].load() == 15
+
+    def test_submit_many_parallel_order_respected(self, client: Client) -> None:
+        import time
+
+        order: list[int] = []
+
+        def step1() -> int:
+            time.sleep(0.05)
+            order.append(1)
+            return 10
+
+        def step2(x: int) -> int:
+            order.append(2)
+            return x * 2
+
+        refs = client.submit_many([
+            step1,
+            (step2, (TaskRef(0),)),
+        ], max_workers=2)
+        assert refs[1].load() == 20
+        assert order == [1, 2]
 
 
 class TestResultRefCommitHash:

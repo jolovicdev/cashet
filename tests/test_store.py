@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -445,7 +446,7 @@ class TestBlobIntegrity:
 
     def test_corrupted_blob_raises_valueerror(self, store_dir: Path) -> None:
         store = SQLiteStore(store_dir)
-        data = b"important data"
+        data = b"important data" * 100
         ref = store.put_blob(data)
         obj_path = store.objects_dir / ref.hash[:2] / ref.hash[2:]
         obj_path.write_bytes(b"corrupted garbage data")
@@ -454,7 +455,7 @@ class TestBlobIntegrity:
 
     def test_corrupted_compressed_blob_raises_valueerror(self, store_dir: Path) -> None:
         store = SQLiteStore(store_dir)
-        data = b"y" * 1000
+        data = b"y" * 2000
         ref = store.put_blob(data)
         obj_path = store.objects_dir / ref.hash[:2] / ref.hash[2:]
         import zlib
@@ -473,6 +474,70 @@ class TestBlobIntegrity:
         fake_path.write_bytes(b"fake data")
         with pytest.raises(ValueError, match="integrity check failed"):
             store.get_blob(fake_ref)
+
+
+class TestInlineStorage:
+    def test_small_blob_uses_inline_tier(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        data = b"tiny"
+        ref = store.put_blob(data)
+        assert ref.tier == StorageTier.INLINE
+        assert not (store.objects_dir / ref.hash[:2] / ref.hash[2:]).exists()
+
+    def test_large_blob_uses_blob_tier(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        data = b"x" * 2000
+        ref = store.put_blob(data)
+        assert ref.tier == StorageTier.BLOB
+        assert (store.objects_dir / ref.hash[:2] / ref.hash[2:]).exists()
+
+    def test_inline_round_trip(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        data = b"inline data"
+        ref = store.put_blob(data)
+        assert store.get_blob(ref) == data
+
+    def test_inline_dedup(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        data = b"dedup"
+        ref1 = store.put_blob(data)
+        ref2 = store.put_blob(data)
+        assert ref1.hash == ref2.hash
+        conn = sqlite3.connect(str(store.db_path))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM inline_objects WHERE hash = ?", (ref1.hash,)
+        ).fetchone()[0]
+        assert count == 1
+
+    def test_inline_delete_removes_orphans(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        data = b"orphan"
+        ref = store.put_blob(data)
+        # create a dummy commit referencing the inline blob so delete_commit finds it
+        from cashet.models import Commit, TaskDef, TaskStatus
+        task_def = TaskDef(
+            func_hash="a", func_name="f", func_source="", args_hash="b", args_snapshot=b""
+        )
+        commit = Commit(
+            hash="c" * 64,
+            task_def=task_def,
+            output_ref=ref,
+            status=TaskStatus.COMPLETED,
+        )
+        store.put_commit(commit)
+        store.delete_commit(commit.hash)
+        assert store.blob_exists(ref.hash) is False
+
+    def test_inline_stats(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        store.put_blob(b"small")
+        large_data = bytes(range(256)) * 10  # incompressible-ish
+        store.put_blob(large_data)
+        stats = store.stats()
+        assert stats["inline_objects"] == 1
+        assert stats["inline_bytes"] == 5
+        assert stats["blob_objects"] == 1
+        assert 0 < stats["blob_bytes"] <= len(large_data)
 
 
 class TestGarbageCollection:
@@ -849,3 +914,46 @@ class TestDeleteCommit:
         newer_after = client.show(newer.hash)
         assert newer_after is not None
         assert newer_after.parent_hash is None
+
+
+class TestSizeAwareGC:
+    def test_gc_max_size_evicts_oldest(self, client: Client) -> None:
+        def make_bytes(n: int) -> bytes:
+            return b"x" * n
+
+        ref1 = client.submit(make_bytes, 5000, _cache=False)
+        ref2 = client.submit(make_bytes, 5000, _cache=False)
+        assert client.stats()["disk_bytes"] > 0
+
+        client.gc(max_size_bytes=1)
+        assert client.show(ref1.hash) is None
+        assert client.show(ref2.hash) is None
+
+    def test_gc_max_size_respects_limit(self, client: Client) -> None:
+        def make_bytes(n: int) -> bytes:
+            return b"x" * n
+
+        client.submit(make_bytes, 100, _cache=False)
+        client.submit(make_bytes, 100, _cache=False)
+        client.submit(make_bytes, 100, _cache=False)
+        initial_stats = client.stats()
+        initial_size = initial_stats["disk_bytes"]
+        assert initial_size > 0
+
+        # Evict until under a very small limit
+        client.gc(max_size_bytes=1)
+        final_stats = client.stats()
+        assert final_stats["disk_bytes"] <= 1
+        assert final_stats["total_commits"] == 0
+
+    def test_gc_combines_time_and_size(self, client: Client) -> None:
+        def make_bytes(n: int) -> bytes:
+            return b"x" * n
+
+        client.submit(make_bytes, 100, _cache=False)
+        stats = client.stats()
+        assert stats["total_commits"] == 1
+
+        # Time-based eviction keeps it (recent), size-based should evict it
+        client.gc(older_than=timedelta(days=1), max_size_bytes=1)
+        assert client.stats()["total_commits"] == 0

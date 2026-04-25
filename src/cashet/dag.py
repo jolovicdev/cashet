@@ -110,7 +110,7 @@ def build_commit(
     parent_hash: str | None = None,
 ) -> Commit:
     salt = None
-    if not task_def.cache:
+    if not task_def.cache or task_def.force:
         salt = f"{time.time_ns()}"
     commit_hash = compute_commit_hash(task_def, input_refs, salt=salt)
     return Commit(

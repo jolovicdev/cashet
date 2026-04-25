@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
@@ -27,6 +28,7 @@ class Client:
         store: Store | None = None,
         executor: Executor | None = None,
         serializer: Serializer | None = None,
+        max_workers: int = 1,
     ) -> None:
         if store is not None:
             self.store: Store = store
@@ -45,6 +47,7 @@ class Client:
         self._executor: Executor = executor or LocalExecutor()
         self.serializer: Serializer = serializer or PickleSerializer()
         self._registered_tasks: dict[str, Callable[..., Any]] = {}
+        self._max_workers = max_workers
 
     def task(
         self,
@@ -54,6 +57,8 @@ class Client:
         name: str | None = None,
         tags: dict[str, str] | None = None,
         retries: int = 0,
+        force: bool = False,
+        timeout: int | float | None = None,
     ) -> Callable[..., Any]:
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             task_name = name or fn.__qualname__
@@ -61,6 +66,8 @@ class Client:
             fn._cashet_name = task_name  # pyright: ignore[reportFunctionMemberAccess]
             fn._cashet_tags = tags or {}  # pyright: ignore[reportFunctionMemberAccess]
             fn._cashet_retries = retries  # pyright: ignore[reportFunctionMemberAccess]
+            fn._cashet_force = force  # pyright: ignore[reportFunctionMemberAccess]
+            fn._cashet_timeout = timeout  # pyright: ignore[reportFunctionMemberAccess]
             self._registered_tasks[task_name] = fn
 
             @wraps(fn)
@@ -72,6 +79,8 @@ class Client:
             wrapper._cashet_name = task_name  # pyright: ignore[reportAttributeAccessIssue]
             wrapper._cashet_tags = tags or {}  # pyright: ignore[reportAttributeAccessIssue]
             wrapper._cashet_retries = retries  # pyright: ignore[reportAttributeAccessIssue]
+            wrapper._cashet_force = force  # pyright: ignore[reportAttributeAccessIssue]
+            wrapper._cashet_timeout = timeout  # pyright: ignore[reportAttributeAccessIssue]
             return wrapper
 
         if func is not None:
@@ -85,13 +94,29 @@ class Client:
         _cache: bool | None = None,
         _tags: dict[str, str] | None = None,
         _retries: int | None = None,
+        _force: bool | None = None,
+        _timeout: int | float | None = None,
         **kwargs: Any,
     ) -> ResultRef:
         raw_func = getattr(func, "_cashet_wrapped_func", func)
         cache = _cache if _cache is not None else getattr(raw_func, "_cashet_cache", True)
         tags = _tags if _tags is not None else getattr(raw_func, "_cashet_tags", {})
         retries = _retries if _retries is not None else getattr(raw_func, "_cashet_retries", 0)
-        task_def = build_task_def(raw_func, args, kwargs, cache=cache, tags=tags, retries=retries)
+        force = _force if _force is not None else getattr(raw_func, "_cashet_force", False)
+        timeout_seconds = (
+            _timeout if _timeout is not None else getattr(raw_func, "_cashet_timeout", None)
+        )
+        timeout = timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
+        task_def = build_task_def(
+            raw_func,
+            args,
+            kwargs,
+            cache=cache,
+            tags=tags,
+            retries=retries,
+            force=force,
+            timeout=timeout,
+        )
         commit, _was_cached = self._executor.submit(
             raw_func, args, kwargs, task_def, self.store, self.serializer
         )
@@ -112,6 +137,9 @@ class Client:
         _cache: bool | None = None,
         _tags: dict[str, str] | None = None,
         _retries: int | None = None,
+        _force: bool | None = None,
+        _timeout: int | float | None = None,
+        max_workers: int | None = None,
     ) -> list[ResultRef]: ...
 
     @overload
@@ -127,6 +155,9 @@ class Client:
         _cache: bool | None = None,
         _tags: dict[str, str] | None = None,
         _retries: int | None = None,
+        _force: bool | None = None,
+        _timeout: int | float | None = None,
+        max_workers: int | None = None,
     ) -> dict[str, ResultRef]: ...
 
     def submit_many(
@@ -136,6 +167,9 @@ class Client:
         _cache: bool | None = None,
         _tags: dict[str, str] | None = None,
         _retries: int | None = None,
+        _force: bool | None = None,
+        _timeout: int | float | None = None,
+        max_workers: int | None = None,
     ) -> list[ResultRef] | dict[str, ResultRef]:
         is_dict = isinstance(tasks, dict)
         if is_dict:
@@ -144,11 +178,20 @@ class Client:
             keys, raw_tasks = _unpack_list_tasks(tasks)
 
         key_set = set(keys)
-        normalized = _normalize_tasks(raw_tasks, _cache, _tags, _retries)
+        normalized = _normalize_tasks(raw_tasks, _cache, _tags, _retries, _force, _timeout)
         deps, task_refs = _build_deps(keys, normalized, key_set)
         order = _topological_sort(deps)
+        workers = max_workers if max_workers is not None else self._max_workers
         results = _execute_batch(
-            order, keys, normalized, task_refs, self._executor, self.store, self.serializer
+            order,
+            keys,
+            normalized,
+            task_refs,
+            deps,
+            self._executor,
+            self.store,
+            self.serializer,
+            workers,
         )
 
         if is_dict:
@@ -205,10 +248,12 @@ class Client:
     def rm(self, hash: str) -> bool:
         return self.store.delete_commit(hash)
 
-    def gc(self, older_than: timedelta | None = None) -> int:
+    def gc(
+        self, older_than: timedelta | None = None, max_size_bytes: int | None = None
+    ) -> int:
         ttl = older_than if older_than is not None else timedelta(days=_DEFAULT_GC_TTL_DAYS)
         cutoff = datetime.now(UTC) - ttl
-        return self.store.evict(cutoff)
+        return self.store.evict(cutoff, max_size_bytes=max_size_bytes)
 
     def clear(self) -> int:
         return self.gc(timedelta(days=0))
@@ -224,7 +269,9 @@ class Client:
 
 
 _BatchKey = int | str
-_NormalizedTask = tuple[Any, tuple[Any, ...], dict[str, Any], bool, dict[str, str], int]
+_NormalizedTask = tuple[
+    Any, tuple[Any, ...], dict[str, Any], bool, dict[str, str], int, bool, timedelta | None
+]
 
 
 def _unpack_dict_tasks(
@@ -243,6 +290,8 @@ def _normalize_tasks(
     default_cache: bool | None,
     default_tags: dict[str, str] | None,
     default_retries: int | None = None,
+    default_force: bool | None = None,
+    default_timeout: int | float | None = None,
 ) -> list[_NormalizedTask]:
     normalized: list[_NormalizedTask] = []
     for i, task in enumerate(raw_tasks):
@@ -295,7 +344,26 @@ def _normalize_tasks(
                 0,
             )
         )
-        normalized.append((raw_func, args, kwargs, cache, tags, retries))
+        force = (
+            default_force
+            if default_force is not None
+            else getattr(
+                raw_func,
+                "_cashet_force",
+                False,
+            )
+        )
+        timeout_seconds = (
+            default_timeout
+            if default_timeout is not None
+            else getattr(
+                raw_func,
+                "_cashet_timeout",
+                None,
+            )
+        )
+        timeout = timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
+        normalized.append((raw_func, args, kwargs, cache, tags, retries, force, timeout))
     return normalized
 
 
@@ -306,7 +374,8 @@ def _build_deps(
 ) -> tuple[dict[_BatchKey, set[_BatchKey]], dict[_BatchKey, list[tuple[str, Any, _BatchKey]]]]:
     deps: dict[_BatchKey, set[_BatchKey]] = {k: set() for k in keys}
     task_refs: dict[_BatchKey, list[tuple[str, Any, _BatchKey]]] = {}
-    for key, (_func, args, kwargs, _cache, _tags, _retries) in zip(keys, normalized, strict=True):
+    for key, item in zip(keys, normalized, strict=True):
+        _func, args, kwargs, _cache, _tags, _retries, _force, _timeout = item
         for j, arg in enumerate(args):
             if isinstance(arg, TaskRef):
                 deps[key].add(arg.key)
@@ -321,6 +390,16 @@ def _build_deps(
             if d == key:
                 raise ValueError(f"Task {key!r} cannot depend on itself")
     return deps, task_refs
+
+
+def _reverse_deps(
+    deps: dict[_BatchKey, set[_BatchKey]],
+) -> dict[_BatchKey, set[_BatchKey]]:
+    rev: dict[_BatchKey, set[_BatchKey]] = {k: set() for k in deps}
+    for key, dep_set in deps.items():
+        for d in dep_set:
+            rev[d].add(key)
+    return rev
 
 
 def _topological_sort(deps: dict[_BatchKey, set[_BatchKey]]) -> list[_BatchKey]:
@@ -350,14 +429,19 @@ def _execute_batch(
     keys: list[_BatchKey],
     normalized: list[_NormalizedTask],
     task_refs: dict[_BatchKey, list[tuple[str, Any, _BatchKey]]],
+    deps: dict[_BatchKey, set[_BatchKey]],
     executor: Executor,
     store: Store,
     serializer: Serializer,
+    max_workers: int | None,
 ) -> dict[_BatchKey, ResultRef]:
     pos = {k: i for i, k in enumerate(keys)}
     results: dict[_BatchKey, ResultRef] = {}
-    for key in order:
-        func, args, kwargs, cache, tags, retries = normalized[pos[key]]
+    rev = _reverse_deps(deps)
+    in_degree = {k: len(deps[k]) for k in keys}
+
+    def _run_single(key: _BatchKey) -> ResultRef:
+        func, args, kwargs, cache, tags, retries, force, timeout = normalized[pos[key]]
         resolved_args = list(args)
         resolved_kwargs = dict(kwargs)
         for kind, arg_key, target_key in task_refs.get(key, []):
@@ -369,7 +453,14 @@ def _execute_batch(
             else:
                 resolved_kwargs[arg_key] = target_ref
         task_def = build_task_def(
-            func, tuple(resolved_args), resolved_kwargs, cache=cache, tags=tags, retries=retries
+            func,
+            tuple(resolved_args),
+            resolved_kwargs,
+            cache=cache,
+            tags=tags,
+            retries=retries,
+            force=force,
+            timeout=timeout,
         )
         commit, _was_cached = executor.submit(
             func, tuple(resolved_args), resolved_kwargs, task_def, store, serializer
@@ -377,7 +468,29 @@ def _execute_batch(
         if commit.output_ref is None:
             raise TaskError(f"Task {commit.task_def.func_name} failed: {commit.error}")
         ref = ResultRef(commit.output_ref, store, serializer, commit_hash=commit.hash)
-        results[key] = ref
+        return ref
+
+    if max_workers is None or max_workers == 1:
+        for key in order:
+            results[key] = _run_single(key)
+        return results
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures: dict[Any, _BatchKey] = {}
+        for key in keys:
+            if in_degree[key] == 0:
+                futures[pool.submit(_run_single, key)] = key
+
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                key = futures.pop(future)
+                results[key] = future.result()
+                for dependent in rev[key]:
+                    in_degree[dependent] -= 1
+                    if in_degree[dependent] == 0:
+                        futures[pool.submit(_run_single, dependent)] = dependent
+
     return results
 
 

@@ -250,15 +250,35 @@ def rm_cmd(hash: str) -> None:
         raise SystemExit(1)
 
 
+def _parse_size(size_str: str) -> int:
+    size_str = size_str.strip().upper()
+    units = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+    for unit, factor in sorted(units.items(), key=lambda x: -len(x[0])):
+        if size_str.endswith(unit):
+            return int(float(size_str[: -len(unit)]) * factor)
+    return int(size_str)
+
+
 @main.command("gc")
 @click.option("--older-than", "-d", default=30, help="Evict entries older than N days")
-def gc_cmd(older_than: int) -> None:
+@click.option(
+    "--max-size",
+    "-s",
+    default=None,
+    help="Evict oldest entries until total size is under limit (e.g., 1GB)",
+)
+def gc_cmd(older_than: int, max_size: str | None) -> None:
     """Evict old cache entries and orphaned blobs"""
     from datetime import timedelta
 
     client = _client()
-    deleted = client.gc(timedelta(days=older_than))
-    console.print(f"[green]Evicted {deleted} commit(s) older than {older_than} day(s).[/green]")
+    max_size_bytes = _parse_size(max_size) if max_size else None
+    deleted = client.gc(timedelta(days=older_than), max_size_bytes=max_size_bytes)
+    msg = f"[green]Evicted {deleted} commit(s)"
+    if max_size:
+        msg += f" (max size {max_size})"
+    msg += ".[/green]"
+    console.print(msg)
 
 
 @main.command("clear")

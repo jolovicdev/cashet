@@ -8,7 +8,7 @@ from cashet.hashing import (
     SafePickleSerializer,
     Serializer,
 )
-from cashet.models import Commit, ObjectRef, TaskDef, TaskStatus
+from cashet.models import Commit, ObjectRef, TaskDef, TaskError, TaskStatus
 from cashet.protocols import Executor, Store
 from cashet.store import SQLiteStore
 
@@ -27,6 +27,7 @@ __all__ = [
     "Serializer",
     "Store",
     "TaskDef",
+    "TaskError",
     "TaskRef",
     "TaskStatus",
 ]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 
@@ -45,6 +45,8 @@ class TaskDef:
     cache: bool = True
     tags: dict[str, str] = field(default_factory=dict[str, str])
     retries: int = 0
+    force: bool = False
+    timeout: timedelta | None = None
 
     @property
     def fingerprint(self) -> str:

@@ -10,6 +10,7 @@ import sys
 import textwrap
 import types
 import warnings
+from datetime import timedelta
 from typing import Any, Protocol, runtime_checkable
 
 from cashet.models import TaskDef
@@ -480,6 +481,8 @@ def build_task_def(
     cache: bool = True,
     tags: dict[str, str] | None = None,
     retries: int = 0,
+    force: bool = False,
+    timeout: timedelta | None = None,
 ) -> TaskDef:
     func_hash = hash_function(func)
     args_hash_val = hash_args(*args, **kwargs)
@@ -496,4 +499,6 @@ def build_task_def(
         cache=cache,
         tags=tags or {},
         retries=retries,
+        force=force,
+        timeout=timeout,
     )

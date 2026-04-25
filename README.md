@@ -131,7 +131,7 @@ The core idea: **hash the function's AST-normalized source + arguments = unique 
 You run 200 hyperparameter sweeps overnight. Half crash. You fix a bug and re-run. Without cashet, you re-process the dataset 200 times. With cashet:
 
 ```python
-from cashet import Client, TaskRef
+from cashet import Client, TaskError, TaskRef
 
 client = Client()
 
@@ -253,6 +253,9 @@ cashet rm <hash>
 # Evict old cache entries and orphaned blobs
 cashet gc --older-than 30
 
+# Evict oldest entries until under a size limit
+cashet gc --max-size 1GB
+
 # Clear everything (alias for gc --older-than 0)
 cashet clear
 
@@ -273,6 +276,7 @@ client = Client(
     store=None,                # or inject any Store implementation
     executor=None,             # or inject any Executor implementation
     serializer=None,           # defaults to PickleSerializer
+    max_workers=1,             # max parallelism for submit_many (default: 1, sequential)
 )
 ```
 
@@ -371,7 +375,7 @@ refs = client.submit_many([
     step1_func,
     (step2_func, (TaskRef(0),)),
     (step3_func, (TaskRef(1), "extra_arg")),
-])
+], max_workers=4)  # run independent tasks in parallel
 ```
 
 This enables parallel fan-out and ensures each task only runs after its dependencies.
@@ -386,6 +390,18 @@ ref = client.submit(non_deterministic_func, _cache=False)
 @client.task(cache=False)
 def random_score():
     return random.random()
+```
+
+**Force re-execution (skip cache, always run):**
+
+```python
+# Per-call
+ref = client.submit(my_func, arg, _force=True)
+
+# Per-function via decorator
+@client.task(force=True)
+def always_rerun():
+    ...
 ```
 
 **Tag commits:**
@@ -414,7 +430,21 @@ def fetch_api(url):
     ...
 ```
 
-Retries wait briefly between attempts. When retries are exhausted, `client.submit` raises `RuntimeError` with the original traceback included in the message.
+Retries wait briefly between attempts. When retries are exhausted, `client.submit` raises `TaskError` with the original traceback included in the message.
+
+**Task timeouts:**
+
+```python
+# Per-call (seconds)
+ref = client.submit(slow_func, _timeout=30)
+
+# Per-function via decorator
+@client.task(timeout=30)
+def slow_func():
+    ...
+```
+
+Timeouts can be combined with retries — a timed-out attempt counts as a failure and will be retried.
 
 ### `@client.task`
 
@@ -469,10 +499,21 @@ evicted = client.gc()
 # Evict entries older than 7 days
 from datetime import timedelta
 evicted = client.gc(older_than=timedelta(days=7))
+# Evict oldest entries until under size limit
+evicted = client.gc(max_size_bytes=1024 * 1024 * 1024)  # 1GB
 
 # Storage stats
 stats = client.stats()
-# {'total_commits': 42, 'completed_commits': 40, 'stored_objects': 38, 'disk_bytes': 10485760}
+# {
+#     'total_commits': 42,
+#     'completed_commits': 40,
+#     'stored_objects': 38,      # blob_objects + inline_objects
+#     'disk_bytes': 10485760,    # blob_bytes + inline_bytes
+#     'blob_objects': 35,
+#     'blob_bytes': 9437184,
+#     'inline_objects': 3,
+#     'inline_bytes': 1048576,
+# }
 ```
 
 ### Jupyter & Notebook Support
@@ -607,8 +648,10 @@ client.submit(func, arg1, arg2)
 │   │   └── b4c5d6... # compressed result blob
 │   └── e7/
 │       └── f8g9h0...
-└── meta.db           # SQLite: commits, fingerprints, provenance
+└── meta.db           # SQLite: commits, fingerprints, provenance, inline_objects
 ```
+
+**Small objects** (<1KB) are stored inline in `meta.db` instead of the filesystem. This reduces inode overhead for caches with many tiny results. Larger objects are stored as compressed blobs in `objects/` as usual.
 
 **Key design decisions:**
 

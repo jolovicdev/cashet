@@ -12,6 +12,7 @@ from typing import Any
 from cashet.models import Commit, ObjectRef, StorageTier, TaskDef, TaskStatus
 
 _BLOB_COMPRESS_THRESHOLD = 256
+_INLINE_THRESHOLD = 1024
 
 
 class SQLiteStore:
@@ -86,6 +87,12 @@ class SQLiteStore:
         self._migrate_last_accessed_at(conn)
         self._migrate_retries(conn)
         self._migrate_claimed_at(conn)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS inline_objects (
+                hash TEXT PRIMARY KEY,
+                data BLOB NOT NULL
+            )
+        """)
 
     def _migrate_last_accessed_at(self, conn: sqlite3.Connection) -> None:
         col_names = [r[1] for r in conn.execute("PRAGMA table_info(commits)").fetchall()]
@@ -116,6 +123,13 @@ class SQLiteStore:
 
     def put_blob(self, data: bytes) -> ObjectRef:
         content_hash = hashlib.sha256(data).hexdigest()
+        if len(data) < _INLINE_THRESHOLD:
+            conn = self._connect()
+            conn.execute(
+                "INSERT OR IGNORE INTO inline_objects (hash, data) VALUES (?, ?)",
+                (content_hash, data),
+            )
+            return ObjectRef(hash=content_hash, size=len(data), tier=StorageTier.INLINE)
         prefix = content_hash[:2]
         suffix = content_hash[2:]
         obj_path = self.objects_dir / prefix / suffix
@@ -131,6 +145,17 @@ class SQLiteStore:
         return ObjectRef(hash=content_hash, size=len(data), tier=StorageTier.BLOB)
 
     def get_blob(self, ref: ObjectRef) -> bytes:
+        if ref.tier == StorageTier.INLINE:
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT data FROM inline_objects WHERE hash = ?", (ref.hash,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Inline blob {ref.hash} not found")
+            data = row["data"]
+            if hashlib.sha256(data).hexdigest() != ref.hash:
+                raise ValueError(f"Inline blob {ref.hash} integrity check failed")
+            return data
         prefix = ref.hash[:2]
         suffix = ref.hash[2:]
         obj_path = self.objects_dir / prefix / suffix
@@ -146,7 +171,13 @@ class SQLiteStore:
         return raw
 
     def blob_exists(self, hash: str) -> bool:
-        return (self.objects_dir / hash[:2] / hash[2:]).exists()
+        if (self.objects_dir / hash[:2] / hash[2:]).exists():
+            return True
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT 1 FROM inline_objects WHERE hash = ?", (hash,)
+        ).fetchone()
+        return row is not None
 
     def put_commit(self, commit: Commit) -> None:
         conn = self._connect(immediate=True)
@@ -319,14 +350,25 @@ class SQLiteStore:
                     if f.is_file():
                         obj_count += 1
                         total_bytes += f.stat().st_size
+        inline_row = conn.execute(
+            "SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(data)), 0) AS bytes FROM inline_objects"
+        ).fetchone()
+        inline_count = inline_row["cnt"] if inline_row else 0
+        inline_bytes = inline_row["bytes"] if inline_row else 0
         return {
             "total_commits": total,
             "completed_commits": completed,
-            "stored_objects": obj_count,
-            "disk_bytes": total_bytes,
+            "stored_objects": obj_count + inline_count,
+            "disk_bytes": total_bytes + inline_bytes,
+            "blob_objects": obj_count,
+            "blob_bytes": total_bytes,
+            "inline_objects": inline_count,
+            "inline_bytes": inline_bytes,
         }
 
-    def evict(self, older_than: datetime) -> int:
+    def evict(
+        self, older_than: datetime, max_size_bytes: int | None = None
+    ) -> int:
         conn = self._connect(immediate=True)
         orphans: list[str] = []
         try:
@@ -362,13 +404,28 @@ class SQLiteStore:
             )
             deleted = cursor.rowcount
             if candidates:
-                orphans = self._find_orphan_blobs(conn, candidates)
+                orphans = self._find_orphan_objects(conn, candidates)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
         if orphans:
-            self._delete_orphan_blobs(orphans)
+            self._delete_orphan_objects(conn, orphans)
+
+        if max_size_bytes is not None:
+            total_commits = conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0]
+            for _ in range(total_commits):
+                stats = self.stats()
+                if stats["disk_bytes"] <= max_size_bytes:
+                    break
+                row = conn.execute(
+                    "SELECT hash FROM commits ORDER BY last_accessed_at ASC LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    break
+                if self.delete_commit(row["hash"]):
+                    deleted += 1
+
         return deleted
 
     def delete_commit(self, hash: str) -> bool:
@@ -408,17 +465,17 @@ class SQLiteStore:
             conn.execute("DELETE FROM commits WHERE hash = ?", (target["hash"],))
 
             if candidates:
-                orphans = self._find_orphan_blobs(conn, candidates)
+                orphans = self._find_orphan_objects(conn, candidates)
 
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
         if orphans:
-            self._delete_orphan_blobs(orphans)
+            self._delete_orphan_objects(conn, orphans)
         return True
 
-    def _find_orphan_blobs(self, conn: sqlite3.Connection, candidates: set[str]) -> list[str]:
+    def _find_orphan_objects(self, conn: sqlite3.Connection, candidates: set[str]) -> list[str]:
         still_output: set[str] = set()
         for row in conn.execute("SELECT output_hash FROM commits WHERE output_hash IS NOT NULL"):
             still_output.add(row[0])
@@ -427,11 +484,14 @@ class SQLiteStore:
             still_input.update(json.loads(row[0]))
         return [h for h in candidates if h not in still_output and h not in still_input]
 
-    def _delete_orphan_blobs(self, orphans: list[str]) -> None:
-        for blob_hash in orphans:
-            blob_path = self.objects_dir / blob_hash[:2] / blob_hash[2:]
+    def _delete_orphan_objects(self, conn: sqlite3.Connection | None, orphans: list[str]) -> None:
+        if conn is None:
+            conn = self._connect()
+        for obj_hash in orphans:
+            blob_path = self.objects_dir / obj_hash[:2] / obj_hash[2:]
             if blob_path.exists():
                 blob_path.unlink()
+            conn.execute("DELETE FROM inline_objects WHERE hash = ?", (obj_hash,))
         for prefix_dir in list(self.objects_dir.iterdir()):
             if prefix_dir.is_dir() and not any(prefix_dir.iterdir()):
                 prefix_dir.rmdir()

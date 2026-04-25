@@ -278,6 +278,18 @@ class TestGc:
         assert result.exit_code == 0
         assert "Evicted" in result.output
 
+    def test_gc_max_size(self, cli_runner: CliRunner, store_dir: Path) -> None:
+        client = Client(store_dir=store_dir)
+
+        def make_bytes() -> bytes:
+            return b"x" * 500
+
+        client.submit(make_bytes, _cache=False)
+        result = _invoke(cli_runner, ["gc", "--max-size", "1B"], store_dir)
+        assert result.exit_code == 0
+        assert "Evicted" in result.output
+        assert client.stats()["total_commits"] == 0
+
 
 class TestClear:
     def test_clear(self, cli_runner: CliRunner, store_dir: Path) -> None:

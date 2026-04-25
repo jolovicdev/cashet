@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import threading
 import time
@@ -58,8 +59,11 @@ def _is_stale_claim(commit: Commit, ttl: timedelta) -> bool:
 
 
 class LocalExecutor:
-    def __init__(self, running_ttl: timedelta | None = None) -> None:
+    def __init__(
+        self, running_ttl: timedelta | None = None, timeout: timedelta | None = None
+    ) -> None:
         self._running_ttl = running_ttl or _DEFAULT_RUNNING_TTL
+        self._timeout = timeout
 
     def submit(
         self,
@@ -70,20 +74,22 @@ class LocalExecutor:
         store: Store,
         serializer: Serializer,
     ) -> tuple[Commit, bool]:
-        with _store_lock(store):
-            existing = find_existing_commit(store, task_def)
-            if existing is not None:
-                existing.status = TaskStatus.CACHED
-                store.put_commit(existing)
-                return existing, True
-
-        while True:
+        if not task_def.force:
             with _store_lock(store):
                 existing = find_existing_commit(store, task_def)
                 if existing is not None:
                     existing.status = TaskStatus.CACHED
                     store.put_commit(existing)
                     return existing, True
+
+        while True:
+            with _store_lock(store):
+                if not task_def.force:
+                    existing = find_existing_commit(store, task_def)
+                    if existing is not None:
+                        existing.status = TaskStatus.CACHED
+                        store.put_commit(existing)
+                        return existing, True
 
                 claim = store.find_running_by_fingerprint(task_def.fingerprint)
                 if claim is not None:
@@ -107,9 +113,10 @@ class LocalExecutor:
         commit = self._execute(func, args, kwargs, claim, store, serializer)
 
         with _store_lock(store):
-            latest = find_existing_commit(store, task_def)
-            if latest is not None:
-                return latest, False
+            if not task_def.force:
+                latest = find_existing_commit(store, task_def)
+                if latest is not None:
+                    return latest, False
             store.put_commit(commit)
             return commit, False
 
@@ -140,14 +147,30 @@ class LocalExecutor:
 
         try:
             retries = max(0, commit.task_def.retries)
+            effective_timeout = commit.task_def.timeout or self._timeout
             for attempt in range(retries + 1):
                 try:
                     resolved_args = self._resolve_args(args)
                     resolved_kwargs = self._resolve_kwargs(kwargs)
-                    result = func(*resolved_args, **resolved_kwargs)
+                    if effective_timeout is not None:
+                        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                        try:
+                            future = pool.submit(func, *resolved_args, **resolved_kwargs)
+                            result = future.result(timeout=effective_timeout.total_seconds())
+                        finally:
+                            pool.shutdown(wait=False)
+                    else:
+                        result = func(*resolved_args, **resolved_kwargs)
                     output_ref = self._store_result(result, store, serializer)
                     commit.output_ref = output_ref
                     commit.status = TaskStatus.COMPLETED
+                    break
+                except concurrent.futures.TimeoutError:
+                    if attempt < retries:
+                        time.sleep(0.5 * attempt)
+                        continue
+                    commit.status = TaskStatus.FAILED
+                    commit.error = f"TimeoutError: task exceeded {effective_timeout}"
                     break
                 except Exception:
                     if attempt < retries:
