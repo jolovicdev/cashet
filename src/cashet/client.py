@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from typing import Any, cast, overload
 
-from cashet.dag import ResultRef, TaskRef
+from cashet._batch import (
+    build_deps,
+    execute_batch,
+    normalize_tasks,
+    topological_sort,
+    unpack_dict_tasks,
+    unpack_list_tasks,
+)
+from cashet.dag import ResultRef
 from cashet.executor import LocalExecutor
 from cashet.hashing import PickleSerializer, Serializer, build_task_def
 from cashet.models import Commit, TaskError, TaskStatus
@@ -45,6 +52,14 @@ class Client:
             self.store_dir = Path(store_dir)
             self.store = SQLiteStore(self.store_dir)
         self._executor: Executor = executor or LocalExecutor()
+        if serializer is None:
+            import warnings
+
+            warnings.warn(
+                "Using PickleSerializer by default — arbitrary code execution risk on "
+                "untrusted cached results. Pass serializer=SafePickleSerializer() to opt in.",
+                stacklevel=2,
+            )
         self.serializer: Serializer = serializer or PickleSerializer()
         self._registered_tasks: dict[str, Callable[..., Any]] = {}
         self._max_workers = max_workers
@@ -173,16 +188,16 @@ class Client:
     ) -> list[ResultRef] | dict[str, ResultRef]:
         is_dict = isinstance(tasks, dict)
         if is_dict:
-            keys, raw_tasks = _unpack_dict_tasks(tasks)
+            keys, raw_tasks = unpack_dict_tasks(tasks)
         else:
-            keys, raw_tasks = _unpack_list_tasks(tasks)
+            keys, raw_tasks = unpack_list_tasks(tasks)
 
         key_set = set(keys)
-        normalized = _normalize_tasks(raw_tasks, _cache, _tags, _retries, _force, _timeout)
-        deps, task_refs = _build_deps(keys, normalized, key_set)
-        order = _topological_sort(deps)
+        normalized = normalize_tasks(raw_tasks, _cache, _tags, _retries, _force, _timeout)
+        deps, task_refs = build_deps(keys, normalized, key_set)
+        order = topological_sort(deps)
         workers = max_workers if max_workers is not None else self._max_workers
-        results = _execute_batch(
+        results = execute_batch(
             order,
             keys,
             normalized,
@@ -230,9 +245,7 @@ class Client:
             raise KeyError(f"No commit found with hash {hash}")
         if commit.output_ref is None:
             raise ValueError(f"Commit {hash[:12]} has no output")
-        ref = ResultRef(
-            commit.output_ref, self.store, self.serializer, commit_hash=commit.hash
-        )
+        ref = ResultRef(commit.output_ref, self.store, self.serializer, commit_hash=commit.hash)
         return ref.load()
 
     def diff(self, hash_a: str, hash_b: str) -> dict[str, Any]:
@@ -248,15 +261,21 @@ class Client:
     def rm(self, hash: str) -> bool:
         return self.store.delete_commit(hash)
 
-    def gc(
-        self, older_than: timedelta | None = None, max_size_bytes: int | None = None
-    ) -> int:
+    def gc(self, older_than: timedelta | None = None, max_size_bytes: int | None = None) -> int:
         ttl = older_than if older_than is not None else timedelta(days=_DEFAULT_GC_TTL_DAYS)
         cutoff = datetime.now(UTC) - ttl
         return self.store.evict(cutoff, max_size_bytes=max_size_bytes)
 
     def clear(self) -> int:
         return self.gc(timedelta(days=0))
+
+    def serve(self, host: str = "127.0.0.1", port: int = 8000) -> None:
+        import uvicorn
+
+        from cashet.server import create_app
+
+        app = create_app(self)
+        uvicorn.run(app, host=host, port=port)
 
     def close(self) -> None:
         self.store.close()
@@ -266,232 +285,6 @@ class Client:
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
-
-
-_BatchKey = int | str
-_NormalizedTask = tuple[
-    Any, tuple[Any, ...], dict[str, Any], bool, dict[str, str], int, bool, timedelta | None
-]
-
-
-def _unpack_dict_tasks(
-    tasks: dict[str, Any],
-) -> tuple[list[_BatchKey], list[Any]]:
-    items = list(tasks.items())
-    return [k for k, _ in items], [t for _, t in items]
-
-
-def _unpack_list_tasks(tasks: list[Any]) -> tuple[list[_BatchKey], list[Any]]:
-    return list(range(len(tasks))), list(tasks)
-
-
-def _normalize_tasks(
-    raw_tasks: list[Any],
-    default_cache: bool | None,
-    default_tags: dict[str, str] | None,
-    default_retries: int | None = None,
-    default_force: bool | None = None,
-    default_timeout: int | float | None = None,
-) -> list[_NormalizedTask]:
-    normalized: list[_NormalizedTask] = []
-    for i, task in enumerate(raw_tasks):
-        if callable(task):
-            func, args, kwargs = task, (), {}
-        elif not isinstance(task, tuple):
-            raise TypeError(
-                f"Task {i}: expected callable or tuple, got {type(task).__name__}"
-            )
-        elif len(task) == 2:
-            func, args = task  # type: ignore[misc]
-            kwargs = {}
-        elif len(task) == 3:
-            func, args, kwargs = task  # type: ignore[misc]
-        else:
-            raise TypeError(
-                f"Task {i}: expected tuple of length 2 or 3, got length {len(task)}"
-            )
-        if not callable(func):
-            raise TypeError(f"Task {i}: expected callable, got {type(func).__name__}")
-        if not isinstance(args, tuple):
-            raise TypeError(f"Task {i}: expected args as tuple, got {type(args).__name__}")
-        if not isinstance(kwargs, dict):
-            raise TypeError(f"Task {i}: expected kwargs as dict, got {type(kwargs).__name__}")
-        raw_func = getattr(func, "_cashet_wrapped_func", func)
-        cache = (
-            default_cache
-            if default_cache is not None
-            else getattr(
-                raw_func,
-                "_cashet_cache",
-                True,
-            )
-        )
-        tags = (
-            default_tags
-            if default_tags is not None
-            else getattr(
-                raw_func,
-                "_cashet_tags",
-                {},
-            )
-        )
-        retries = (
-            default_retries
-            if default_retries is not None
-            else getattr(
-                raw_func,
-                "_cashet_retries",
-                0,
-            )
-        )
-        force = (
-            default_force
-            if default_force is not None
-            else getattr(
-                raw_func,
-                "_cashet_force",
-                False,
-            )
-        )
-        timeout_seconds = (
-            default_timeout
-            if default_timeout is not None
-            else getattr(
-                raw_func,
-                "_cashet_timeout",
-                None,
-            )
-        )
-        timeout = timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
-        normalized.append((raw_func, args, kwargs, cache, tags, retries, force, timeout))
-    return normalized
-
-
-def _build_deps(
-    keys: list[_BatchKey],
-    normalized: list[_NormalizedTask],
-    key_set: set[_BatchKey],
-) -> tuple[dict[_BatchKey, set[_BatchKey]], dict[_BatchKey, list[tuple[str, Any, _BatchKey]]]]:
-    deps: dict[_BatchKey, set[_BatchKey]] = {k: set() for k in keys}
-    task_refs: dict[_BatchKey, list[tuple[str, Any, _BatchKey]]] = {}
-    for key, item in zip(keys, normalized, strict=True):
-        _func, args, kwargs, _cache, _tags, _retries, _force, _timeout = item
-        for j, arg in enumerate(args):
-            if isinstance(arg, TaskRef):
-                deps[key].add(arg.key)
-                task_refs.setdefault(key, []).append(("arg", j, arg.key))
-        for kw_key, val in kwargs.items():
-            if isinstance(val, TaskRef):
-                deps[key].add(val.key)
-                task_refs.setdefault(key, []).append(("kwarg", kw_key, val.key))
-        for d in deps[key]:
-            if d not in key_set:
-                raise ValueError(f"TaskRef({d!r}) not found")
-            if d == key:
-                raise ValueError(f"Task {key!r} cannot depend on itself")
-    return deps, task_refs
-
-
-def _reverse_deps(
-    deps: dict[_BatchKey, set[_BatchKey]],
-) -> dict[_BatchKey, set[_BatchKey]]:
-    rev: dict[_BatchKey, set[_BatchKey]] = {k: set() for k in deps}
-    for key, dep_set in deps.items():
-        for d in dep_set:
-            rev[d].add(key)
-    return rev
-
-
-def _topological_sort(deps: dict[_BatchKey, set[_BatchKey]]) -> list[_BatchKey]:
-    visited: set[_BatchKey] = set()
-    temp: set[_BatchKey] = set()
-    order: list[_BatchKey] = []
-
-    def visit(n: _BatchKey) -> None:
-        if n in temp:
-            raise ValueError("Circular dependency detected in batch tasks")
-        if n in visited:
-            return
-        temp.add(n)
-        for d in deps[n]:
-            visit(d)
-        temp.remove(n)
-        visited.add(n)
-        order.append(n)
-
-    for n in deps:
-        visit(n)
-    return order
-
-
-def _execute_batch(
-    order: list[_BatchKey],
-    keys: list[_BatchKey],
-    normalized: list[_NormalizedTask],
-    task_refs: dict[_BatchKey, list[tuple[str, Any, _BatchKey]]],
-    deps: dict[_BatchKey, set[_BatchKey]],
-    executor: Executor,
-    store: Store,
-    serializer: Serializer,
-    max_workers: int | None,
-) -> dict[_BatchKey, ResultRef]:
-    pos = {k: i for i, k in enumerate(keys)}
-    results: dict[_BatchKey, ResultRef] = {}
-    rev = _reverse_deps(deps)
-    in_degree = {k: len(deps[k]) for k in keys}
-
-    def _run_single(key: _BatchKey) -> ResultRef:
-        func, args, kwargs, cache, tags, retries, force, timeout = normalized[pos[key]]
-        resolved_args = list(args)
-        resolved_kwargs = dict(kwargs)
-        for kind, arg_key, target_key in task_refs.get(key, []):
-            target_ref = results.get(target_key)
-            if target_ref is None:
-                raise RuntimeError(f"TaskRef({target_key!r}) unresolved")
-            if kind == "arg":
-                resolved_args[arg_key] = target_ref
-            else:
-                resolved_kwargs[arg_key] = target_ref
-        task_def = build_task_def(
-            func,
-            tuple(resolved_args),
-            resolved_kwargs,
-            cache=cache,
-            tags=tags,
-            retries=retries,
-            force=force,
-            timeout=timeout,
-        )
-        commit, _was_cached = executor.submit(
-            func, tuple(resolved_args), resolved_kwargs, task_def, store, serializer
-        )
-        if commit.output_ref is None:
-            raise TaskError(f"Task {commit.task_def.func_name} failed: {commit.error}")
-        ref = ResultRef(commit.output_ref, store, serializer, commit_hash=commit.hash)
-        return ref
-
-    if max_workers is None or max_workers == 1:
-        for key in order:
-            results[key] = _run_single(key)
-        return results
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures: dict[Any, _BatchKey] = {}
-        for key in keys:
-            if in_degree[key] == 0:
-                futures[pool.submit(_run_single, key)] = key
-
-        while futures:
-            done, _ = wait(futures, return_when=FIRST_COMPLETED)
-            for future in done:
-                key = futures.pop(future)
-                results[key] = future.result()
-                for dependent in rev[key]:
-                    in_degree[dependent] -= 1
-                    if in_degree[dependent] == 0:
-                        futures[pool.submit(_run_single, dependent)] = dependent
-
-    return results
 
 
 def _load_result(commit: Commit, store: Store, serializer: Serializer) -> Any:
