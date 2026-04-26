@@ -1,12 +1,25 @@
 <h1 align="center">cashet</h1>
 
 <p align="center">
-  <strong>Content-addressable compute cache with git semantics</strong><br>
-  Run a function once. Get the same result instantly every time after that.
+  <strong>A Python memoization cache with Redis, async support, and an HTTP server.</strong><br>
+  Hash functions + args into cache keys. Results stored as immutable blobs. Chain outputs with DAG resolution.<br>
+  Run a function once — get the same result instantly every time after.
 </p>
 
 <p align="center">
-  <a href="#install">Install</a> · <a href="#quickstart">Quick Start</a> · <a href="#why">Why</a> · <a href="#use-cases">Use Cases</a> · <a href="#cli">CLI</a> · <a href="#api">API</a> · <a href="#how-it-works">How It Works</a>
+  <a href="#install">Install</a> ·
+  <a href="#quickstart">Quick Start</a> ·
+  <a href="#why">Why</a> ·
+  <a href="#use-cases">Use Cases</a> ·
+  <a href="#cli">CLI</a> ·
+  <a href="#api">API</a> ·
+  <a href="#how-it-works">How It Works</a>
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/cashet/"><img src="https://img.shields.io/pypi/v/cashet?color=blue" alt="PyPI"></a>
+  <a href="https://github.com/jolovicdev/cashet/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python"></a>
 </p>
 
 ---
@@ -37,12 +50,34 @@ pip install cashet
 
 This installs `cashet` as both an importable Python library (`from cashet import Client`) and a project-local CLI (`uv run cashet`).
 
+**With Redis backend:**
+
+```bash
+uv add "cashet[redis]"
+# or
+pip install "cashet[redis]"
+```
+
+**With HTTP server:**
+
+```bash
+uv add "cashet[server]"
+# or
+pip install "cashet[server]"
+```
+
+**All extras:**
+
+```bash
+uv add "cashet[redis,server]"
+```
+
 **Develop / contribute:**
 
 ```bash
 git clone https://github.com/jolovicdev/cashet.git
 cd cashet
-uv sync
+uv sync --all-extras
 uv run pytest
 ```
 
@@ -105,21 +140,72 @@ print(model.load())  # {'loss': 0.05, 'lr': 0.001, 'samples': 100}
 
 Re-run the script — everything returns instantly from cache. Change one argument and only that step (and downstream) re-runs.
 
+**Shared cache with Redis** — multiple processes or machines share one cache:
+
+```python
+from cashet import Client
+from cashet.redis_store import RedisStore
+
+client = Client(store=RedisStore("redis://localhost:6379"))
+
+# Any process on any machine using the same Redis gets cached results
+ref = client.submit(expensive_transform, [1, 2, 3], scale=2.0)
+```
+
+**Async API** — drop-in `AsyncClient` for asyncio workflows:
+
+```python
+import asyncio
+from cashet.async_client import AsyncClient
+
+async def main():
+    client = AsyncClient()
+
+    def compute(x: int) -> int:
+        return x * 2
+
+    ref = await client.submit(compute, 21)
+    result = await ref.load()
+    print(result)  # 42
+
+asyncio.run(main())
+```
+
+**HTTP server** — expose the cache over HTTP:
+
+```bash
+python -c "from cashet import Client; Client().serve(port=8000)"
+```
+
+Then submit tasks remotely:
+
+```python
+import requests
+r = requests.post("http://localhost:8000/submit", json={
+    "func_source": "def double(x):\\n    return x * 2",
+    "func_name": "double",
+    "args_b64": base64.b64encode(pickle.dumps((5,))).decode(),
+    "kwargs_b64": base64.b64encode(pickle.dumps({})).decode(),
+})
+```
+
 ## Why
 
 You already have caches (`functools.lru_cache`, `joblib.Memory`). Here's what's different:
 
 | | lru_cache | joblib.Memory | **cashet** |
 |---|---|---|---|
-| AST-normalized hashing | No | No | Yes (comments/formatting don't break cache) |
-| DAG resolution (chain outputs) | No | No | Yes |
-| Content-addressable storage | No | No | Yes (like git blobs) |
+| AST-normalized hashing | No | No | Yes |
+| DAG / pipeline chaining | No | No | Yes |
+| Content-addressable storage | No | No | Yes |
 | CLI to inspect history | No | No | Yes |
 | Diff two runs | No | No | Yes |
 | Garbage collection / eviction | No | No | Yes |
 | Pluggable serialization | No | No | Yes |
-| Explicit cache opt-out | No | Partial | Yes |
 | Pluggable store / executor | No | No | Yes |
+| Redis backend (shared cache) | No | No | Yes |
+| Async client (asyncio) | No | No | Yes |
+| HTTP server | No | No | Yes |
 | Persists across restarts | No | Yes | Yes |
 
 The core idea: **hash the function's AST-normalized source + arguments = unique cache key**. Comments, docstrings, and formatting changes don't invalidate the cache — only semantic changes do. Same function + same args = same result, stored immutably on disk. The result is a git-like blob you can inspect, diff, and chain.
@@ -273,12 +359,80 @@ from cashet import Client
 client = Client(
     store_dir=".cashet",       # where to store blobs + metadata (SQLiteStore)
                                # falls back to $CASHET_DIR env var if set
-    store=None,                # or inject any Store implementation
+    store=None,                # or inject any Store implementation (SQLiteStore, RedisStore)
     executor=None,             # or inject any Executor implementation
     serializer=None,           # defaults to PickleSerializer
     max_workers=1,             # max parallelism for submit_many (default: 1, sequential)
 )
 ```
+
+### `AsyncClient`
+
+```python
+import asyncio
+from cashet.async_client import AsyncClient
+
+async def main():
+    client = AsyncClient(
+        store_dir=".cashet",   # defaults to AsyncSQLiteStore
+        store=None,            # or AsyncRedisStore, or any AsyncStore
+        executor=None,         # defaults to AsyncLocalExecutor
+        serializer=None,       # defaults to PickleSerializer
+    )
+
+    def square(x: int) -> int:
+        return x * x
+
+    ref = await client.submit(square, 5)
+    result = await ref.load()  # 25
+    await client.close()
+
+asyncio.run(main())
+```
+
+`AsyncClient` mirrors `Client` — `submit()`, `submit_many()`, `log()`, `show()`, `get()`, `stats()`, `gc()`, `rm()`, `clear()`, `serve()` are all `async def`. `submit()` returns `AsyncResultRef` with `async load()`. Chain tasks by passing `AsyncResultRef` as an argument.
+
+### HTTP Server
+
+```python
+# Start the server
+from cashet import Client
+client = Client()
+client.serve(host="127.0.0.1", port=8000)
+```
+
+Endpoints:
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/submit` | Submit a function for execution |
+| GET | `/result/{hash}` | Fetch deserialized result |
+| GET | `/commit/{hash}` | Commit metadata |
+| GET | `/log` | List commits (query: `?func=`, `?limit=`, `?status=`) |
+| GET | `/stats` | Storage statistics |
+| POST | `/gc` | Run garbage collection |
+
+Use `AsyncClient.serve()` for the async variant with `create_async_app()`.
+
+> **Security:** The server deserializes arbitrary code via `dill` and `exec`. Only expose it to trusted networks.
+
+### Redis Backend
+
+```python
+from cashet import Client
+from cashet.redis_store import RedisStore
+
+# Sync
+client = Client(store=RedisStore("redis://localhost:6379/0"))
+
+# Async
+from cashet.async_client import AsyncClient
+from cashet.redis_store import AsyncRedisStore
+
+client = AsyncClient(store=AsyncRedisStore("redis://localhost:6379/0"))
+```
+
+Redis-backed stores support all operations — cache dedup, fingerprint lookup, history, eviction, and size-based GC. Cross-process claim dedup uses per-fingerprint Redis locks (`cashet:lock:{fingerprint}`) to prevent redundant execution across machines. Blob ref counts (`cashet:blob:ref:{hash}`) enable O(1) orphan cleanup without scanning all commits.
 
 ### Pluggable Backends
 
@@ -379,6 +533,8 @@ refs = client.submit_many([
 ```
 
 This enables parallel fan-out and ensures each task only runs after its dependencies.
+
+> **Note:** With the default `SQLiteStore`, parallel execution serializes on the SQLite write lock — `max_workers > 1` only benefits compute-heavy tasks where execution time dominates. For true parallel fan-out, use `RedisStore`.
 
 **Opt out of caching:**
 
@@ -633,11 +789,12 @@ client.submit(func, arg1, arg2)
 
 **Architecture (protocol-based):**
 
-| Protocol | Default | Implement for |
-|---|---|---|
-| `Store` | `SQLiteStore` | RocksDB, Redis, S3, Postgres |
-| `Executor` | `LocalExecutor` | Celery, Kafka, RQ, subprocess |
-| `Serializer` | `PickleSerializer` | JSON, MessagePack, custom formats |
+| Protocol | Default | Built-in alternatives | Implement for |
+|---|---|---|---|
+| `Store` | `SQLiteStore` | `RedisStore` | RocksDB, S3, Postgres |
+| `AsyncStore` | `AsyncSQLiteStore` | `AsyncRedisStore` | async variants of above |
+| `Executor` | `LocalExecutor` | `AsyncLocalExecutor` | Celery, Kafka, RQ |
+| `Serializer` | `PickleSerializer` | `JsonSerializer`, `SafePickleSerializer` | MessagePack, custom |
 
 **Storage layout** (in `.cashet/`):
 
@@ -656,7 +813,7 @@ client.submit(func, arg1, arg2)
 **Key design decisions:**
 
 - **Closure variables are not hashed** and emit a `ClosureWarning` if present. Function identity is source code, not runtime state. If you need cache invalidation based on a value, pass it as an explicit argument.
-- **Referenced user-defined helper functions are hashed recursively.** Change an imported helper in your own code and the caller's cache invalidates correctly. Builtin and third-party library functions are skipped.
+- **Referenced user-defined helper functions are hashed recursively.** If your cached function calls or references a helper from your own project (via `co_names` / `globals`), that helper's source is included in the cache key. Change the helper and the caller's cache invalidates. Builtin and stdlib functions are skipped. This behavior is automatic and invisible — no decorators or imports needed.
 - **Blobs are deduplicated by content hash.** Identical results share one blob on disk.
 - **Source is hashed as an AST.** Comments, docstrings, and whitespace changes don't invalidate the cache.
 - **Non-cached tasks get unique commit hashes** (timestamp salt) so they always re-execute but still record lineage.
@@ -664,10 +821,11 @@ client.submit(func, arg1, arg2)
 
 ## Project Status
 
-**Beta.** The core (hashing, DAG resolution, fingerprint dedup) is stable. The defaults work reliably for single-machine and multiprocess workflows. The protocol layer (`Store`, `Executor`, `Serializer`) is ready for alternative backends — implementing a Redis store or Celery executor is a single-file job.
+**Beta.** The core (hashing, DAG resolution, fingerprint dedup) is stable. Works reliably for single-machine, multiprocess, and multi-machine (Redis) workflows.
 
-Built-in: `SQLiteStore` + `LocalExecutor` + `PickleSerializer`.
-Not yet built: Redis, RocksDB, S3 stores; Celery/Kafka executors. PRs welcome.
+Built-in: `SQLiteStore` + `AsyncSQLiteStore`, `RedisStore` + `AsyncRedisStore`, `LocalExecutor` + `AsyncLocalExecutor`, `PickleSerializer` + `JsonSerializer` + `SafePickleSerializer`, HTTP server (`client.serve()`), CLI.
+
+Not yet built: RocksDB, S3 stores; Celery/Kafka executors. PRs welcome.
 
 ## License
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -37,6 +38,7 @@ class SQLiteStore:
         if conn is None:
             conn = sqlite3.connect(str(self.db_path), isolation_level=None)
             conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
             self._tls.conn = conn
@@ -47,6 +49,7 @@ class SQLiteStore:
     def close(self) -> None:
         conn: sqlite3.Connection | None = getattr(self._tls, "conn", None)
         if conn is not None:
+            conn.execute("VACUUM")
             conn.close()
             self._tls.conn = None
 
@@ -426,6 +429,14 @@ class SQLiteStore:
                 if self.delete_commit(row["hash"]):
                     deleted += 1
 
+        if deleted:
+            c = self._connect()
+            mode = c.execute("PRAGMA auto_vacuum").fetchone()[0]
+            if mode == 2:
+                c.execute("PRAGMA incremental_vacuum")
+            else:
+                c.execute("VACUUM")
+
         return deleted
 
     def delete_commit(self, hash: str) -> bool:
@@ -544,3 +555,57 @@ class SQLiteStore:
             error=row["error"],
             tags=tags,
         )
+
+
+class AsyncSQLiteStore:
+    def __init__(self, root: Path) -> None:
+        self._store = SQLiteStore(root)
+        self._async_lock = asyncio.Lock()
+
+    async def put_blob(self, data: bytes) -> ObjectRef:
+        return await asyncio.to_thread(self._store.put_blob, data)
+
+    async def get_blob(self, ref: ObjectRef) -> bytes:
+        return await asyncio.to_thread(self._store.get_blob, ref)
+
+    async def put_commit(self, commit: Commit) -> None:
+        await asyncio.to_thread(self._store.put_commit, commit)
+
+    async def get_commit(self, hash: str) -> Commit | None:
+        return await asyncio.to_thread(self._store.get_commit, hash)
+
+    async def find_by_fingerprint(self, fingerprint: str) -> Commit | None:
+        return await asyncio.to_thread(self._store.find_by_fingerprint, fingerprint)
+
+    async def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
+        return await asyncio.to_thread(self._store.find_running_by_fingerprint, fingerprint)
+
+    async def list_commits(
+        self,
+        func_name: str | None = None,
+        limit: int = 50,
+        status: TaskStatus | None = None,
+        tags: dict[str, str | None] | None = None,
+    ) -> list[Commit]:
+        return await asyncio.to_thread(
+            self._store.list_commits,
+            func_name=func_name,
+            limit=limit,
+            status=status,
+            tags=tags,
+        )
+
+    async def get_history(self, hash: str) -> list[Commit]:
+        return await asyncio.to_thread(self._store.get_history, hash)
+
+    async def stats(self) -> dict[str, int]:
+        return await asyncio.to_thread(self._store.stats)
+
+    async def evict(self, older_than: datetime, max_size_bytes: int | None = None) -> int:
+        return await asyncio.to_thread(self._store.evict, older_than, max_size_bytes)
+
+    async def delete_commit(self, hash: str) -> bool:
+        return await asyncio.to_thread(self._store.delete_commit, hash)
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._store.close)

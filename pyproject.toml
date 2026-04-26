@@ -1,13 +1,27 @@
 [project]
 name = "cashet"
-version = "0.2.0"
-description = "Content-addressable compute cache with git semantics"
+version = "0.3.0"
+description = "A Python memoization cache with Redis, async support, DAG pipelines, and an HTTP server"
 readme = "README.md"
 license = "MIT"
 authors = [
     { name = "jolovicdev", email = "dusan.jolovic@proton.me" }
 ]
-keywords = ["cache", "dag", "compute", "content-addressable", "pipeline"]
+keywords = [
+    "cache",
+    "memoization",
+    "dag",
+    "pipeline",
+    "redis",
+    "async",
+    "asyncio",
+    "hashing",
+    "content-addressable",
+    "compute",
+    "distributed",
+    "provenance",
+    "python",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -32,6 +46,15 @@ Repository = "https://github.com/jolovicdev/cashet"
 [project.scripts]
 cashet = "cashet.cli:main"
 
+[project.optional-dependencies]
+redis = [
+    "redis>=7.4.0",
+]
+server = [
+    "starlette>=1.0.0",
+    "uvicorn>=0.46.0",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -45,6 +68,8 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.11",
     "pyright>=1.1",
+    "httpx>=0.28.1",
+    "pytest-asyncio>=1.3.0",
 ]
 
 [tool.ruff]
@@ -69,3 +94,7 @@ reportUnknownLambdaType = "none"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+asyncio_mode = "auto"
+markers = [
+    "redis: tests that require a running Redis server",
+]

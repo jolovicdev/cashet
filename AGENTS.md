@@ -2,12 +2,17 @@
 
 ## Project overview
 
-cashet is a content-addressable compute cache with git semantics. Python functions + args are hashed into cache keys, results stored as immutable blobs, identical calls deduplicated. Local-only but protocol-based for future distributed backends.
+cashet is a content-addressable compute cache with git semantics. Python functions + args are hashed into cache keys, results stored as immutable blobs, identical calls deduplicated. Local by default (SQLite), with optional Redis and HTTP server for distributed use.
 
 ## Commands
 
 - Install deps: `uv sync`
+- Install with Redis: `uv sync --extra redis`
+- Install with HTTP server: `uv sync --extra server`
+- Install with all extras: `uv sync --all-extras`
 - Run tests: `uv run pytest tests/ -v`
+- Redis tests auto-detect: skipped if Redis isn't reachable at `localhost:6379`
+- Start Redis for full suite: `docker run -d --name cashet-redis -p 6379:6379 redis:7-alpine`
 - Lint: `uv run ruff check src/ tests/`
 - Type check: `uv run pyright src/`
 - Format fix: `uv run ruff format src/ tests/`
@@ -24,16 +29,23 @@ Always run `ruff check`, `pyright`, and `pytest` before committing. All three mu
 - Type checking: pyright strict mode (target 3.11)
 - Testing: pytest
 - CLI: click + rich
+- Optional backends: Redis (via `redis` extra)
+- Optional HTTP server: Starlette + uvicorn (via `server` extra)
 
 ## Architecture
 
 Protocol-based dependency injection via three pluggable protocols in `src/cashet/protocols.py`:
 
-- **Store** — metadata + blob storage. Default: `SQLiteStore` in `store.py`
-- **Executor** — runs functions. Default: `LocalExecutor` in `executor.py`
+- **Store** — metadata + blob storage. Default: `SQLiteStore` in `store.py`. Also: `RedisStore` and `AsyncRedisStore` in `redis_store.py`
+- **AsyncStore** — async protocol for IO-bound backends (Redis, S3, HTTP). Defined in `protocols.py`
+- **Executor** — runs functions. Default: `LocalExecutor` in `executor.py` (sync). Async variant: `AsyncLocalExecutor` in `async_executor.py`
 - **Serializer** — serialize/deserialize results. Default: `PickleSerializer` in `hashing.py`
 
-Data flow: `Client.submit()` → `build_task_def()` hashes function source + args → `LocalExecutor.submit()` checks cache → runs if needed → `build_commit()` creates commit with parent lineage → blobs stored via `Store.put_blob()` with zlib compression (256B threshold).
+Data flow (sync): `Client.submit()` → `build_task_def()` hashes function source + args → `LocalExecutor.submit()` checks cache → runs if needed → `build_commit()` creates commit with parent lineage → blobs stored via `Store.put_blob()` with zlib compression (256B threshold).
+
+Async data flow: `AsyncClient.submit()` → `build_task_def()` → `AsyncLocalExecutor.submit()` checks cache via async store → runs function in thread via `asyncio.to_thread()` → stores result via async `AsyncStore.put_blob()`. Heartbeat and locking are asyncio-native.
+
+HTTP server: `client.serve(host, port)` exposes endpoints over HTTP. Async server (`AsyncClient.serve()`) uses `create_async_app()` with native async handlers. Sync server (`Client.serve()`) uses `create_app()`.
 
 ## Key design decisions
 
@@ -42,6 +54,8 @@ Data flow: `Client.submit()` → `build_task_def()` hashes function source + arg
 - `cache=False` opt-out for non-deterministic functions. These get timestamp-salted hashes so they don't overwrite previous commits.
 - All source files use `from __future__ import annotations` for union type syntax compatibility with >=3.10.
 - `ResultRef` objects enable DAG chaining — pass a ref as an arg to `submit()` and it auto-resolves.
+- `AsyncResultRef` is the async counterpart for `AsyncClient`.
+- IO-bound layers (Store, HTTP) are async. CPU-bound execution stays on threads via `asyncio.to_thread()`.
 
 ## Code style
 
