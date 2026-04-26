@@ -376,95 +376,17 @@ def _stable_repr_to(
         buf.write(repr(obj))
 
 
-def _length_prefixed(tag: bytes, data: bytes) -> bytes:
-    return tag + len(data).to_bytes(4, "big") + data
-
-
 def _stable_hash(
     obj: Any, h: Any, _visited: set[int] | None = None
 ) -> None:
-    if _visited is None:
-        _visited = set()
-    if obj is None:
-        h.update(b"N")
-    elif isinstance(obj, bool):
-        h.update(b"T" if obj else b"F")
-    elif isinstance(obj, int):
-        h.update(_length_prefixed(b"I", str(obj).encode()))
-    elif isinstance(obj, float):
-        h.update(_length_prefixed(b"F", repr(obj).encode()))
-    elif isinstance(obj, str):
-        h.update(_length_prefixed(b"S", obj.encode()))
-    elif isinstance(obj, bytes):
-        h.update(_length_prefixed(b"B", obj))
-    elif isinstance(obj, (list, tuple)):
-        obj_id = id(obj)
-        if obj_id in _visited:
-            h.update(b"[...]" if isinstance(obj, list) else b"(...)")
-            return
-        _visited.add(obj_id)
-        h.update(b"[" if isinstance(obj, list) else b"(")
-        for item in obj:
-            _stable_hash(item, h, _visited)
-        h.update(b"]" if isinstance(obj, list) else b")")
-        _visited.discard(obj_id)
-    elif isinstance(obj, set):
-        obj_id = id(obj)
-        if obj_id in _visited:
-            h.update(b"set{...}")
-            return
-        _visited.add(obj_id)
-        h.update(b"set{")
-        for item in sorted(obj, key=repr):
-            _stable_hash(item, h, _visited)
-        h.update(b"}")
-        _visited.discard(obj_id)
-    elif isinstance(obj, frozenset):
-        obj_id = id(obj)
-        if obj_id in _visited:
-            h.update(b"fset{...}")
-            return
-        _visited.add(obj_id)
-        h.update(b"fset{")
-        for item in sorted(obj, key=repr):
-            _stable_hash(item, h, _visited)
-        h.update(b"}")
-        _visited.discard(obj_id)
-    elif isinstance(obj, dict):
-        obj_id = id(obj)
-        if obj_id in _visited:
-            h.update(b"dict{...}")
-            return
-        _visited.add(obj_id)
-        h.update(b"dict{")
-        for key, val in sorted(obj.items(), key=lambda p: repr(p[0])):
-            _stable_hash(key, h, _visited)
-            _stable_hash(val, h, _visited)
-        h.update(b"}")
-        _visited.discard(obj_id)
-    elif isinstance(obj, types.FunctionType):
-        h.update(b"func:" + hash_function(obj).encode())
-    elif isinstance(obj, type):
-        h.update(b"type:" + f"{obj.__module__}.{obj.__qualname__}".encode())
-    elif hasattr(obj, "__cashet_ref__"):
-        h.update(b"ref:" + obj.__cashet_ref__().hash.encode())
-    elif hasattr(obj, "__dict__"):
-        obj_id = id(obj)
-        if obj_id in _visited:
-            h.update(type(obj).__qualname__.encode() + b":...")
-            return
-        _visited.add(obj_id)
-        h.update(type(obj).__qualname__.encode() + b":")
-        _stable_hash(obj.__dict__, h, _visited)
-        _visited.discard(obj_id)
-    else:
-        h.update(repr(obj).encode())
+    buf = io.StringIO()
+    _stable_repr_to(buf, obj, _visited)
+    h.update(buf.getvalue().encode())
 
 
 def hash_args(*args: Any, **kwargs: Any) -> str:
     h = hashlib.sha256()
-    _stable_hash(args, h)
-    _stable_hash(kwargs, h)
+    _stable_hash((args, kwargs), h)
     return h.hexdigest()
 
 
