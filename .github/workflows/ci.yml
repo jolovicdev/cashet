@@ -12,12 +12,22 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --group dev
+      - run: uv sync --all-extras
       - run: uv run ruff check src/ tests/
       - run: uv run pyright src/
       - run: uv run pytest tests/ -v
