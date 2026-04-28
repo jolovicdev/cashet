@@ -20,6 +20,24 @@ class ClosureWarning(UserWarning):
     pass
 
 
+_pickle_warning_issued = False
+
+
+def warn_default_pickle() -> None:
+    global _pickle_warning_issued
+    if _pickle_warning_issued:
+        return
+    _pickle_warning_issued = True
+    import warnings
+
+    warnings.warn(
+        "Using PickleSerializer by default — arbitrary code execution risk on "
+        "untrusted cached results. Pass serializer=SafePickleSerializer() "
+        "for safer deserialization.",
+        stacklevel=3,
+    )
+
+
 @runtime_checkable
 class Serializer(Protocol):
     def dumps(self, obj: Any) -> bytes: ...
@@ -138,7 +156,13 @@ def _normalize_source(source: str) -> str:
 
 def _bytecode_source(func: types.FunctionType) -> str:
     code = func.__code__
-    return f"<bytecode:{func.__qualname__}:{code.co_code.hex()}:{code.co_consts!r}>"
+    return (
+        f"<bytecode:{func.__qualname__}:{code.co_argcount}:"
+        f"{code.co_posonlyargcount}:{code.co_kwonlyargcount}:{code.co_nlocals}:"
+        f"{code.co_flags}:{code.co_code.hex()}:{code.co_consts!r}:"
+        f"{code.co_names!r}:{code.co_varnames!r}:{code.co_cellvars!r}:"
+        f"{code.co_freevars!r}:{func.__defaults__!r}:{func.__kwdefaults__!r}>"
+    )
 
 
 def get_func_source(func: types.FunctionType) -> str:
@@ -249,6 +273,12 @@ def hash_function(
     h = hashlib.sha256()
     source = get_func_source(func)
     h.update(hash_source(_ast_canonical(source)).encode())
+    if func.__defaults__ is not None:
+        h.update(b"<defaults>")
+        _stable_hash(func.__defaults__, h)
+    if func.__kwdefaults__ is not None:
+        h.update(b"<kwdefaults>")
+        _stable_hash(func.__kwdefaults__, h)
     if include_deps:
         deps = get_dep_versions(func)
         for name in sorted(deps):
@@ -365,10 +395,10 @@ def _stable_repr_to(
     elif hasattr(obj, "__dict__"):
         obj_id = id(obj)
         if obj_id in _visited:
-            buf.write(f"<{type(obj).__qualname__}:...>")
+            buf.write(f"<{type(obj).__module__}.{type(obj).__qualname__}:...>")
             return
         _visited.add(obj_id)
-        buf.write(f"<{type(obj).__qualname__}:")
+        buf.write(f"<{type(obj).__module__}.{type(obj).__qualname__}:")
         _stable_repr_to(buf, obj.__dict__, _visited)
         buf.write(">")
         _visited.discard(obj_id)
@@ -413,7 +443,7 @@ def build_task_def(
     dep_versions = get_dep_versions(func)
     return TaskDef(
         func_hash=func_hash,
-        func_name=func.__qualname__,
+        func_name=getattr(func, "_cashet_name", func.__qualname__),
         func_source=source,
         args_hash=args_hash_val,
         args_snapshot=args_snapshot,

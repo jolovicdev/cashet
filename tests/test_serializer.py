@@ -63,3 +63,22 @@ class TestSafePickleSerializer:
         assert s.loads(s.dumps(timedelta(hours=2))) == timedelta(hours=2)
 
 
+class TestPickleWarning:
+    def test_warns_once_per_process(self, store_dir: Path) -> None:
+        import warnings
+
+        import cashet.hashing as hashing_mod
+
+        original = hashing_mod._pickle_warning_issued
+        try:
+            hashing_mod._pickle_warning_issued = False
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                Client(store_dir=store_dir)
+                Client(store_dir=store_dir)
+                pickle_warnings = [x for x in w if "PickleSerializer" in str(x.message)]
+                assert len(pickle_warnings) == 1
+        finally:
+            hashing_mod._pickle_warning_issued = original
+
+
