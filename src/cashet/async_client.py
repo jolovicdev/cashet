@@ -25,7 +25,7 @@ from cashet.async_executor import AsyncLocalExecutor
 from cashet.dag import AsyncResultRef
 from cashet.hashing import PickleSerializer, Serializer, build_task_def, warn_default_pickle
 from cashet.models import Commit, TaskError, TaskStatus
-from cashet.protocols import AsyncStore
+from cashet.protocols import AsyncExecutor, AsyncStore
 from cashet.store import AsyncSQLiteStore
 
 _DEFAULT_GC_TTL_DAYS = 30
@@ -36,7 +36,7 @@ class AsyncClient:
         self,
         store_dir: str | Path | None = None,
         store: AsyncStore | None = None,
-        executor: Any | None = None,
+        executor: AsyncExecutor | None = None,
         serializer: Serializer | None = None,
         max_workers: int = 1,
     ) -> None:

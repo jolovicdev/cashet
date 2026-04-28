@@ -858,7 +858,8 @@ client.submit(func, arg1, arg2)
 |---|---|---|---|
 | `Store` | `SQLiteStore` | `RedisStore` | RocksDB, S3, Postgres |
 | `AsyncStore` | `AsyncSQLiteStore` | `AsyncRedisStore` | async variants of above |
-| `Executor` | `LocalExecutor` | `AsyncLocalExecutor` | Celery, Kafka, RQ |
+| `Executor` | `LocalExecutor` | — | Celery, Kafka, RQ |
+| `AsyncExecutor` | `AsyncLocalExecutor` | — | Celery, Kafka, RQ |
 | `Serializer` | `PickleSerializer` | `JsonSerializer`, `SafePickleSerializer` | MessagePack, custom |
 
 **Storage layout** (in `.cashet/`):

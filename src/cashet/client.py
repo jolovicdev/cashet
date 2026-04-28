@@ -27,7 +27,7 @@ from cashet.dag import ResultRef
 from cashet.executor import LocalExecutor
 from cashet.hashing import Serializer
 from cashet.models import Commit, TaskStatus
-from cashet.protocols import Executor, Store
+from cashet.protocols import AsyncExecutor, AsyncStore, Executor, Store
 from cashet.store import AsyncSQLiteStore, SQLiteStore
 
 _DEFAULT_GC_TTL_DAYS = 30
@@ -57,6 +57,7 @@ class Client:
             async_store = AsyncSQLiteStore(self.store_dir)
             self.store = SQLiteStore.from_async(async_store, runner=self._runner)
 
+        async_executor: AsyncExecutor
         if executor is not None:
             self._executor = executor
             if hasattr(executor, "_async_executor"):
@@ -65,7 +66,7 @@ class Client:
                 if executor_runner is not None:
                     self._runner = executor_runner
             elif inspect.iscoroutinefunction(getattr(executor, "submit", None)):
-                async_executor = executor
+                async_executor = executor  # type: ignore[assignment]
             else:
                 async_executor = _SyncExecutorAdapter(executor, self._runner, self.store)
         else:
@@ -292,10 +293,10 @@ class _SyncExecutorAdapter:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         task_def: Any,
-        store: Any,
+        store: AsyncStore,
         serializer: Any,
     ) -> tuple[Commit, bool]:
-        resolved_store = self._sync_store if self._sync_store is not None else store
+        resolved_store = self._sync_store if self._sync_store is not None else cast(Store, store)
         return await asyncio.to_thread(
             self._executor.submit, func, args, kwargs, task_def, resolved_store, serializer
         )

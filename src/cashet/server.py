@@ -11,6 +11,8 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -41,6 +43,29 @@ def _validate_remote_code_options(
 ) -> None:
     if allow_remote_code and not require_token:
         raise ValueError("allow_remote_code=True requires a non-empty require_token")
+
+
+_DEFAULT_MAX_CONTENT_LENGTH = 500 * 1024 * 1024
+
+
+def _limit_request_size(
+    request: Request,
+) -> JSONResponse | None:
+    max_size = getattr(request.app.state, "max_content_length", _DEFAULT_MAX_CONTENT_LENGTH)
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            size = int(content_length)
+        except ValueError:
+            return _CustomJSONResponse(
+                {"error": "invalid content-length"}, status_code=400
+            )
+        if size > max_size:
+            return _CustomJSONResponse(
+                {"error": f"request body exceeds {max_size} bytes"},
+                status_code=413,
+            )
+    return None
 
 
 def _reconstruct_func(data: dict[str, Any]) -> Callable[..., Any] | None:
@@ -315,6 +340,7 @@ def create_async_app(
     *,
     tasks: TaskRegistry | None = None,
     allow_remote_code: bool = False,
+    max_content_length: int = _DEFAULT_MAX_CONTENT_LENGTH,
 ) -> Starlette:
     _validate_remote_code_options(allow_remote_code, require_token)
     routes = [
@@ -333,11 +359,24 @@ def create_async_app(
         Route("/stats", _require_token(_async_stats, require_token), methods=["GET"]),
         Route("/gc", _require_token(_async_gc, require_token), methods=["POST"]),
     ]
-    app = Starlette(routes=routes)
+
+    app = Starlette(
+        routes=routes,
+        middleware=[Middleware(_SizeLimitMiddleware)],
+    )
     app.state.client = client
     app.state.tasks = _server_tasks(client, tasks)
     app.state.allow_remote_code = allow_remote_code
+    app.state.max_content_length = max_content_length
     return app
+
+
+class _SizeLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: Any) -> JSONResponse:
+        error = _limit_request_size(request)
+        if error is not None:
+            return error
+        return await call_next(request)
 
 
 # Sync handlers run sync Client operations in threads so they don't block the event loop
@@ -518,6 +557,7 @@ def create_app(
     *,
     tasks: TaskRegistry | None = None,
     allow_remote_code: bool = False,
+    max_content_length: int = _DEFAULT_MAX_CONTENT_LENGTH,
 ) -> Starlette:
     _validate_remote_code_options(allow_remote_code, require_token)
     routes = [
@@ -536,8 +576,12 @@ def create_app(
         Route("/stats", _require_token(_stats, require_token), methods=["GET"]),
         Route("/gc", _require_token(_gc, require_token), methods=["POST"]),
     ]
-    app = Starlette(routes=routes)
+    app = Starlette(
+        routes=routes,
+        middleware=[Middleware(_SizeLimitMiddleware)],
+    )
     app.state.client = client
     app.state.tasks = _server_tasks(client, tasks)
     app.state.allow_remote_code = allow_remote_code
+    app.state.max_content_length = max_content_length
     return app
