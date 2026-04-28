@@ -1,3 +1,6 @@
+import logging
+import os
+
 from cashet.async_client import AsyncClient
 from cashet.client import Client
 from cashet.dag import AsyncResultRef, ResultRef, TaskRef
@@ -18,6 +21,15 @@ try:
 except ImportError:
     AsyncRedisStore = None  # type: ignore[misc,assignment]
     RedisStore = None  # type: ignore[misc,assignment]
+
+_log_level = os.environ.get("CASHET_LOG", "").upper()
+if _log_level in ("DEBUG", "INFO", "WARNING", "ERROR"):
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)-8s [cashet] %(message)s"))
+    _cashet_logger = logging.getLogger("cashet")
+    _cashet_logger.setLevel(getattr(logging, _log_level))
+    _cashet_logger.addHandler(_handler)
+    _cashet_logger.propagate = False
 
 __all__ = [
     "AsyncClient",

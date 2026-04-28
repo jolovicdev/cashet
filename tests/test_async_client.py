@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import pytest_asyncio
 
 from cashet.async_client import AsyncClient
-from cashet.dag import TaskRef
+from cashet.dag import AsyncResultRef, TaskRef
 
 
 @pytest_asyncio.fixture
@@ -56,6 +57,9 @@ class TestAsyncClientSubmit:
         r1 = await async_client.submit(step1)
         r2 = await async_client.submit(step2, r1)
         assert await r2.load() == 30
+        commit = await async_client.show(r2.commit_hash)
+        assert commit is not None
+        assert [ref.hash for ref in commit.input_refs] == [r1.hash]
 
 
 class TestAsyncClientSubmitMany:
@@ -93,6 +97,9 @@ class TestAsyncClientSubmitMany:
         assert await refs[0].load() == 10
         assert await refs[1].load() == 30
         assert await refs[2].load() == "result: 30"
+        commit = await async_client.show(refs[2].commit_hash)
+        assert commit is not None
+        assert [ref.hash for ref in commit.input_refs] == [refs[1].hash]
 
     async def test_submit_many_fan_out(self, async_client: AsyncClient) -> None:
         def gen() -> int:
@@ -150,6 +157,41 @@ class TestAsyncClientSubmitMany:
         assert await refs[1].load() == 20
         assert order == [1, 2]
 
+    async def test_submit_many_parallel_respects_max_workers(
+        self, async_client: AsyncClient
+    ) -> None:
+        import threading
+        import time
+
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def work(x: int) -> int:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return x
+
+        refs = await async_client.submit_many(
+            [(work, (i,)) for i in range(5)], max_workers=2
+        )
+        assert [await ref.load() for ref in refs] == list(range(5))
+        assert max_active <= 2
+
+    async def test_submit_many_rejects_zero_max_workers(
+        self, async_client: AsyncClient
+    ) -> None:
+        def val() -> int:
+            return 1
+
+        with pytest.raises(ValueError, match="max_workers"):
+            await async_client.submit_many([val], max_workers=0)
+
 
 class TestAsyncClientOperations:
     async def test_log(self, async_client: AsyncClient) -> None:
@@ -202,3 +244,105 @@ class TestAsyncClientOperations:
         deleted = await async_client.clear()
         assert deleted >= 1
         assert (await async_client.stats())["total_commits"] == 0
+
+
+class TestAsyncTaskDecorator:
+    async def test_task_decorator_registers(self, async_client: AsyncClient) -> None:
+        @async_client.task
+        def my_task(x: int) -> int:
+            return x + 1
+
+        assert any("my_task" in name for name in async_client._registered_tasks)
+        ref = await async_client.submit(my_task, 5)
+        assert await ref.load() == 6
+
+    async def test_task_with_custom_name(self, async_client: AsyncClient) -> None:
+        @async_client.task(name="custom_name")
+        def unnamed() -> str:
+            return "hello"
+
+        ref = await unnamed()
+        commit = await async_client.show(ref.commit_hash)
+        assert commit is not None
+        assert commit.task_def.func_name == "custom_name"
+        assert len(await async_client.log(func_name="custom_name")) == 1
+
+    async def test_task_with_cache_false(self, async_client: AsyncClient) -> None:
+        counter = 0
+
+        @async_client.task(cache=False)
+        def non_cached() -> int:
+            nonlocal counter
+            counter += 1
+            return counter
+
+        ref1 = await async_client.submit(non_cached)
+        ref2 = await async_client.submit(non_cached)
+        assert await ref1.load() == 1
+        assert await ref2.load() == 2
+
+    async def test_task_decorator_callable_returns_async_result_ref(
+        self, async_client: AsyncClient
+    ) -> None:
+        @async_client.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        ref = await add(2, 3)
+        assert isinstance(ref, AsyncResultRef)
+        assert await ref.load() == 5
+
+    async def test_task_decorator_callable_with_kwargs(
+        self, async_client: AsyncClient
+    ) -> None:
+        @async_client.task
+        def greet(name: str, greeting: str = "hello") -> str:
+            return f"{greeting}, {name}"
+
+        ref = await greet("world", greeting="hi")
+        assert isinstance(ref, AsyncResultRef)
+        assert await ref.load() == "hi, world"
+
+    async def test_task_decorator_preserves_metadata(
+        self, async_client: AsyncClient
+    ) -> None:
+        @async_client.task(name="my_task")
+        def do_thing(x: int) -> int:
+            """A docstring."""
+            return x * 2
+
+        assert do_thing.__name__ == "do_thing"
+        assert do_thing.__doc__ == "A docstring."
+        assert hasattr(do_thing, "_cashet_wrapped_func")
+
+
+class TestAsyncContextManager:
+    async def test_async_with(self) -> None:
+        from pathlib import Path
+
+        store_dir = Path("/tmp/cashet_test_async_ctx")
+        store_dir.mkdir(parents=True, exist_ok=True)
+        async with AsyncClient(store_dir=store_dir) as client:
+            def val() -> int:
+                return 42
+
+            ref = await client.submit(val)
+            assert await ref.load() == 42
+
+
+class TestAsyncDiff:
+    async def test_diff_small_outputs(self, async_client: AsyncClient) -> None:
+        def make_val(x: int) -> int:
+            return x
+
+        await async_client.submit(make_val, 1, _cache=False)
+        await async_client.submit(make_val, 2, _cache=False)
+        log = await async_client.log()
+        d = await async_client.diff(log[0].hash, log[1].hash)
+        assert d["output_changed"] is True
+        assert "a_output_repr" in d
+        assert "b_output_repr" in d
+
+    async def test_diff_missing_commit_raises(self, async_client: AsyncClient) -> None:
+        with pytest.raises(KeyError, match="not found"):
+            await async_client.diff("deadbeef", "cafebabe")

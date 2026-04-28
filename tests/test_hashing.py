@@ -62,6 +62,25 @@ class TestHashingEdgeCases:
         ref = client.submit(mixed, 42, "hello", 3.14, True)
         assert ref.load() == "42-hello-3.14-True"
 
+    def test_custom_object_arg_hash_includes_module(self, client: Client) -> None:
+        thing_a = type("Thing", (), {})
+        thing_a.__module__ = "module_a"
+        thing_b = type("Thing", (), {})
+        thing_b.__module__ = "module_b"
+        a = thing_a()
+        b = thing_b()
+        a.v = 1
+        b.v = 1
+
+        def module_name(x: object) -> str:
+            return x.__class__.__module__
+
+        ref1 = client.submit(module_name, a)
+        ref2 = client.submit(module_name, b)
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == "module_a"
+        assert ref2.load() == "module_b"
+
     def test_closure_values_not_in_cache_key(self, client: Client) -> None:
         base = 10
 
@@ -88,6 +107,19 @@ class TestHashingEdgeCases:
         assert ref2.load() == 25
 
         assert ref1.hash != ref2.hash
+
+    def test_default_values_are_in_function_hash(self, client: Client) -> None:
+        def make(base: int) -> Any:
+            def f(x: int = base) -> int:
+                return x
+
+            return f
+
+        ref1 = client.submit(make(1))
+        ref2 = client.submit(make(2))
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == 1
+        assert ref2.load() == 2
 
 
 class TestASTNormalizedHashing:
@@ -348,6 +380,32 @@ class TestDynamicSource:
         assert ref1.hash != ref2.hash
         assert ref1.load() == 6
         assert ref2.load() == 7
+
+    def test_exec_function_invalidates_on_default_change(self, client: Client) -> None:
+        namespace1: dict[str, Any] = {}
+        exec("def f(x=1):\n    return x", namespace1)
+        ref1 = client.submit(namespace1["f"])
+
+        namespace2: dict[str, Any] = {}
+        exec("def f(x=2):\n    return x", namespace2)
+        ref2 = client.submit(namespace2["f"])
+
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == 1
+        assert ref2.load() == 2
+
+    def test_exec_function_invalidates_on_global_name_change(self, client: Client) -> None:
+        namespace1: dict[str, Any] = {"A": 1}
+        exec("def f():\n    return A", namespace1)
+        ref1 = client.submit(namespace1["f"])
+
+        namespace2: dict[str, Any] = {"B": 2}
+        exec("def f():\n    return B", namespace2)
+        ref2 = client.submit(namespace2["f"])
+
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == 1
+        assert ref2.load() == 2
 
     def test_lambda_hashes_by_bytecode(self, client: Client) -> None:
         f = lambda x: x * 3  # noqa: E731

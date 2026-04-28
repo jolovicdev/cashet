@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -8,7 +9,7 @@ import pytest
 
 from cashet import Client
 from cashet.models import Commit, TaskDef, TaskStatus
-from cashet.redis_store import RedisStore
+from cashet.redis_store import RedisStore, _access_key, _commit_key
 
 pytestmark = pytest.mark.redis
 
@@ -16,7 +17,7 @@ pytestmark = pytest.mark.redis
 @pytest.fixture
 def redis_store() -> RedisStore:
     store = RedisStore()
-    store._redis.flushdb()
+    store._flushdb()
     return store
 
 
@@ -61,6 +62,42 @@ class TestRedisStoreProtocol:
         found = redis_store.find_by_fingerprint(task_def.fingerprint)
         assert found is not None
         assert found.hash == commit.hash
+
+    def test_cached_put_commit_does_not_move_access_score_backwards(
+        self, redis_store: RedisStore
+    ) -> None:
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+        )
+        commit = Commit(
+            hash="c" * 64,
+            task_def=task_def,
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(UTC) - timedelta(days=10),
+        )
+        redis_store.put_commit(commit)
+        old_score = redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+            redis_store._async_store._redis.zscore(_access_key(), commit.hash)  # pyright: ignore[reportPrivateUsage]
+        )
+        found = redis_store.find_by_fingerprint(task_def.fingerprint)
+        assert found is not None
+        touched_score = redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+            redis_store._async_store._redis.zscore(_access_key(), commit.hash)  # pyright: ignore[reportPrivateUsage]
+        )
+        found.status = TaskStatus.CACHED
+        redis_store.put_commit(found)
+        final_score = redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+            redis_store._async_store._redis.zscore(_access_key(), commit.hash)  # pyright: ignore[reportPrivateUsage]
+        )
+        assert old_score is not None
+        assert touched_score is not None
+        assert final_score is not None
+        assert touched_score > old_score
+        assert final_score >= touched_score
 
     def test_find_running_by_fingerprint(self, redis_store: RedisStore) -> None:
         task_def = TaskDef(
@@ -138,6 +175,31 @@ class TestRedisStoreProtocol:
         commits = redis_store.list_commits(tags={"env": "test"})
         assert len(commits) == 1
 
+    def test_list_commits_filter_tags_searches_past_limit_window(
+        self, redis_store: RedisStore
+    ) -> None:
+        for i in range(5):
+            tags = {"keep": "yes"} if i == 0 else {}
+            task_def = TaskDef(
+                func_hash=f"{i:064d}",
+                func_name="f",
+                func_source="def f(): pass",
+                args_hash="b" * 64,
+                args_snapshot=b"",
+                tags=tags,
+            )
+            commit = Commit(
+                hash=f"{i:064d}",
+                task_def=task_def,
+                status=TaskStatus.COMPLETED,
+                created_at=datetime.now(UTC) + timedelta(seconds=i),
+                tags=tags,
+            )
+            redis_store.put_commit(commit)
+        commits = redis_store.list_commits(limit=1, tags={"keep": "yes"})
+        assert len(commits) == 1
+        assert commits[0].hash == f"{0:064d}"
+
     def test_get_history(self, redis_store: RedisStore) -> None:
         task_def = TaskDef(
             func_hash="a" * 64,
@@ -168,6 +230,71 @@ class TestRedisStoreProtocol:
         s = redis_store.stats()
         assert s["total_commits"] == 1
         assert s["stored_objects"] == 1
+        assert s["disk_bytes"] == 4
+
+    def test_stats_use_maintained_blob_counters(
+        self, redis_store: RedisStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first = redis_store.put_blob(b"data")
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+        )
+        commit = Commit(
+            hash="c" * 64,
+            task_def=task_def,
+            output_ref=first,
+            status=TaskStatus.COMPLETED,
+        )
+        redis_store.put_commit(commit)
+        assert redis_store.stats()["disk_bytes"] == 4
+
+        def fail_scan_iter(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("blob stats should use maintained Redis counters")
+
+        monkeypatch.setattr(redis_store._async_store._redis, "scan_iter", fail_scan_iter)  # pyright: ignore[reportPrivateUsage]
+        redis_store.put_blob(b"more")
+        s = redis_store.stats()
+        assert s["stored_objects"] == 2
+        assert s["disk_bytes"] == 8
+
+        assert redis_store.delete_commit(commit.hash) is True
+        s = redis_store.stats()
+        assert s["stored_objects"] == 1
+        assert s["disk_bytes"] == 4
+
+    def test_evict_max_size_uses_cashet_blob_bytes(self, redis_store: RedisStore) -> None:
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+        )
+        old_ref = redis_store.put_blob(b"x" * 10)
+        new_ref = redis_store.put_blob(b"y" * 10)
+        old = Commit(
+            hash="a1" + "0" * 62,
+            task_def=task_def,
+            output_ref=old_ref,
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(UTC) - timedelta(seconds=1),
+        )
+        new = Commit(
+            hash="a2" + "0" * 62,
+            task_def=task_def,
+            output_ref=new_ref,
+            status=TaskStatus.COMPLETED,
+        )
+        redis_store.put_commit(old)
+        redis_store.put_commit(new)
+        assert redis_store.evict(datetime.now(UTC) - timedelta(days=1), max_size_bytes=10) == 1
+        assert redis_store.get_commit(old.hash) is None
+        assert redis_store.get_commit(new.hash) is not None
+        assert redis_store.stats()["disk_bytes"] == 10
 
     def test_evict_old_commits(self, redis_store: RedisStore) -> None:
         task_def = TaskDef(
@@ -183,6 +310,73 @@ class TestRedisStoreProtocol:
         assert deleted == 1
         assert redis_store.get_commit("c" * 64) is None
 
+    def test_evict_backfills_partial_last_access_index(self, redis_store: RedisStore) -> None:
+        old = datetime.now(UTC) - timedelta(days=10)
+        hashes = ["c" * 64, "d" * 64]
+        for h in hashes:
+            ref = redis_store.put_blob(h.encode())
+            task_def = TaskDef(
+                func_hash=h,
+                func_name="f",
+                func_source="def f(): pass",
+                args_hash="b" * 64,
+                args_snapshot=b"",
+            )
+            commit = Commit(
+                hash=h,
+                task_def=task_def,
+                output_ref=ref,
+                status=TaskStatus.COMPLETED,
+                created_at=old,
+            )
+            redis_store.put_commit(commit)
+            raw = redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+                redis_store._async_store._redis.get(_commit_key(h))  # pyright: ignore[reportPrivateUsage]
+            )
+            data = json.loads(raw)
+            data["last_accessed_at"] = old.isoformat()
+            redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+                redis_store._async_store._redis.set(  # pyright: ignore[reportPrivateUsage]
+                    _commit_key(h), json.dumps(data, separators=(",", ":")).encode()
+                )
+            )
+        redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+            redis_store._async_store._redis.zrem(_access_key(), hashes[0])  # pyright: ignore[reportPrivateUsage]
+        )
+        redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+            redis_store._async_store._redis.zadd(  # pyright: ignore[reportPrivateUsage]
+                _access_key(), {hashes[1]: old.timestamp()}
+            )
+        )
+
+        deleted = redis_store.evict(datetime.now(UTC) - timedelta(days=1))
+
+        assert deleted == 2
+        assert redis_store.get_commit(hashes[0]) is None
+        assert redis_store.get_commit(hashes[1]) is None
+
+    def test_evict_preserves_recently_accessed_old_commit(
+        self, redis_store: RedisStore
+    ) -> None:
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+        )
+        commit = Commit(
+            hash="c" * 64,
+            task_def=task_def,
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(UTC) - timedelta(days=10),
+        )
+        redis_store.put_commit(commit)
+        assert redis_store.find_by_fingerprint(task_def.fingerprint) is not None
+        deleted = redis_store.evict(datetime.now(UTC) - timedelta(days=1))
+        assert deleted == 0
+        assert redis_store.get_commit(commit.hash) is not None
+
     def test_delete_commit(self, redis_store: RedisStore) -> None:
         task_def = TaskDef(
             func_hash="a" * 64,
@@ -196,6 +390,29 @@ class TestRedisStoreProtocol:
         assert redis_store.delete_commit("c" * 64) is True
         assert redis_store.get_commit("c" * 64) is None
         assert redis_store.delete_commit("c" * 64) is False
+
+    def test_delete_commit_with_short_prefix_deletes_full_key(
+        self, redis_store: RedisStore
+    ) -> None:
+        ref = redis_store.put_blob(b"prefix delete")
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+        )
+        commit = Commit(
+            hash="c1" + "0" * 62,
+            task_def=task_def,
+            output_ref=ref,
+            status=TaskStatus.COMPLETED,
+        )
+        redis_store.put_commit(commit)
+        assert redis_store.delete_commit("c1") is True
+        assert redis_store.get_commit(commit.hash) is None
+        with pytest.raises(ValueError, match="not found"):
+            redis_store.get_blob(ref)
 
     def test_delete_commit_removes_orphan_blobs(self, redis_store: RedisStore) -> None:
         data = b"orphan blob"

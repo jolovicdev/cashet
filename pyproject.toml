@@ -1,6 +1,6 @@
 [project]
 name = "cashet"
-version = "0.3.0"
+version = "0.3.1"
 description = "A Python memoization cache with Redis, async support, DAG pipelines, and an HTTP server"
 readme = "README.md"
 license = "MIT"
@@ -90,6 +90,7 @@ venv = ".venv"
 reportUnknownVariableType = "none"
 reportUnknownArgumentType = "none"
 reportUnknownLambdaType = "none"
+reportUnknownMemberType = "none"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

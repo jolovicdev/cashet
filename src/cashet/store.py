@@ -3,20 +3,49 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import zlib
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from cashet._runner import BlockingAsyncRunner
 from cashet.models import Commit, ObjectRef, StorageTier, TaskDef, TaskStatus
 
 _BLOB_COMPRESS_THRESHOLD = 256
 _INLINE_THRESHOLD = 1024
 
+logger = logging.getLogger("cashet")
 
-class SQLiteStore:
+
+@dataclass
+class _SQLiteLockState:
+    thread_lock: threading.Lock
+    file_lock: Any
+
+
+_SQLITE_LOCKS: dict[str, _SQLiteLockState] = {}
+_SQLITE_LOCKS_GUARD = threading.Lock()
+
+
+def _sqlite_lock_state(lock_path: str) -> _SQLiteLockState:
+    with _SQLITE_LOCKS_GUARD:
+        state = _SQLITE_LOCKS.get(lock_path)
+        if state is None:
+            from filelock import FileLock
+
+            state = _SQLiteLockState(
+                thread_lock=threading.Lock(),
+                file_lock=FileLock(lock_path, timeout=30, thread_local=False),
+            )
+            _SQLITE_LOCKS[lock_path] = state
+        return state
+
+
+class _SQLiteStoreCore:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.objects_dir = root / "objects"
@@ -47,13 +76,14 @@ class SQLiteStore:
         return conn
 
     def close(self) -> None:
+        logger.debug("closing sqlite store path=%s", str(self.db_path))
         conn: sqlite3.Connection | None = getattr(self._tls, "conn", None)
         if conn is not None:
-            conn.execute("VACUUM")
             conn.close()
             self._tls.conn = None
 
     def _init_db(self) -> None:
+        logger.debug("initializing sqlite store path=%s", str(self.db_path))
         conn = self._connect()
         conn.execute("""
             CREATE TABLE IF NOT EXISTS commits (
@@ -132,11 +162,21 @@ class SQLiteStore:
                 "INSERT OR IGNORE INTO inline_objects (hash, data) VALUES (?, ?)",
                 (content_hash, data),
             )
+            logger.info(
+                "blob stored hash=%s size=%d tier=inline",
+                content_hash[:12],
+                len(data),
+            )
             return ObjectRef(hash=content_hash, size=len(data), tier=StorageTier.INLINE)
         prefix = content_hash[:2]
         suffix = content_hash[2:]
         obj_path = self.objects_dir / prefix / suffix
         if obj_path.exists():
+            logger.debug(
+                "blob deduplicated hash=%s size=%d",
+                content_hash[:12],
+                len(data),
+            )
             return ObjectRef(hash=content_hash, size=len(data), tier=StorageTier.BLOB)
         obj_path.parent.mkdir(parents=True, exist_ok=True)
         stored = data
@@ -145,6 +185,12 @@ class SQLiteStore:
             if len(compressed) < len(data):
                 stored = compressed
         obj_path.write_bytes(stored)
+        logger.info(
+            "blob stored hash=%s size=%d tier=blob compressed=%s",
+            content_hash[:12],
+            len(data),
+            "true" if stored is not data else "false",
+        )
         return ObjectRef(hash=content_hash, size=len(data), tier=StorageTier.BLOB)
 
     def get_blob(self, ref: ObjectRef) -> bytes:
@@ -154,9 +200,14 @@ class SQLiteStore:
                 "SELECT data FROM inline_objects WHERE hash = ?", (ref.hash,)
             ).fetchone()
             if row is None:
+                logger.warning("inline blob not found hash=%s", ref.hash[:12])
                 raise ValueError(f"Inline blob {ref.hash} not found")
             data = row["data"]
             if hashlib.sha256(data).hexdigest() != ref.hash:
+                logger.error(
+                    "inline blob integrity check failed hash=%s",
+                    ref.hash[:12],
+                )
                 raise ValueError(f"Inline blob {ref.hash} integrity check failed")
             return data
         prefix = ref.hash[:2]
@@ -170,6 +221,10 @@ class SQLiteStore:
         except zlib.error:
             pass
         if hashlib.sha256(raw).hexdigest() != ref.hash:
+            logger.error(
+                "blob integrity check failed hash=%s",
+                ref.hash[:12],
+            )
             raise ValueError(f"Blob {ref.hash} integrity check failed")
         return raw
 
@@ -345,19 +400,8 @@ class SQLiteStore:
         completed = conn.execute(
             "SELECT COUNT(*) FROM commits WHERE status IN ('completed', 'cached')"
         ).fetchone()[0]
-        obj_count = 0
-        total_bytes = 0
-        for p in self.objects_dir.iterdir():
-            if p.is_dir():
-                for f in p.iterdir():
-                    if f.is_file():
-                        obj_count += 1
-                        total_bytes += f.stat().st_size
-        inline_row = conn.execute(
-            "SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(data)), 0) AS bytes FROM inline_objects"
-        ).fetchone()
-        inline_count = inline_row["cnt"] if inline_row else 0
-        inline_bytes = inline_row["bytes"] if inline_row else 0
+        obj_count, total_bytes = self._blob_storage_totals()
+        inline_count, inline_bytes = self._inline_storage_totals(conn)
         return {
             "total_commits": total,
             "completed_commits": completed,
@@ -368,6 +412,28 @@ class SQLiteStore:
             "inline_objects": inline_count,
             "inline_bytes": inline_bytes,
         }
+
+    def _blob_storage_totals(self) -> tuple[int, int]:
+        obj_count = 0
+        total_bytes = 0
+        for p in self.objects_dir.iterdir():
+            if p.is_dir():
+                for f in p.iterdir():
+                    if f.is_file():
+                        obj_count += 1
+                        total_bytes += f.stat().st_size
+        return obj_count, total_bytes
+
+    def _inline_storage_totals(self, conn: sqlite3.Connection) -> tuple[int, int]:
+        inline_row = conn.execute(
+            "SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(data)), 0) AS bytes FROM inline_objects"
+        ).fetchone()
+        inline_count = inline_row["cnt"] if inline_row else 0
+        inline_bytes = inline_row["bytes"] if inline_row else 0
+        return inline_count, inline_bytes
+
+    def _storage_bytes(self, conn: sqlite3.Connection) -> int:
+        return self._blob_storage_totals()[1] + self._inline_storage_totals(conn)[1]
 
     def evict(
         self, older_than: datetime, max_size_bytes: int | None = None
@@ -413,30 +479,74 @@ class SQLiteStore:
             conn.execute("ROLLBACK")
             raise
         if orphans:
+            logger.info(
+                "orphan objects cleaned count=%d",
+                len(orphans),
+            )
             self._delete_orphan_objects(conn, orphans)
 
         if max_size_bytes is not None:
-            total_commits = conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0]
-            for _ in range(total_commits):
-                stats = self.stats()
-                if stats["disk_bytes"] <= max_size_bytes:
-                    break
-                row = conn.execute(
-                    "SELECT hash FROM commits ORDER BY last_accessed_at ASC LIMIT 1"
-                ).fetchone()
-                if row is None:
-                    break
-                if self.delete_commit(row["hash"]):
-                    deleted += 1
+            current_bytes = self._storage_bytes(conn)
+            if current_bytes > max_size_bytes:
+                deleted += self._evict_to_size(current_bytes, max_size_bytes)
 
         if deleted:
+            logger.info(
+                "eviction complete deleted=%d reason=%s",
+                deleted,
+                "size_limit" if max_size_bytes is not None else "ttl",
+            )
             c = self._connect()
             mode = c.execute("PRAGMA auto_vacuum").fetchone()[0]
             if mode == 2:
                 c.execute("PRAGMA incremental_vacuum")
             else:
                 c.execute("VACUUM")
+        else:
+            logger.debug("eviction found no candidates")
 
+        return deleted
+
+    def _evict_to_size(self, current_bytes: int, max_size_bytes: int) -> int:
+        pending_orphans: list[str] = []
+        deleted = 0
+        conn = self._connect(immediate=True)
+        try:
+            ref_counts = self._object_ref_counts(conn)
+            rows = conn.execute(
+                "SELECT * FROM commits ORDER BY last_accessed_at ASC"
+            ).fetchall()
+            for target in rows:
+                if current_bytes <= max_size_bytes:
+                    break
+                refs = self._row_object_refs(target)
+                conn.execute(
+                    "UPDATE commits SET parent_hash = NULL WHERE parent_hash = ?",
+                    (target["hash"],),
+                )
+                conn.execute("DELETE FROM commits WHERE hash = ?", (target["hash"],))
+                deleted += 1
+                for obj_hash in refs:
+                    count = ref_counts.get(obj_hash, 0)
+                    if count <= 0:
+                        continue
+                    if count == 1:
+                        ref_counts.pop(obj_hash, None)
+                        if obj_hash not in pending_orphans:
+                            current_bytes -= self._object_storage_size(conn, obj_hash)
+                            pending_orphans.append(obj_hash)
+                    else:
+                        ref_counts[obj_hash] = count - 1
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        if pending_orphans:
+            logger.info(
+                "orphan objects cleaned count=%d",
+                len(pending_orphans),
+            )
+            self._delete_orphan_objects(conn, pending_orphans)
         return deleted
 
     def delete_commit(self, hash: str) -> bool:
@@ -462,13 +572,7 @@ class SQLiteStore:
                 if target is None:
                     return False
 
-            candidates: set[str] = set()
-            if target["output_hash"]:
-                candidates.add(target["output_hash"])
-            if target["input_refs"]:
-                for h in json.loads(target["input_refs"]):
-                    candidates.add(h)
-
+            candidates = set(self._row_object_refs(target))
             conn.execute(
                 "UPDATE commits SET parent_hash = NULL WHERE parent_hash = ?",
                 (target["hash"],),
@@ -483,8 +587,42 @@ class SQLiteStore:
             conn.execute("ROLLBACK")
             raise
         if orphans:
+            logger.info(
+                "orphan objects cleaned count=%d",
+                len(orphans),
+            )
             self._delete_orphan_objects(conn, orphans)
+        logger.debug("commit deleted hash=%s", target["hash"][:12])
         return True
+
+    def _row_object_refs(self, row: sqlite3.Row) -> list[str]:
+        refs: list[str] = []
+        if row["output_hash"]:
+            refs.append(row["output_hash"])
+        if row["input_refs"]:
+            refs.extend(set(json.loads(row["input_refs"])))
+        return refs
+
+    def _object_ref_counts(self, conn: sqlite3.Connection) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for row in conn.execute("SELECT output_hash FROM commits WHERE output_hash IS NOT NULL"):
+            counts[row[0]] = counts.get(row[0], 0) + 1
+        for row in conn.execute("SELECT input_refs FROM commits WHERE input_refs IS NOT NULL"):
+            for h in set(json.loads(row[0])):
+                counts[h] = counts.get(h, 0) + 1
+        return counts
+
+    def _object_storage_size(self, conn: sqlite3.Connection, obj_hash: str) -> int:
+        size = 0
+        blob_path = self.objects_dir / obj_hash[:2] / obj_hash[2:]
+        if blob_path.exists():
+            size += blob_path.stat().st_size
+        row = conn.execute(
+            "SELECT LENGTH(data) AS size FROM inline_objects WHERE hash = ?", (obj_hash,)
+        ).fetchone()
+        if row is not None:
+            size += row["size"] or 0
+        return size
 
     def _find_orphan_objects(self, conn: sqlite3.Connection, candidates: set[str]) -> list[str]:
         still_output: set[str] = set()
@@ -495,17 +633,25 @@ class SQLiteStore:
             still_input.update(json.loads(row[0]))
         return [h for h in candidates if h not in still_output and h not in still_input]
 
-    def _delete_orphan_objects(self, conn: sqlite3.Connection | None, orphans: list[str]) -> None:
+    def _delete_orphan_objects(self, conn: sqlite3.Connection | None, orphans: list[str]) -> int:
         if conn is None:
             conn = self._connect()
+        freed = 0
         for obj_hash in orphans:
             blob_path = self.objects_dir / obj_hash[:2] / obj_hash[2:]
             if blob_path.exists():
+                freed += blob_path.stat().st_size
                 blob_path.unlink()
+            row = conn.execute(
+                "SELECT LENGTH(data) AS size FROM inline_objects WHERE hash = ?", (obj_hash,)
+            ).fetchone()
+            if row is not None:
+                freed += row["size"] or 0
             conn.execute("DELETE FROM inline_objects WHERE hash = ?", (obj_hash,))
         for prefix_dir in list(self.objects_dir.iterdir()):
             if prefix_dir.is_dir() and not any(prefix_dir.iterdir()):
                 prefix_dir.rmdir()
+        return freed
 
     def _row_to_commit(self, row: sqlite3.Row) -> Commit:
         output_ref = None
@@ -557,28 +703,67 @@ class SQLiteStore:
         )
 
 
+class _SQLiteFingerprintLock:
+    def __init__(self, lock_path: str) -> None:
+        self._state = _sqlite_lock_state(lock_path)
+
+    async def __aenter__(self) -> None:
+        await asyncio.to_thread(self._state.thread_lock.acquire)
+        try:
+            await asyncio.to_thread(self._state.file_lock.acquire)
+        except Exception:
+            self._state.thread_lock.release()
+            raise
+
+    async def __aexit__(self, *args: Any) -> None:
+        try:
+            await asyncio.to_thread(self._state.file_lock.release)
+        finally:
+            self._state.thread_lock.release()
+
+
 class AsyncSQLiteStore:
     def __init__(self, root: Path) -> None:
-        self._store = SQLiteStore(root)
-        self._async_lock = asyncio.Lock()
+        self._core = _SQLiteStoreCore(root)
+        self._write_lock = asyncio.Lock()
+
+    def _fingerprint_lock(self, fingerprint: str) -> _SQLiteFingerprintLock:
+        import hashlib
+
+        fp_hash = hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
+        return _SQLiteFingerprintLock(str(self._core.root / f".lock-{fp_hash}"))
+
+    @property
+    def root(self) -> Path:
+        return self._core.root
+
+    @property
+    def objects_dir(self) -> Path:
+        return self._core.objects_dir
+
+    @property
+    def db_path(self) -> Path:
+        return self._core.db_path
 
     async def put_blob(self, data: bytes) -> ObjectRef:
-        return await asyncio.to_thread(self._store.put_blob, data)
+        async with self._write_lock:
+            return await asyncio.to_thread(self._core.put_blob, data)
 
     async def get_blob(self, ref: ObjectRef) -> bytes:
-        return await asyncio.to_thread(self._store.get_blob, ref)
+        return await asyncio.to_thread(self._core.get_blob, ref)
 
     async def put_commit(self, commit: Commit) -> None:
-        await asyncio.to_thread(self._store.put_commit, commit)
+        async with self._write_lock:
+            await asyncio.to_thread(self._core.put_commit, commit)
 
     async def get_commit(self, hash: str) -> Commit | None:
-        return await asyncio.to_thread(self._store.get_commit, hash)
+        return await asyncio.to_thread(self._core.get_commit, hash)
 
     async def find_by_fingerprint(self, fingerprint: str) -> Commit | None:
-        return await asyncio.to_thread(self._store.find_by_fingerprint, fingerprint)
+        return await asyncio.to_thread(self._core.find_by_fingerprint, fingerprint)
 
     async def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
-        return await asyncio.to_thread(self._store.find_running_by_fingerprint, fingerprint)
+        return await asyncio.to_thread(self._core.find_running_by_fingerprint, fingerprint)
 
     async def list_commits(
         self,
@@ -588,7 +773,7 @@ class AsyncSQLiteStore:
         tags: dict[str, str | None] | None = None,
     ) -> list[Commit]:
         return await asyncio.to_thread(
-            self._store.list_commits,
+            self._core.list_commits,
             func_name=func_name,
             limit=limit,
             status=status,
@@ -596,16 +781,100 @@ class AsyncSQLiteStore:
         )
 
     async def get_history(self, hash: str) -> list[Commit]:
-        return await asyncio.to_thread(self._store.get_history, hash)
+        return await asyncio.to_thread(self._core.get_history, hash)
 
     async def stats(self) -> dict[str, int]:
-        return await asyncio.to_thread(self._store.stats)
+        return await asyncio.to_thread(self._core.stats)
 
     async def evict(self, older_than: datetime, max_size_bytes: int | None = None) -> int:
-        return await asyncio.to_thread(self._store.evict, older_than, max_size_bytes)
+        async with self._write_lock:
+            return await asyncio.to_thread(self._core.evict, older_than, max_size_bytes)
 
     async def delete_commit(self, hash: str) -> bool:
-        return await asyncio.to_thread(self._store.delete_commit, hash)
+        async with self._write_lock:
+            return await asyncio.to_thread(self._core.delete_commit, hash)
 
     async def close(self) -> None:
-        await asyncio.to_thread(self._store.close)
+        await asyncio.to_thread(self._core.close)
+
+
+class SQLiteStore:
+    def __init__(self, root: Path) -> None:
+        self._async_store = AsyncSQLiteStore(root)
+        self._runner = BlockingAsyncRunner()
+
+    @classmethod
+    def from_async(
+        cls, async_store: AsyncSQLiteStore, *, runner: BlockingAsyncRunner | None = None
+    ) -> SQLiteStore:
+        instance = cls.__new__(cls)
+        instance._async_store = async_store
+        instance._runner = runner or BlockingAsyncRunner()
+        return instance
+
+    @property
+    def root(self) -> Path:
+        return self._async_store.root
+
+    @property
+    def objects_dir(self) -> Path:
+        return self._async_store.objects_dir
+
+    @property
+    def db_path(self) -> Path:
+        return self._async_store.db_path
+
+    def _connect(self, *, immediate: bool = False) -> sqlite3.Connection:
+        core: Any = self._async_store._core  # pyright: ignore[reportPrivateUsage]
+        return core._connect(immediate=immediate)
+
+    def blob_exists(self, hash: str) -> bool:
+        core: Any = self._async_store._core  # pyright: ignore[reportPrivateUsage]
+        return core.blob_exists(hash)
+
+    def put_blob(self, data: bytes) -> ObjectRef:
+        return self._runner.call(self._async_store.put_blob(data))
+
+    def get_blob(self, ref: ObjectRef) -> bytes:
+        return self._runner.call(self._async_store.get_blob(ref))
+
+    def put_commit(self, commit: Commit) -> None:
+        self._runner.call(self._async_store.put_commit(commit))
+
+    def get_commit(self, hash: str) -> Commit | None:
+        return self._runner.call(self._async_store.get_commit(hash))
+
+    def find_by_fingerprint(self, fingerprint: str) -> Commit | None:
+        return self._runner.call(self._async_store.find_by_fingerprint(fingerprint))
+
+    def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
+        return self._runner.call(self._async_store.find_running_by_fingerprint(fingerprint))
+
+    def list_commits(
+        self,
+        func_name: str | None = None,
+        limit: int = 50,
+        status: TaskStatus | None = None,
+        tags: dict[str, str | None] | None = None,
+    ) -> list[Commit]:
+        return self._runner.call(
+            self._async_store.list_commits(
+                func_name=func_name, limit=limit, status=status, tags=tags
+            )
+        )
+
+    def get_history(self, hash: str) -> list[Commit]:
+        return self._runner.call(self._async_store.get_history(hash))
+
+    def stats(self) -> dict[str, int]:
+        return self._runner.call(self._async_store.stats())
+
+    def evict(self, older_than: datetime, max_size_bytes: int | None = None) -> int:
+        return self._runner.call(self._async_store.evict(older_than, max_size_bytes))
+
+    def delete_commit(self, hash: str) -> bool:
+        return self._runner.call(self._async_store.delete_commit(hash))
+
+    def close(self) -> None:
+        self._runner.call(self._async_store.close())
+        self._runner.close()

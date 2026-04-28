@@ -61,3 +61,16 @@ class Executor(Protocol):
         store: Store,
         serializer: Any,
     ) -> tuple[Commit, bool]: ...
+
+
+@runtime_checkable
+class AsyncExecutor(Protocol):
+    async def submit(
+        self,
+        func: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        task_def: TaskDef,
+        store: AsyncStore,
+        serializer: Any,
+    ) -> tuple[Commit, bool]: ...

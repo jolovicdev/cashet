@@ -9,12 +9,75 @@ import pytest
 
 from cashet import Client
 from cashet.executor import LocalExecutor
-from cashet.hashing import PickleSerializer
-from cashet.models import ObjectRef, StorageTier
+from cashet.hashing import PickleSerializer, build_task_def
+from cashet.models import Commit, ObjectRef, StorageTier, TaskStatus
 from cashet.store import SQLiteStore
 
 
 class TestProcessSafety:
+    def test_local_executor_accepts_plain_sync_store_protocol(
+        self, store_dir: Path
+    ) -> None:
+        wrapped = SQLiteStore(store_dir)
+
+        class StoreProxy:
+            def put_blob(self, data: bytes) -> ObjectRef:
+                return wrapped.put_blob(data)
+
+            def get_blob(self, ref: ObjectRef) -> bytes:
+                return wrapped.get_blob(ref)
+
+            def put_commit(self, commit: Commit) -> None:
+                wrapped.put_commit(commit)
+
+            def get_commit(self, hash: str) -> Commit | None:
+                return wrapped.get_commit(hash)
+
+            def find_by_fingerprint(self, fingerprint: str) -> Commit | None:
+                return wrapped.find_by_fingerprint(fingerprint)
+
+            def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
+                return wrapped.find_running_by_fingerprint(fingerprint)
+
+            def list_commits(
+                self,
+                func_name: str | None = None,
+                limit: int = 50,
+                status: TaskStatus | None = None,
+                tags: dict[str, str | None] | None = None,
+            ) -> list[Commit]:
+                return wrapped.list_commits(func_name, limit, status, tags)
+
+            def get_history(self, hash: str) -> list[Commit]:
+                return wrapped.get_history(hash)
+
+            def stats(self) -> dict[str, int]:
+                return wrapped.stats()
+
+            def evict(
+                self, older_than: datetime, max_size_bytes: int | None = None
+            ) -> int:
+                return wrapped.evict(older_than, max_size_bytes)
+
+            def delete_commit(self, hash: str) -> bool:
+                return wrapped.delete_commit(hash)
+
+            def close(self) -> None:
+                wrapped.close()
+
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        serializer = PickleSerializer()
+        task_def = build_task_def(add, (2, 3), {})
+        commit, cached = LocalExecutor().submit(
+            add, (2, 3), {}, task_def, StoreProxy(), serializer
+        )
+
+        assert cached is False
+        assert commit.output_ref is not None
+        assert serializer.loads(wrapped.get_blob(commit.output_ref)) == 5
+
     def test_cross_process_dedup(self, store_dir: Path) -> None:
         import multiprocessing
 
@@ -945,6 +1008,27 @@ class TestSizeAwareGC:
         final_stats = client.stats()
         assert final_stats["disk_bytes"] <= 1
         assert final_stats["total_commits"] == 0
+
+    def test_gc_max_size_does_not_walk_stats_per_commit(
+        self, client: Client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def make_bytes(n: int) -> bytes:
+            return b"x" * n
+
+        client.submit(make_bytes, 100, _cache=False)
+        client.submit(make_bytes, 100, _cache=False)
+        client.submit(make_bytes, 100, _cache=False)
+        calls = 0
+        original = client.store.stats
+
+        def counted_stats() -> dict[str, int]:
+            nonlocal calls
+            calls += 1
+            return original()
+
+        monkeypatch.setattr(client.store, "stats", counted_stats)
+        client.gc(max_size_bytes=1)
+        assert calls == 0
 
     def test_gc_combines_time_and_size(self, client: Client) -> None:
         def make_bytes(n: int) -> bytes:
