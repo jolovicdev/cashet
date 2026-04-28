@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import time
 from typing import Any
 
 from cashet.hashing import Serializer
 from cashet.models import Commit, ObjectRef, TaskDef, TaskStatus
-from cashet.protocols import AsyncStore, Store
+from cashet.protocols import AsyncStore
 
 
 class TaskRef:
@@ -23,54 +24,6 @@ def resolve_input_refs(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Ob
         if hasattr(val, "__cashet_ref__"):
             refs.append(val.__cashet_ref__())
     return refs
-
-
-class ResultRef:
-    __slots__ = ("_commit_hash", "_loaded", "_ref", "_serializer", "_store", "_value")
-
-    def __init__(
-        self,
-        ref: ObjectRef,
-        store: Store,
-        serializer: Serializer,
-        commit_hash: str = "",
-    ) -> None:
-        self._ref = ref
-        self._store = store
-        self._serializer = serializer
-        self._commit_hash = commit_hash
-        self._value: Any = None
-        self._loaded = False
-
-    def __cashet_ref__(self) -> ObjectRef:
-        return self._ref
-
-    @property
-    def hash(self) -> str:
-        return self._ref.hash
-
-    @property
-    def commit_hash(self) -> str:
-        return self._commit_hash
-
-    @property
-    def short_hash(self) -> str:
-        return self._ref.short()
-
-    @property
-    def size(self) -> int:
-        return self._ref.size
-
-    def load(self) -> Any:
-        if not self._loaded:
-            data = self._store.get_blob(self._ref)
-            self._value = self._serializer.loads(data)
-            self._loaded = True
-        return self._value
-
-    def __repr__(self) -> str:
-        ch = self._commit_hash[:12] if self._commit_hash else "?"
-        return f"ResultRef(commit={ch}, blob={self.short_hash}, size={self.size})"
 
 
 class AsyncResultRef:
@@ -112,13 +65,15 @@ class AsyncResultRef:
     def size(self) -> int:
         return self._ref.size
 
+    @property
+    def ref(self) -> ObjectRef:
+        return self._ref
+
     async def load(self) -> Any:
         if self._loaded:
             return self._value
-        import asyncio as _asyncio
-
         if self._load_lock is None:
-            self._load_lock = _asyncio.Lock()
+            self._load_lock = asyncio.Lock()
         async with self._load_lock:
             if self._loaded:
                 return self._value
@@ -132,29 +87,53 @@ class AsyncResultRef:
         return f"AsyncResultRef(commit={ch}, blob={self.short_hash}, size={self.size})"
 
 
-async def async_resolve_input_refs(
-    args: tuple[Any, ...], kwargs: dict[str, Any]
-) -> list[ObjectRef]:
-    refs: list[ObjectRef] = []
-    for arg in args:
-        if hasattr(arg, "__cashet_ref__"):
-            refs.append(arg.__cashet_ref__())
-    for val in kwargs.values():
-        if hasattr(val, "__cashet_ref__"):
-            refs.append(val.__cashet_ref__())
-    return refs
+class ResultRef:
+    __slots__ = ("_async_ref", "_commit_hash", "_ref", "_runner")
+
+    def __init__(self, async_ref: AsyncResultRef, runner: Any) -> None:
+        self._async_ref = async_ref
+        self._runner = runner
+        self._ref = async_ref.ref
+        self._commit_hash = async_ref.commit_hash
+
+    def __cashet_ref__(self) -> ObjectRef:
+        return self._ref
+
+    @property
+    def hash(self) -> str:
+        return self._ref.hash
+
+    @property
+    def commit_hash(self) -> str:
+        return self._commit_hash
+
+    @property
+    def short_hash(self) -> str:
+        return self._ref.short()
+
+    @property
+    def size(self) -> int:
+        return self._ref.size
+
+    async def __cashet_async_load__(self) -> Any:
+        return await self._async_ref.load()
+
+    def load(self) -> Any:
+        return self._runner.call(self._async_ref.load())
+
+    def __repr__(self) -> str:
+        ch = self._commit_hash[:12] if self._commit_hash else "?"
+        return f"ResultRef(commit={ch}, blob={self.short_hash}, size={self.size})"
 
 
-async def async_find_existing_commit(store: AsyncStore, task_def: TaskDef) -> Commit | None:
+async def find_existing_commit(store: AsyncStore, task_def: TaskDef) -> Commit | None:
     if not task_def.cache:
         return None
-    fingerprint = f"{task_def.func_hash}:{task_def.args_hash}"
-    return await store.find_by_fingerprint(fingerprint)
+    return await store.find_by_fingerprint(task_def.fingerprint)
 
 
-async def async_find_parent_hash(store: AsyncStore, task_def: TaskDef) -> str | None:
-    fingerprint = f"{task_def.func_hash}:{task_def.args_hash}"
-    existing = await store.find_by_fingerprint(fingerprint)
+async def find_parent_hash(store: AsyncStore, task_def: TaskDef) -> str | None:
+    existing = await store.find_by_fingerprint(task_def.fingerprint)
     if existing is not None:
         return existing.hash
     return None
@@ -174,21 +153,6 @@ def compute_commit_hash(
     if salt is not None:
         h.update(salt.encode("utf-8"))
     return h.hexdigest()
-
-
-def find_existing_commit(store: Store, task_def: TaskDef) -> Commit | None:
-    if not task_def.cache:
-        return None
-    fingerprint = f"{task_def.func_hash}:{task_def.args_hash}"
-    return store.find_by_fingerprint(fingerprint)
-
-
-def find_parent_hash(store: Store, task_def: TaskDef) -> str | None:
-    fingerprint = f"{task_def.func_hash}:{task_def.args_hash}"
-    existing = store.find_by_fingerprint(fingerprint)
-    if existing is not None:
-        return existing.hash
-    return None
 
 
 def build_commit(

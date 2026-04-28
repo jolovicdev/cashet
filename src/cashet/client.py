@@ -1,30 +1,35 @@
 from __future__ import annotations
 
-import os
-from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+import asyncio
+import inspect
+from collections.abc import Callable, Mapping
+from datetime import timedelta
 from functools import wraps
 from pathlib import Path
 from typing import Any, cast, overload
 
 from cashet._batch import (
     build_deps,
-    execute_batch,
     normalize_tasks,
     topological_sort,
     unpack_dict_tasks,
     unpack_list_tasks,
 )
+from cashet._client_base import (
+    resolve_store_dir,
+    set_task_metadata,
+)
+from cashet._runner import BlockingAsyncRunner
+from cashet.adapters import SyncStoreAdapter
+from cashet.async_client import AsyncClient
+from cashet.async_executor import AsyncLocalExecutor
 from cashet.dag import ResultRef
 from cashet.executor import LocalExecutor
-from cashet.hashing import PickleSerializer, Serializer, build_task_def
-from cashet.models import Commit, TaskError, TaskStatus
+from cashet.hashing import Serializer
+from cashet.models import Commit, TaskStatus
 from cashet.protocols import Executor, Store
-from cashet.store import SQLiteStore
+from cashet.store import AsyncSQLiteStore, SQLiteStore
 
-_DEFAULT_STORE_DIR = ".cashet"
-_CASHET_DIR_ENV = "CASHET_DIR"
-_DIFF_SIZE_LIMIT = 10 * 1024 * 1024
 _DEFAULT_GC_TTL_DAYS = 30
 
 
@@ -37,30 +42,44 @@ class Client:
         serializer: Serializer | None = None,
         max_workers: int = 1,
     ) -> None:
-        if store is not None:
-            self.store: Store = store
-            self.store_dir = (
-                Path(store_dir)
-                if store_dir is not None
-                else Path(os.environ.get(_CASHET_DIR_ENV) or Path.cwd() / _DEFAULT_STORE_DIR)
-            )
-        else:
-            if store_dir is None:
-                store_dir = os.environ.get(_CASHET_DIR_ENV) or None
-            if store_dir is None:
-                store_dir = Path.cwd() / _DEFAULT_STORE_DIR
-            self.store_dir = Path(store_dir)
-            self.store = SQLiteStore(self.store_dir)
-        self._executor: Executor = executor or LocalExecutor()
-        if serializer is None:
-            import warnings
+        self.store_dir = resolve_store_dir(store_dir, store)
 
-            warnings.warn(
-                "Using PickleSerializer by default — arbitrary code execution risk on "
-                "untrusted cached results. Pass serializer=SafePickleSerializer() to opt in.",
-                stacklevel=2,
-            )
-        self.serializer: Serializer = serializer or PickleSerializer()
+        if store is not None:
+            self.store = store
+            if isinstance(store, SQLiteStore) or hasattr(store, "_async_store"):
+                async_store = store._async_store  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+                self._runner = getattr(store, "_runner", None) or BlockingAsyncRunner()
+            else:
+                async_store = SyncStoreAdapter(store)
+                self._runner = BlockingAsyncRunner()
+        else:
+            self._runner = BlockingAsyncRunner()
+            async_store = AsyncSQLiteStore(self.store_dir)
+            self.store = SQLiteStore.from_async(async_store, runner=self._runner)
+
+        if executor is not None:
+            self._executor = executor
+            if hasattr(executor, "_async_executor"):
+                async_executor = executor._async_executor  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+                executor_runner = getattr(executor, "_runner", None)
+                if executor_runner is not None:
+                    self._runner = executor_runner
+            elif inspect.iscoroutinefunction(getattr(executor, "submit", None)):
+                async_executor = executor
+            else:
+                async_executor = _SyncExecutorAdapter(executor, self._runner, self.store)
+        else:
+            async_executor = AsyncLocalExecutor()
+            self._executor = LocalExecutor.from_async(async_executor, runner=self._runner)
+
+        self._async_client = AsyncClient(
+            store_dir=store_dir,
+            store=async_store,
+            executor=async_executor,
+            serializer=serializer,
+            max_workers=max_workers,
+        )
+        self.serializer = self._async_client.serializer
         self._registered_tasks: dict[str, Callable[..., Any]] = {}
         self._max_workers = max_workers
 
@@ -77,12 +96,7 @@ class Client:
     ) -> Callable[..., Any]:
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             task_name = name or fn.__qualname__
-            fn._cashet_cache = cache  # pyright: ignore[reportFunctionMemberAccess]
-            fn._cashet_name = task_name  # pyright: ignore[reportFunctionMemberAccess]
-            fn._cashet_tags = tags or {}  # pyright: ignore[reportFunctionMemberAccess]
-            fn._cashet_retries = retries  # pyright: ignore[reportFunctionMemberAccess]
-            fn._cashet_force = force  # pyright: ignore[reportFunctionMemberAccess]
-            fn._cashet_timeout = timeout  # pyright: ignore[reportFunctionMemberAccess]
+            set_task_metadata(fn, task_name, cache, tags, retries, force, timeout)
             self._registered_tasks[task_name] = fn
 
             @wraps(fn)
@@ -90,12 +104,7 @@ class Client:
                 return self.submit(fn, *args, **kwargs)
 
             wrapper._cashet_wrapped_func = fn  # pyright: ignore[reportAttributeAccessIssue]
-            wrapper._cashet_cache = cache  # pyright: ignore[reportAttributeAccessIssue]
-            wrapper._cashet_name = task_name  # pyright: ignore[reportAttributeAccessIssue]
-            wrapper._cashet_tags = tags or {}  # pyright: ignore[reportAttributeAccessIssue]
-            wrapper._cashet_retries = retries  # pyright: ignore[reportAttributeAccessIssue]
-            wrapper._cashet_force = force  # pyright: ignore[reportAttributeAccessIssue]
-            wrapper._cashet_timeout = timeout  # pyright: ignore[reportAttributeAccessIssue]
+            set_task_metadata(wrapper, task_name, cache, tags, retries, force, timeout)
             return wrapper
 
         if func is not None:
@@ -113,32 +122,19 @@ class Client:
         _timeout: int | float | None = None,
         **kwargs: Any,
     ) -> ResultRef:
-        raw_func = getattr(func, "_cashet_wrapped_func", func)
-        cache = _cache if _cache is not None else getattr(raw_func, "_cashet_cache", True)
-        tags = _tags if _tags is not None else getattr(raw_func, "_cashet_tags", {})
-        retries = _retries if _retries is not None else getattr(raw_func, "_cashet_retries", 0)
-        force = _force if _force is not None else getattr(raw_func, "_cashet_force", False)
-        timeout_seconds = (
-            _timeout if _timeout is not None else getattr(raw_func, "_cashet_timeout", None)
+        async_ref = self._runner.call(
+            self._async_client.submit(
+                func,
+                *args,
+                _cache=_cache,
+                _tags=_tags,
+                _retries=_retries,
+                _force=_force,
+                _timeout=_timeout,
+                **kwargs,
+            )
         )
-        timeout = timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
-        task_def = build_task_def(
-            raw_func,
-            args,
-            kwargs,
-            cache=cache,
-            tags=tags,
-            retries=retries,
-            force=force,
-            timeout=timeout,
-        )
-        commit, _was_cached = self._executor.submit(
-            raw_func, args, kwargs, task_def, self.store, self.serializer
-        )
-        if commit.output_ref is None:
-            raise TaskError(f"Task {commit.task_def.func_name} failed: {commit.error}")
-        ref = ResultRef(commit.output_ref, self.store, self.serializer, commit_hash=commit.hash)
-        return ref
+        return ResultRef(async_ref, self._runner)
 
     @overload
     def submit_many(
@@ -194,24 +190,28 @@ class Client:
 
         key_set = set(keys)
         normalized = normalize_tasks(raw_tasks, _cache, _tags, _retries, _force, _timeout)
-        deps, task_refs = build_deps(keys, normalized, key_set)
-        order = topological_sort(deps)
+        deps, _task_refs = build_deps(keys, normalized, key_set)
+        _order = topological_sort(deps)
         workers = max_workers if max_workers is not None else self._max_workers
-        results = execute_batch(
-            order,
-            keys,
-            normalized,
-            task_refs,
-            deps,
-            self._executor,
-            self.store,
-            self.serializer,
-            workers,
+
+        async_results = self._runner.call(
+            self._async_client.submit_many(
+                tasks,
+                _cache=_cache,
+                _tags=_tags,
+                _retries=_retries,
+                _force=_force,
+                _timeout=_timeout,
+                max_workers=workers,
+            )
         )
 
         if is_dict:
-            return cast(dict[str, ResultRef], {k: results[k] for k in keys})
-        return [results[k] for k in keys]
+            return cast(
+                dict[str, ResultRef],
+                {k: ResultRef(async_results[k], self._runner) for k in keys},
+            )
+        return [ResultRef(async_results[k], self._runner) for k in keys]
 
     def log(
         self,
@@ -220,65 +220,56 @@ class Client:
         status: TaskStatus | str | None = None,
         tags: dict[str, str | None] | None = None,
     ) -> list[Commit]:
-        resolved_status: TaskStatus | None = None
-        if isinstance(status, str):
-            try:
-                resolved_status = TaskStatus(status)
-            except ValueError as e:
-                valid = ", ".join(s.value for s in TaskStatus)
-                raise ValueError(f"Invalid status '{status}'. Valid values: {valid}") from e
-        else:
-            resolved_status = status
-        return self.store.list_commits(
-            func_name=func_name, limit=limit, status=resolved_status, tags=tags
-        )
+        return self._runner.call(self._async_client.log(func_name, limit, status, tags))
 
     def show(self, hash: str) -> Commit | None:
-        return self.store.get_commit(hash)
+        return self._runner.call(self._async_client.show(hash))
 
     def history(self, hash: str) -> list[Commit]:
-        return self.store.get_history(hash)
+        return self._runner.call(self._async_client.history(hash))
 
     def get(self, hash: str) -> Any:
-        commit = self.store.get_commit(hash)
-        if commit is None:
-            raise KeyError(f"No commit found with hash {hash}")
-        if commit.output_ref is None:
-            raise ValueError(f"Commit {hash[:12]} has no output")
-        ref = ResultRef(commit.output_ref, self.store, self.serializer, commit_hash=commit.hash)
-        return ref.load()
+        return self._runner.call(self._async_client.get(hash))
 
     def diff(self, hash_a: str, hash_b: str) -> dict[str, Any]:
-        commit_a = self.store.get_commit(hash_a)
-        commit_b = self.store.get_commit(hash_b)
-        if commit_a is None or commit_b is None:
-            raise KeyError("One or both commits not found")
-        return _diff_commits(commit_a, commit_b, self.store, self.serializer)
+        return self._runner.call(self._async_client.diff(hash_a, hash_b))
 
     def stats(self) -> dict[str, int]:
-        return self.store.stats()
+        return self._runner.call(self._async_client.stats())
 
     def rm(self, hash: str) -> bool:
-        return self.store.delete_commit(hash)
+        return self._runner.call(self._async_client.rm(hash))
 
     def gc(self, older_than: timedelta | None = None, max_size_bytes: int | None = None) -> int:
-        ttl = older_than if older_than is not None else timedelta(days=_DEFAULT_GC_TTL_DAYS)
-        cutoff = datetime.now(UTC) - ttl
-        return self.store.evict(cutoff, max_size_bytes=max_size_bytes)
+        return self._runner.call(self._async_client.gc(older_than, max_size_bytes))
 
     def clear(self) -> int:
-        return self.gc(timedelta(days=0))
+        return self._runner.call(self._async_client.clear())
 
-    def serve(self, host: str = "127.0.0.1", port: int = 8000) -> None:
+    def serve(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        require_token: str | None = None,
+        *,
+        tasks: Mapping[str, Callable[..., Any]] | None = None,
+        allow_remote_code: bool = False,
+    ) -> None:
         import uvicorn
 
         from cashet.server import create_app
 
-        app = create_app(self)
+        app = create_app(
+            self,
+            require_token=require_token,
+            tasks=tasks,
+            allow_remote_code=allow_remote_code,
+        )
         uvicorn.run(app, host=host, port=port)
 
     def close(self) -> None:
-        self.store.close()
+        self._runner.call(self._async_client.close())
+        self._runner.close()
 
     def __enter__(self) -> Client:
         return self
@@ -287,54 +278,24 @@ class Client:
         self.close()
 
 
-def _load_result(commit: Commit, store: Store, serializer: Serializer) -> Any:
-    if commit.output_ref is None:
-        return None
-    data = store.get_blob(commit.output_ref)
-    return serializer.loads(data)
+class _SyncExecutorAdapter:
+    def __init__(
+        self, executor: Executor, runner: BlockingAsyncRunner, sync_store: Store | None = None
+    ) -> None:
+        self._executor = executor
+        self._runner = runner
+        self._sync_store = sync_store
 
-
-def _diff_commits(a: Commit, b: Commit, store: Store, serializer: Serializer) -> dict[str, Any]:
-    diff: dict[str, Any] = {
-        "a": {
-            "hash": a.hash[:12],
-            "func": a.task_def.func_name,
-            "time": a.created_at.isoformat(),
-        },
-        "b": {
-            "hash": b.hash[:12],
-            "func": b.task_def.func_name,
-            "time": b.created_at.isoformat(),
-        },
-        "func_changed": a.task_def.func_hash != b.task_def.func_hash,
-        "args_changed": a.task_def.args_hash != b.task_def.args_hash,
-    }
-    if a.task_def.func_source != b.task_def.func_source:
-        diff["source_diff"] = {
-            "a_source": a.task_def.func_source,
-            "b_source": b.task_def.func_source,
-        }
-    if a.task_def.args_snapshot != b.task_def.args_snapshot:
-        diff["args_diff"] = {
-            "a_args": a.task_def.args_snapshot.decode("utf-8", errors="replace"),
-            "b_args": b.task_def.args_snapshot.decode("utf-8", errors="replace"),
-        }
-    try:
-        size_a = a.output_ref.size if a.output_ref else 0
-        size_b = b.output_ref.size if b.output_ref else 0
-        if size_a > _DIFF_SIZE_LIMIT or size_b > _DIFF_SIZE_LIMIT:
-            diff["output_changed"] = "skipped_large_output"
-            diff["a_output_size"] = size_a
-            diff["b_output_size"] = size_b
-        else:
-            val_a = _load_result(a, store, serializer)
-            val_b = _load_result(b, store, serializer)
-            if val_a != val_b:
-                diff["output_changed"] = True
-                diff["a_output_repr"] = repr(val_a)
-                diff["b_output_repr"] = repr(val_b)
-            else:
-                diff["output_changed"] = False
-    except Exception:
-        diff["output_changed"] = "unable_to_compare"
-    return diff
+    async def submit(
+        self,
+        func: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        task_def: Any,
+        store: Any,
+        serializer: Any,
+    ) -> tuple[Commit, bool]:
+        resolved_store = self._sync_store if self._sync_store is not None else store
+        return await asyncio.to_thread(
+            self._executor.submit, func, args, kwargs, task_def, resolved_store, serializer
+        )

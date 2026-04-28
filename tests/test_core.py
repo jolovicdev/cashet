@@ -6,6 +6,9 @@ from typing import Any
 import pytest
 
 from cashet import Client, ResultRef, TaskError, TaskRef, TaskStatus
+from cashet.dag import build_commit, resolve_input_refs
+from cashet.models import Commit, TaskDef
+from cashet.models import TaskStatus as ModelTaskStatus
 
 
 class TestBasicSubmit:
@@ -38,6 +41,41 @@ class TestBasicSubmit:
         ref = client.submit(make_dict)
         result = ref.load()
         assert result == {"a": [1, 2, 3], "b": {"nested": True}}
+
+    def test_sync_executor_receives_sync_store_with_default_store(
+        self, store_dir: Path
+    ) -> None:
+        class RecordingExecutor:
+            def __init__(self) -> None:
+                self.seen_sync_store = False
+
+            def submit(
+                self,
+                func: Any,
+                args: tuple[Any, ...],
+                kwargs: dict[str, Any],
+                task_def: TaskDef,
+                store: Any,
+                serializer: Any,
+            ) -> tuple[Commit, bool]:
+                result = func(*args, **kwargs)
+                output_ref = store.put_blob(serializer.dumps(result))
+                self.seen_sync_store = not hasattr(output_ref, "__await__")
+                commit = build_commit(task_def, resolve_input_refs(args, kwargs))
+                commit.output_ref = output_ref
+                commit.status = ModelTaskStatus.COMPLETED
+                store.put_commit(commit)
+                return commit, False
+
+        executor = RecordingExecutor()
+        client = Client(store_dir=store_dir, executor=executor)
+
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        ref = client.submit(add, 2, 5)
+        assert ref.load() == 7
+        assert executor.seen_sync_store is True
 
 
 class TestDeduplication:
@@ -113,6 +151,11 @@ class TestTaskDecorator:
             return "hello"
 
         assert "custom_name" in client._registered_tasks
+        ref = unnamed()
+        commit = client.show(ref.commit_hash)
+        assert commit is not None
+        assert commit.task_def.func_name == "custom_name"
+        assert len(client.log(func_name="custom_name")) == 1
 
     def test_task_decorator_callable_returns_result_ref(self, client: Client) -> None:
         @client.task
@@ -751,10 +794,10 @@ class TestDiffSizeLimit:
         assert "b_output_repr" in d
 
     def test_large_outputs_skip_comparison(self, client: Client) -> None:
-        import cashet.client as client_mod
+        import cashet._client_base as base_mod
 
-        original_limit = client_mod._DIFF_SIZE_LIMIT
-        client_mod._DIFF_SIZE_LIMIT = 100
+        original_limit = base_mod._DIFF_SIZE_LIMIT
+        base_mod._DIFF_SIZE_LIMIT = 100
         try:
 
             def make_big(suffix: str) -> bytes:
@@ -768,13 +811,13 @@ class TestDiffSizeLimit:
             assert "a_output_size" in d
             assert "b_output_size" in d
         finally:
-            client_mod._DIFF_SIZE_LIMIT = original_limit
+            base_mod._DIFF_SIZE_LIMIT = original_limit
 
     def test_one_large_one_small_skips(self, client: Client) -> None:
-        import cashet.client as client_mod
+        import cashet._client_base as base_mod
 
-        original_limit = client_mod._DIFF_SIZE_LIMIT
-        client_mod._DIFF_SIZE_LIMIT = 100
+        original_limit = base_mod._DIFF_SIZE_LIMIT
+        base_mod._DIFF_SIZE_LIMIT = 100
         try:
 
             def make_small() -> bytes:
@@ -789,6 +832,4 @@ class TestDiffSizeLimit:
             d = client.diff(log[0].hash, log[1].hash)
             assert d["output_changed"] == "skipped_large_output"
         finally:
-            client_mod._DIFF_SIZE_LIMIT = original_limit
-
-
+            base_mod._DIFF_SIZE_LIMIT = original_limit

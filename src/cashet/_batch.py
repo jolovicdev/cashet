@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import timedelta
 from typing import Any
 
-from cashet.dag import ResultRef, TaskRef
+from cashet._client_base import resolve_task_config
+from cashet.dag import AsyncResultRef, TaskRef
 from cashet.hashing import Serializer, build_task_def
 from cashet.models import TaskError
-from cashet.protocols import Executor, Store
+from cashet.protocols import AsyncStore
 
 BatchKey = int | str
 NormalizedTask = tuple[
     Any, tuple[Any, ...], dict[str, Any], bool, dict[str, str], int, bool, timedelta | None
 ]
+
+logger = logging.getLogger("cashet")
 
 
 def unpack_dict_tasks(tasks: dict[str, Any]) -> tuple[list[BatchKey], list[Any]]:
@@ -54,33 +59,14 @@ def normalize_tasks(
             raise TypeError(f"Task {i}: expected args as tuple, got {type(args).__name__}")
         if not isinstance(kwargs, dict):
             raise TypeError(f"Task {i}: expected kwargs as dict, got {type(kwargs).__name__}")
-        raw_func = getattr(func, "_cashet_wrapped_func", func)
-        cache = (
-            default_cache
-            if default_cache is not None
-            else getattr(raw_func, "_cashet_cache", True)
+        raw_func, cache, tags, retries, force, timeout = resolve_task_config(
+            func,
+            default_cache,
+            default_tags,
+            default_retries,
+            default_force,
+            default_timeout,
         )
-        tags = (
-            default_tags
-            if default_tags is not None
-            else getattr(raw_func, "_cashet_tags", {})
-        )
-        retries = (
-            default_retries
-            if default_retries is not None
-            else getattr(raw_func, "_cashet_retries", 0)
-        )
-        force = (
-            default_force
-            if default_force is not None
-            else getattr(raw_func, "_cashet_force", False)
-        )
-        timeout_seconds = (
-            default_timeout
-            if default_timeout is not None
-            else getattr(raw_func, "_cashet_timeout", None)
-        )
-        timeout = timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
         normalized.append((raw_func, args, kwargs, cache, tags, retries, force, timeout))
     return normalized
 
@@ -140,73 +126,114 @@ def topological_sort(deps: dict[BatchKey, set[BatchKey]]) -> list[BatchKey]:
     return order
 
 
-def execute_batch(
+def _validate_max_workers(max_workers: int | None) -> None:
+    if max_workers is not None and max_workers < 1:
+        raise ValueError("max_workers must be greater than 0")
+
+
+def _apply_task_refs(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    refs: list[tuple[str, Any, BatchKey]],
+    results: dict[BatchKey, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    resolved_args = list(args)
+    resolved_kwargs = dict(kwargs)
+    for kind, arg_key, target_key in refs:
+        target_ref = results.get(target_key)
+        if target_ref is None:
+            raise RuntimeError(f"TaskRef({target_key!r}) unresolved")
+        if kind == "arg":
+            resolved_args[arg_key] = target_ref
+        else:
+            resolved_kwargs[arg_key] = target_ref
+    return tuple(resolved_args), resolved_kwargs
+
+
+async def execute_batch(
     order: list[BatchKey],
     keys: list[BatchKey],
     normalized: list[NormalizedTask],
     task_refs: dict[BatchKey, list[tuple[str, Any, BatchKey]]],
     deps: dict[BatchKey, set[BatchKey]],
-    executor: Executor,
-    store: Store,
+    executor: Any,
+    store: AsyncStore,
     serializer: Serializer,
     max_workers: int | None,
-) -> dict[BatchKey, ResultRef]:
-    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-
+) -> dict[BatchKey, AsyncResultRef]:
     pos = {k: i for i, k in enumerate(keys)}
-    results: dict[BatchKey, ResultRef] = {}
+    results: dict[BatchKey, AsyncResultRef] = {}
     rev = reverse_deps(deps)
     in_degree = {k: len(deps[k]) for k in keys}
 
-    def _run_single(key: BatchKey) -> ResultRef:
+    logger.info(
+        "batch started task_count=%d max_workers=%s",
+        len(keys),
+        max_workers,
+    )
+    _validate_max_workers(max_workers)
+
+    async def _run_single(key: BatchKey) -> AsyncResultRef:
         func, args, kwargs, cache, tags, retries, force, timeout = normalized[pos[key]]
-        resolved_args = list(args)
-        resolved_kwargs = dict(kwargs)
-        for kind, arg_key, target_key in task_refs.get(key, []):
-            target_ref = results.get(target_key)
-            if target_ref is None:
-                raise RuntimeError(f"TaskRef({target_key!r}) unresolved")
-            if kind == "arg":
-                resolved_args[arg_key] = target_ref
-            else:
-                resolved_kwargs[arg_key] = target_ref
+        logger.debug(
+            "batch task started key=%s func=%s",
+            key,
+            func.__qualname__,
+        )
+        hash_args, hash_kwargs = _apply_task_refs(
+            args, kwargs, task_refs.get(key, []), results
+        )
         task_def = build_task_def(
             func,
-            tuple(resolved_args),
-            resolved_kwargs,
+            hash_args,
+            hash_kwargs,
             cache=cache,
             tags=tags,
             retries=retries,
             force=force,
             timeout=timeout,
         )
-        commit, _was_cached = executor.submit(
-            func, tuple(resolved_args), resolved_kwargs, task_def, store, serializer
+        commit, _was_cached = await executor.submit(
+            func, hash_args, hash_kwargs, task_def, store, serializer
         )
         if commit.output_ref is None:
             raise TaskError(f"Task {commit.task_def.func_name} failed: {commit.error}")
-        ref = ResultRef(commit.output_ref, store, serializer, commit_hash=commit.hash)
+        ref = AsyncResultRef(commit.output_ref, store, serializer, commit_hash=commit.hash)
+        logger.debug(
+            "batch task finished key=%s func=%s commit=%s",
+            key,
+            func.__qualname__,
+            commit.hash[:12],
+        )
         return ref
 
     if max_workers is None or max_workers == 1:
         for key in order:
-            results[key] = _run_single(key)
+            results[key] = await _run_single(key)
+        logger.info("batch completed task_count=%d", len(keys))
         return results
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures: dict[Any, BatchKey] = {}
-        for key in keys:
-            if in_degree[key] == 0:
-                futures[pool.submit(_run_single, key)] = key
+    worker_limit = max_workers
+    tasks: dict[asyncio.Task[Any], BatchKey] = {}
+    ready = [key for key in keys if in_degree[key] == 0]
 
-        while futures:
-            done, _ = wait(futures, return_when=FIRST_COMPLETED)
-            for future in done:
-                key = futures.pop(future)
-                results[key] = future.result()
-                for dependent in rev[key]:
-                    in_degree[dependent] -= 1
-                    if in_degree[dependent] == 0:
-                        futures[pool.submit(_run_single, dependent)] = dependent
+    def _schedule_ready() -> None:
+        while ready and len(tasks) < worker_limit:
+            key = ready.pop(0)
+            task = asyncio.create_task(_run_single(key))
+            tasks[task] = key
 
+    _schedule_ready()
+    while tasks:
+        done, _ = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            key = tasks.pop(task)
+            results[key] = task.result()
+            for dependent in rev[key]:
+                in_degree[dependent] -= 1
+                if in_degree[dependent] == 0:
+                    ready.append(dependent)
+            _schedule_ready()
+
+    logger.info("batch completed task_count=%d", len(keys))
     return results
