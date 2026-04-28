@@ -40,6 +40,32 @@ def main() -> None:
     pass
 
 
+@main.command("serve")
+@click.option("--host", "-h", default="127.0.0.1", help="Host to bind")
+@click.option("--port", "-p", default=8000, help="Port to bind")
+@click.option("--require-token", default=None, help="Require Bearer token for all requests")
+@click.option(
+    "--allow-remote-code",
+    is_flag=True,
+    help="Allow trusted clients to submit Python source or dill payloads",
+)
+def serve_cmd(
+    host: str, port: int, require_token: str | None, allow_remote_code: bool
+) -> None:
+    """Start the HTTP server"""
+    client = _client()
+    try:
+        client.serve(
+            host=host,
+            port=port,
+            require_token=require_token,
+            allow_remote_code=allow_remote_code,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1) from None
+
+
 @main.command("log")
 @click.option("--func", "-f", default=None, help="Filter by function name")
 @click.option("--limit", "-n", default=20, help="Max commits to show")
