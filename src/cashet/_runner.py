@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 from typing import Any
+
+_LOCK_OPERATIONS_POOL_SIZE = 64
 
 
 class BlockingAsyncRunner:
@@ -14,6 +17,9 @@ class BlockingAsyncRunner:
 
     def _run(self) -> None:
         loop = asyncio.new_event_loop()
+        loop.set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(max_workers=_LOCK_OPERATIONS_POOL_SIZE)
+        )
         self._loop = loop
         self._started.set()
         try:
