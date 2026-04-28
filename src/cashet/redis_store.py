@@ -7,6 +7,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from redis.exceptions import WatchError
+
 from cashet._runner import BlockingAsyncRunner
 from cashet.models import Commit, ObjectRef, StorageTier, TaskDef, TaskStatus
 
@@ -298,18 +300,26 @@ class AsyncRedisStore:
         return data
 
     async def put_commit(self, commit: Commit) -> None:
-        pipe = self._redis.pipeline()
-        _index_commit_commands(pipe, commit)
-        results = await pipe.execute()
-        existing_raw = results[0]
+        ck = _commit_key(commit.hash)
         new_hashes = _blob_hashes(commit)
-        if existing_raw is None:
-            for h in new_hashes:
-                await self._redis.incr(_blob_ref_key(h))
-        else:
-            old_hashes = _blob_hashes(_decode_commit(existing_raw))
-            for h in new_hashes - old_hashes:
-                await self._redis.incr(_blob_ref_key(h))
+        while True:
+            async with self._redis.pipeline(transaction=True) as pipe:
+                await pipe.watch(ck)
+                existing_raw = await pipe.get(ck)
+                pipe.multi()
+                _index_commit_commands(pipe, commit)
+                if existing_raw is None:
+                    for h in new_hashes:
+                        pipe.incr(_blob_ref_key(h))
+                else:
+                    old_hashes = _blob_hashes(_decode_commit(existing_raw))
+                    for h in new_hashes - old_hashes:
+                        pipe.incr(_blob_ref_key(h))
+                try:
+                    await pipe.execute()
+                    return
+                except WatchError:
+                    continue
 
     async def get_commit(self, hash: str) -> Commit | None:
         if not hash:
