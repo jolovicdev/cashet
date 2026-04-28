@@ -81,6 +81,14 @@ uv sync --all-extras
 uv run pytest
 ```
 
+## Version Compatibility
+
+**0.2.x → 0.3.x: Hash format changed.** `hash_args` was unified with `serialize_args` to use a single canonical representation via `_stable_repr_to`. Same function + same arguments produce different cache fingerprints across the major version line. Caches created with 0.2.x **will not hit** on 0.3.x.
+
+**0.3.0 → 0.3.1:** Redis blob data keys renamed from `cashet:blob:{hash}` to `cashet:blob:data:{hash}` to fix a stats double-counting bug. Redis blob object/byte totals are maintained in `cashet:stats:blob` after a one-time backfill for existing caches. Function hashing also now includes defaults / keyword defaults in more cases, and custom object argument hashing includes the defining module. Existing 0.3.0 caches may miss after upgrading. Clear old caches before upgrading if you use Redis or rely on long-lived cache reuse across versions.
+
+**Upgrading from an incompatible version:** either clear the cache (`cashet clear`) and rebuild, or point the new version at a fresh store directory.
+
 ## Quick Start
 
 ```python
@@ -171,23 +179,46 @@ async def main():
 asyncio.run(main())
 ```
 
-**HTTP server** — expose the cache over HTTP:
+**HTTP server** — expose cache metadata and registered tasks over HTTP:
 
 ```bash
 python -c "from cashet import Client; Client().serve(port=8000)"
 ```
 
-Then submit tasks remotely:
+```python
+# With auth token
+from cashet import Client
+client = Client()
+client.serve(port=8000, require_token="my-secret-token")
+```
+
+Register server-side tasks in the server process:
+
+```python
+from cashet import Client
+
+client = Client()
+
+def double(x):
+    return x * 2
+
+client.serve(port=8000, tasks={"double": double})
+```
+
+Submit JSON args from another process:
 
 ```python
 import requests
+
 r = requests.post("http://localhost:8000/submit", json={
-    "func_source": "def double(x):\\n    return x * 2",
-    "func_name": "double",
-    "args_b64": base64.b64encode(pickle.dumps((5,))).decode(),
-    "kwargs_b64": base64.b64encode(pickle.dumps({})).decode(),
+    "task": "double",
+    "args": [5],
 })
 ```
+
+Submitting Python source, dill payloads, or serializer-encoded args is disabled by default.
+For trusted internal clients only, enable the legacy remote-code path with both
+`allow_remote_code=True` and a non-empty `require_token=...`.
 
 ## Why
 
@@ -347,6 +378,12 @@ cashet clear
 
 # Storage statistics (includes disk size)
 cashet stats
+
+# Start the HTTP server
+cashet serve --host 127.0.0.1 --port 8000
+
+# Legacy unsafe remote-code mode requires auth
+cashet serve --require-token secret123 --allow-remote-code
 ```
 
 ## API
@@ -378,6 +415,7 @@ async def main():
         store=None,            # or AsyncRedisStore, or any AsyncStore
         executor=None,         # defaults to AsyncLocalExecutor
         serializer=None,       # defaults to PickleSerializer
+        max_workers=1,         # max parallelism for submit_many (default: 1, sequential)
     )
 
     def square(x: int) -> int:
@@ -399,13 +437,36 @@ asyncio.run(main())
 from cashet import Client
 client = Client()
 client.serve(host="127.0.0.1", port=8000)
+
+# With Bearer token authentication
+client.serve(host="0.0.0.0", port=8000, require_token="secret123")
+```
+
+Execute tasks over HTTP by registering callables in the server process and sending
+JSON arguments from another process:
+
+```python
+from cashet import Client
+
+client = Client()
+
+def add(x: int, y: int) -> int:
+    return x + y
+
+client.serve(port=8000, tasks={"add": add})
+```
+
+```python
+import requests
+
+r = requests.post("http://localhost:8000/submit", json={"task": "add", "args": [3, 4]})
 ```
 
 Endpoints:
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/submit` | Submit a function for execution |
+| POST | `/submit` | Submit a registered task for execution |
 | GET | `/result/{hash}` | Fetch deserialized result |
 | GET | `/commit/{hash}` | Commit metadata |
 | GET | `/log` | List commits (query: `?func=`, `?limit=`, `?status=`) |
@@ -414,7 +475,11 @@ Endpoints:
 
 Use `AsyncClient.serve()` for the async variant with `create_async_app()`.
 
-> **Security:** The server deserializes arbitrary code via `dill` and `exec`. Only expose it to trusted networks.
+> **Security:** `/submit` does not execute client-supplied Python by default. The legacy
+> `func_source`, `func_b64`, `args_b64`, and `kwargs_b64` payloads require
+> `allow_remote_code=True` and a non-empty Bearer token. In the CLI, this is
+> `cashet serve --require-token secret123 --allow-remote-code`. That mode deserializes
+> and executes arbitrary Python, so expose it only to trusted clients.
 
 ### Redis Backend
 
@@ -432,7 +497,7 @@ from cashet.redis_store import AsyncRedisStore
 client = AsyncClient(store=AsyncRedisStore("redis://localhost:6379/0"))
 ```
 
-Redis-backed stores support all operations — cache dedup, fingerprint lookup, history, eviction, and size-based GC. Cross-process claim dedup uses per-fingerprint Redis locks (`cashet:lock:{fingerprint}`) to prevent redundant execution across machines. Blob ref counts (`cashet:blob:ref:{hash}`) enable O(1) orphan cleanup without scanning all commits.
+Redis-backed stores support all operations — cache dedup, fingerprint lookup, history, eviction, and size-based GC. Cross-process claim dedup uses per-fingerprint Redis locks (`cashet:lock:{fingerprint}`) to prevent redundant execution across machines. Last-access eviction is indexed in Redis (`cashet:index:last_accessed`), blob stats are maintained in `cashet:stats:blob`, and blob ref counts (`cashet:blob:ref:{hash}`) enable orphan cleanup without scanning all commits.
 
 ### Pluggable Backends
 
@@ -470,7 +535,7 @@ class RedisStore:
     def list_commits(self, ...) -> list[Commit]: ...
     def get_history(self, hash: str) -> list[Commit]: ...
     def stats(self) -> dict[str, int]: ...
-    def evict(self, older_than: datetime) -> int: ...
+    def evict(self, older_than: datetime, max_size_bytes: int | None = None) -> int: ...
     def delete_commit(self, hash: str) -> bool: ...
     def close(self) -> None: ...
 
@@ -600,7 +665,7 @@ def slow_func():
     ...
 ```
 
-Timeouts can be combined with retries — a timed-out attempt counts as a failure and will be retried.
+Timeouts can be combined with retries — a timed-out attempt counts as a failure and will be retried. Local execution uses Python threads, so timeouts are soft: cashet stops waiting and records the attempt as failed, but Python cannot safely kill already-running thread code. Use idempotent task functions; hard cancellation belongs in a process/distributed executor such as a future Celery executor.
 
 ### `@client.task`
 
@@ -812,12 +877,18 @@ client.submit(func, arg1, arg2)
 
 **Key design decisions:**
 
-- **Closure variables are not hashed** and emit a `ClosureWarning` if present. Function identity is source code, not runtime state. If you need cache invalidation based on a value, pass it as an explicit argument.
+- **Closure variables are not hashed** and emit a `ClosureWarning` if present. Function identity is source code, defaults, keyword defaults, and referenced helper functions; not arbitrary runtime state. If you need cache invalidation based on a value, pass it as an explicit argument.
 - **Referenced user-defined helper functions are hashed recursively.** If your cached function calls or references a helper from your own project (via `co_names` / `globals`), that helper's source is included in the cache key. Change the helper and the caller's cache invalidates. Builtin and stdlib functions are skipped. This behavior is automatic and invisible — no decorators or imports needed.
 - **Blobs are deduplicated by content hash.** Identical results share one blob on disk.
 - **Source is hashed as an AST.** Comments, docstrings, and whitespace changes don't invalidate the cache.
+- **Custom object arguments include their class module and qualname** in the argument hash so same-named classes from different modules do not collide.
 - **Non-cached tasks get unique commit hashes** (timestamp salt) so they always re-execute but still record lineage.
 - **Parent tracking:** Each commit records the hash of the previous commit for the same function+args, forming a history chain you can traverse.
+
+## Configuration
+
+- **`CASHET_DIR`** — override the default `.cashet` store directory. Equivalent to passing `store_dir=`.
+- **`CASHET_LOG`** — set to `DEBUG`, `INFO`, `WARNING`, or `ERROR` to print log output to stderr with a `[cashet]` tag. Messages include task fingerprint, function name, commit hash, and duration inline — no structured logging backend needed.
 
 ## Project Status
 

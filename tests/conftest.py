@@ -11,6 +11,7 @@ def pytest_configure(config: pytest.Config) -> None:
     import os
 
     if os.environ.get("CASHET_REDIS"):
+        config.redis_available = True
         return
     try:
         import redis
