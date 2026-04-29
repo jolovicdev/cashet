@@ -18,6 +18,7 @@ _ARCHIVE_ROOT = "cashet-export"
 _LIST_ALL_LIMIT = 999_999_999
 _COMMIT_FILE = f"{_ARCHIVE_ROOT}/commits.jsonl"
 _BLOB_DIR = f"{_ARCHIVE_ROOT}/blobs"
+_MANIFEST_FILE = f"{_ARCHIVE_ROOT}/manifest.json"
 
 
 def _object_ref_to_dict(ref: ObjectRef) -> dict[str, Any]:
@@ -133,6 +134,16 @@ async def export_store(store: AsyncStore, tar_path: Path) -> None:
         info.size = len(commit_data)
         tar.addfile(info, BytesIO(commit_data))
 
+        manifest = {
+            "version": 1,
+            "blob_hashes": sorted(blob_refs.keys()),
+            "commit_hashes": sorted(c.hash for c in commits),
+        }
+        manifest_data = json.dumps(manifest).encode("utf-8")
+        info = tarfile.TarInfo(name=_MANIFEST_FILE)
+        info.size = len(manifest_data)
+        tar.addfile(info, BytesIO(manifest_data))
+
 
 def _is_safe_tar_member(name: str) -> bool:
     if name.startswith("/") or name.startswith("\\"):
@@ -149,52 +160,90 @@ async def import_store(store: AsyncStore, tar_path: Path) -> int:
                 logger.warning("skipping unsafe tar member: %s", m.name)
                 continue
             members[m.name] = m
-        blob_refs: dict[str, ObjectRef] = {}
-        missing_blobs: set[str] = set()
 
+        expected_blobs: set[str] = set()
+        expected_commits: set[str] = set()
+        manifest_member = members.get(_MANIFEST_FILE)
+        if manifest_member is not None and manifest_member.isfile():
+            mf = tar.extractfile(manifest_member)
+            if mf is not None:
+                with mf:
+                    manifest_data = json.loads(mf.read())
+                    expected_blobs = set(manifest_data.get("blob_hashes", []))
+                    expected_commits = set(manifest_data.get("commit_hashes", []))
+
+        actual_blobs: set[str] = set()
+        for name in members:
+            if name.startswith(_BLOB_DIR + "/"):
+                parts = name[len(_BLOB_DIR) + 1 :].split("/")
+                if len(parts) == 2:
+                    actual_blobs.add(parts[0] + parts[1])
+
+        if expected_blobs and expected_blobs - actual_blobs:
+            missing = sorted(expected_blobs - actual_blobs)
+            raise ValueError(
+                f"Archive manifest expects {len(missing)} blob(s) not found in archive: "
+                f"{missing[0][:12]}..."
+            )
+
+        commit_lines: list[bytes] = []
         commit_member = members.get(_COMMIT_FILE)
         if commit_member is not None and commit_member.isfile():
             f = tar.extractfile(commit_member)
             if f is not None:
                 with f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        data = json.loads(line)
-                        commit = _dict_to_commit(data)
-                        existing = await store.get_commit(commit.hash)
-                        if existing is not None:
-                            continue
-                        refs_to_import = list(commit.input_refs)
-                        if commit.output_ref is not None:
-                            refs_to_import.append(commit.output_ref)
-                        has_missing = False
-                        for ref in refs_to_import:
-                            h = ref.hash
-                            if h in missing_blobs:
-                                has_missing = True
-                                continue
-                            if h not in blob_refs:
-                                blob_member = members.get(_blob_path(h))
-                                if blob_member is not None:
-                                    tf = tar.extractfile(blob_member)
-                                    if tf is not None:
-                                        with tf:
-                                            blob_refs[h] = await store.put_blob(tf.read())
-                                else:
-                                    logger.warning("missing blob in archive hash=%s", h[:12])
-                                    missing_blobs.add(h)
-                                    has_missing = True
-                        if has_missing:
-                            continue
-                        commit.input_refs = [
-                            blob_refs.get(r.hash, r) for r in commit.input_refs
-                        ]
-                        if commit.output_ref is not None:
-                            out_h = commit.output_ref.hash
-                            if out_h in blob_refs:
-                                commit.output_ref = blob_refs[out_h]
-                        await store.put_commit(commit)
-                        imported += 1
+                    commit_lines = [line.strip() for line in f if line.strip()]
+
+        found_commits: set[str] = set()
+        for line in commit_lines:
+            data = json.loads(line)
+            found_commits.add(data["hash"])
+
+        if expected_commits and expected_commits - found_commits:
+            missing = sorted(expected_commits - found_commits)
+            raise ValueError(
+                f"Archive manifest expects {len(missing)} commit(s) not found in "
+                f"commits.jsonl: {missing[0][:12]}..."
+            )
+
+        blob_refs: dict[str, ObjectRef] = {}
+        missing_blobs: set[str] = set()
+
+        for line in commit_lines:
+            data = json.loads(line)
+            commit = _dict_to_commit(data)
+            existing = await store.get_commit(commit.hash)
+            if existing is not None:
+                continue
+            refs_to_import = list(commit.input_refs)
+            if commit.output_ref is not None:
+                refs_to_import.append(commit.output_ref)
+            has_missing = False
+            for ref in refs_to_import:
+                h = ref.hash
+                if h in missing_blobs:
+                    has_missing = True
+                    continue
+                if h not in blob_refs:
+                    blob_member = members.get(_blob_path(h))
+                    if blob_member is not None:
+                        tf = tar.extractfile(blob_member)
+                        if tf is not None:
+                            with tf:
+                                blob_refs[h] = await store.put_blob(tf.read())
+                    else:
+                        logger.warning("missing blob in archive hash=%s", h[:12])
+                        missing_blobs.add(h)
+                        has_missing = True
+            if has_missing:
+                continue
+            commit.input_refs = [
+                blob_refs.get(r.hash, r) for r in commit.input_refs
+            ]
+            if commit.output_ref is not None:
+                out_h = commit.output_ref.hash
+                if out_h in blob_refs:
+                    commit.output_ref = blob_refs[out_h]
+            await store.put_commit(commit)
+            imported += 1
     return imported
