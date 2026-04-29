@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
-from typing import Any, cast, overload
+from typing import Any, TypeVar, cast, overload
 
 from cashet._batch import (
     build_deps,
@@ -29,6 +29,8 @@ from cashet.hashing import Serializer
 from cashet.models import Commit, TaskStatus
 from cashet.protocols import AsyncExecutor, AsyncStore, Executor, Store
 from cashet.store import AsyncSQLiteStore, SQLiteStore
+
+T = TypeVar("T")
 
 _DEFAULT_GC_TTL_DAYS = 30
 
@@ -101,7 +103,7 @@ class Client:
             self._registered_tasks[task_name] = fn
 
             @wraps(fn)
-            def wrapper(*args: Any, **kwargs: Any) -> ResultRef:
+            def wrapper(*args: Any, **kwargs: Any) -> ResultRef[Any]:
                 return self.submit(fn, *args, **kwargs)
 
             wrapper._cashet_wrapped_func = fn  # pyright: ignore[reportAttributeAccessIssue]
@@ -114,7 +116,7 @@ class Client:
 
     def submit(
         self,
-        func: Callable[..., Any],
+        func: Callable[..., T],
         *args: Any,
         _cache: bool | None = None,
         _tags: dict[str, str] | None = None,
@@ -122,7 +124,7 @@ class Client:
         _force: bool | None = None,
         _timeout: int | float | None = None,
         **kwargs: Any,
-    ) -> ResultRef:
+    ) -> ResultRef[T]:
         async_ref = self._runner.call(
             self._async_client.submit(
                 func,
@@ -152,7 +154,7 @@ class Client:
         _force: bool | None = None,
         _timeout: int | float | None = None,
         max_workers: int | None = None,
-    ) -> list[ResultRef]: ...
+    ) -> list[ResultRef[Any]]: ...
 
     @overload
     def submit_many(
@@ -170,7 +172,7 @@ class Client:
         _force: bool | None = None,
         _timeout: int | float | None = None,
         max_workers: int | None = None,
-    ) -> dict[str, ResultRef]: ...
+    ) -> dict[str, ResultRef[Any]]: ...
 
     def submit_many(
         self,
@@ -182,7 +184,7 @@ class Client:
         _force: bool | None = None,
         _timeout: int | float | None = None,
         max_workers: int | None = None,
-    ) -> list[ResultRef] | dict[str, ResultRef]:
+    ) -> list[ResultRef[Any]] | dict[str, ResultRef[Any]]:
         is_dict = isinstance(tasks, dict)
         if is_dict:
             keys, raw_tasks = unpack_dict_tasks(tasks)
@@ -209,7 +211,7 @@ class Client:
 
         if is_dict:
             return cast(
-                dict[str, ResultRef],
+                dict[str, ResultRef[Any]],
                 {k: ResultRef(async_results[k], self._runner) for k in keys},
             )
         return [ResultRef(async_results[k], self._runner) for k in keys]
@@ -247,6 +249,35 @@ class Client:
     def clear(self) -> int:
         return self._runner.call(self._async_client.clear())
 
+    def map(
+        self,
+        func: Callable[..., T],
+        items: Iterable[Any],
+        *args: Any,
+        _cache: bool | None = None,
+        _tags: dict[str, str] | None = None,
+        _retries: int | None = None,
+        _force: bool | None = None,
+        _timeout: int | float | None = None,
+        max_workers: int | None = None,
+        **kwargs: Any,
+    ) -> list[ResultRef[T]]:
+        async_refs = self._runner.call(
+            self._async_client.map(
+                func,
+                items,
+                *args,
+                _cache=_cache,
+                _tags=_tags,
+                _retries=_retries,
+                _force=_force,
+                _timeout=_timeout,
+                max_workers=max_workers,
+                **kwargs,
+            )
+        )
+        return [ResultRef(ref, self._runner) for ref in async_refs]
+
     def serve(
         self,
         host: str = "127.0.0.1",
@@ -267,6 +298,12 @@ class Client:
             allow_remote_code=allow_remote_code,
         )
         uvicorn.run(app, host=host, port=port)
+
+    def export(self, path: str | Path) -> None:
+        self._runner.call(self._async_client.export(path))
+
+    def import_archive(self, path: str | Path) -> int:
+        return self._runner.call(self._async_client.import_archive(path))
 
     def close(self) -> None:
         self._runner.call(self._async_client.close())

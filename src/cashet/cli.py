@@ -317,5 +317,35 @@ def clear_cmd() -> None:
     console.print(f"[green]Cleared {deleted} commit(s).[/green]")
 
 
+@main.command("export")
+@click.argument("path")
+def export_cmd(path: str) -> None:
+    """Export all commits and blobs to a tar.gz archive"""
+    import tarfile
+
+    client = _client()
+    try:
+        client.export(path)
+    except (OSError, tarfile.TarError) as e:
+        console.print(f"[red]Export failed: {e}[/red]")
+        raise SystemExit(1) from None
+    console.print(f"[green]Exported cache to {path}[/green]")
+
+
+@main.command("import")
+@click.argument("path")
+def import_archive(path: str) -> None:
+    """Import commits and blobs from a tar.gz archive"""
+    import tarfile
+
+    client = _client()
+    try:
+        count = client.import_archive(path)
+    except (OSError, tarfile.TarError, ValueError) as e:
+        console.print(f"[red]Import failed: {e}[/red]")
+        raise SystemExit(1) from None
+    console.print(f"[green]Imported {count} commit(s) from {path}[/green]")
+
+
 if __name__ == "__main__":
     main()

@@ -317,3 +317,35 @@ class TestList:
         assert "foo" in result.output
 
 
+class TestExportImport:
+    def test_export(self, cli_runner: CliRunner, store_dir: Path, tmp_path: Path) -> None:
+        client = Client(store_dir=store_dir)
+
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        client.submit(add, 1, 2)
+        archive = tmp_path / "export.tar.gz"
+        result = _invoke(cli_runner, ["export", str(archive)], store_dir)
+        assert result.exit_code == 0
+        assert "Exported" in result.output
+        assert archive.exists()
+
+    def test_import(self, cli_runner: CliRunner, store_dir: Path, tmp_path: Path) -> None:
+        client = Client(store_dir=store_dir)
+
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        ref = client.submit(add, 1, 2)
+        archive = tmp_path / "export.tar.gz"
+        client.export(archive)
+
+        store_dir2 = tmp_path / ".cashet2"
+        store_dir2.mkdir()
+        result = _invoke(cli_runner, ["import", str(archive)], store_dir2)
+        assert result.exit_code == 0
+        assert "Imported" in result.output
+
+        client2 = Client(store_dir=store_dir2)
+        assert client2.get(ref.commit_hash) == 3

@@ -376,6 +376,12 @@ cashet gc --max-size 1GB
 # Clear everything (alias for gc --older-than 0)
 cashet clear
 
+# Export all commits and blobs to a tar.gz archive
+cashet export backup.tar.gz
+
+# Import commits and blobs from a tar.gz archive
+cashet import backup.tar.gz
+
 # Storage statistics (includes disk size)
 cashet stats
 
@@ -601,6 +607,19 @@ This enables parallel fan-out and ensures each task only runs after its dependen
 
 > **Note:** With the default `SQLiteStore`, parallel execution serializes on the SQLite write lock — `max_workers > 1` only benefits compute-heavy tasks where execution time dominates. For true parallel fan-out, use `RedisStore`.
 
+### `client.map(func, items, *args, **kwargs) -> list[ResultRef]`
+
+Map a function over an iterable with per-item caching. Each item becomes the first positional argument; additional `*args` and `**kwargs` are appended.
+
+```python
+refs = client.map(process_chunk, range(100), source_file="data.parquet")
+# refs[0].load() == process_chunk(0, source_file="data.parquet")
+
+results = [r.load() for r in refs]
+```
+
+Already-computed items return instantly from cache. Add a new chunk later and only that item re-runs.
+
 **Opt out of caching:**
 
 ```python
@@ -737,6 +756,22 @@ stats = client.stats()
 # }
 ```
 
+### `client.export(path)` / `client.import_archive(path)`
+
+Export the entire cache to a portable `.tar.gz` archive and import it elsewhere. Blobs are content-addressable, so deduplication is preserved across stores.
+
+```python
+# Export
+client.export("backup.tar.gz")
+
+# Import into a fresh store
+client2 = Client(store_dir=".cashet2")
+count = client2.import_archive("backup.tar.gz")
+print(f"Imported {count} commits")
+```
+
+Use this for migrations (SQLite → Redis), CI cache warm-up, or backups. Existing commits are skipped during import.
+
 ### Jupyter & Notebook Support
 
 `cashet` works seamlessly in Jupyter notebooks, IPython, and the Python REPL. It uses a tiered source-resolution strategy:
@@ -794,6 +829,13 @@ A lazy reference to a stored result. Pass it as an argument to chain tasks:
 ```python
 step1 = client.submit(func_a, input_data)
 step2 = client.submit(func_b, step1)  # step1 auto-resolves to its output
+```
+
+`ResultRef` is generic — `submit()` infers the return type from the function annotation:
+
+```python
+ref: ResultRef[int] = client.submit(double, 5)
+result = ref.load()  # typed as int
 ```
 
 ### Custom Serialization
