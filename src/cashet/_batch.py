@@ -160,9 +160,9 @@ async def execute_batch(
     store: AsyncStore,
     serializer: Serializer,
     max_workers: int | None,
-) -> dict[BatchKey, AsyncResultRef]:
+) -> dict[BatchKey, AsyncResultRef[Any]]:
     pos = {k: i for i, k in enumerate(keys)}
-    results: dict[BatchKey, AsyncResultRef] = {}
+    results: dict[BatchKey, AsyncResultRef[Any]] = {}
     rev = reverse_deps(deps)
     in_degree = {k: len(deps[k]) for k in keys}
 
@@ -173,7 +173,7 @@ async def execute_batch(
     )
     _validate_max_workers(max_workers)
 
-    async def _run_single(key: BatchKey) -> AsyncResultRef:
+    async def _run_single(key: BatchKey) -> AsyncResultRef[Any]:
         func, args, kwargs, cache, tags, retries, force, timeout = normalized[pos[key]]
         logger.debug(
             "batch task started key=%s func=%s",

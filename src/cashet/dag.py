@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 from cashet.hashing import Serializer
 from cashet.models import Commit, ObjectRef, TaskDef, TaskStatus
 from cashet.protocols import AsyncStore
+
+T = TypeVar("T")
 
 
 class TaskRef:
@@ -26,7 +28,7 @@ def resolve_input_refs(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Ob
     return refs
 
 
-class AsyncResultRef:
+class AsyncResultRef(Generic[T]):
     __slots__ = (
         "_commit_hash", "_load_lock", "_loaded", "_ref", "_serializer", "_store", "_value"
     )
@@ -69,7 +71,7 @@ class AsyncResultRef:
     def ref(self) -> ObjectRef:
         return self._ref
 
-    async def load(self) -> Any:
+    async def load(self) -> T:
         if self._loaded:
             return self._value
         if self._load_lock is None:
@@ -87,10 +89,10 @@ class AsyncResultRef:
         return f"AsyncResultRef(commit={ch}, blob={self.short_hash}, size={self.size})"
 
 
-class ResultRef:
+class ResultRef(Generic[T]):
     __slots__ = ("_async_ref", "_commit_hash", "_ref", "_runner")
 
-    def __init__(self, async_ref: AsyncResultRef, runner: Any) -> None:
+    def __init__(self, async_ref: AsyncResultRef[T], runner: Any) -> None:
         self._async_ref = async_ref
         self._runner = runner
         self._ref = async_ref.ref
@@ -115,10 +117,10 @@ class ResultRef:
     def size(self) -> int:
         return self._ref.size
 
-    async def __cashet_async_load__(self) -> Any:
+    async def __cashet_async_load__(self) -> T:
         return await self._async_ref.load()
 
-    def load(self) -> Any:
+    def load(self) -> T:
         return self._runner.call(self._async_ref.load())
 
     def __repr__(self) -> str:

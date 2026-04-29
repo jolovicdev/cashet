@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
-from typing import Any, cast, overload
+from typing import Any, TypeVar, cast, overload
 
 from cashet._batch import (
     build_deps,
@@ -21,12 +21,15 @@ from cashet._client_base import (
     resolve_task_config,
     set_task_metadata,
 )
+from cashet._export import export_store, import_store
 from cashet.async_executor import AsyncLocalExecutor
 from cashet.dag import AsyncResultRef
 from cashet.hashing import PickleSerializer, Serializer, build_task_def, warn_default_pickle
 from cashet.models import Commit, TaskError, TaskStatus
 from cashet.protocols import AsyncExecutor, AsyncStore
 from cashet.store import AsyncSQLiteStore
+
+T = TypeVar("T")
 
 _DEFAULT_GC_TTL_DAYS = 30
 
@@ -66,7 +69,7 @@ class AsyncClient:
             self._registered_tasks[task_name] = fn
 
             @wraps(fn)
-            async def wrapper(*args: Any, **kwargs: Any) -> AsyncResultRef:
+            async def wrapper(*args: Any, **kwargs: Any) -> AsyncResultRef[Any]:
                 return await self.submit(fn, *args, **kwargs)
 
             wrapper._cashet_wrapped_func = fn  # pyright: ignore[reportAttributeAccessIssue]
@@ -79,7 +82,7 @@ class AsyncClient:
 
     async def submit(
         self,
-        func: Callable[..., Any],
+        func: Callable[..., T],
         *args: Any,
         _cache: bool | None = None,
         _tags: dict[str, str] | None = None,
@@ -87,7 +90,7 @@ class AsyncClient:
         _force: bool | None = None,
         _timeout: int | float | None = None,
         **kwargs: Any,
-    ) -> AsyncResultRef:
+    ) -> AsyncResultRef[T]:
         raw_func, cache, tags, retries, force, timeout = resolve_task_config(
             func, _cache, _tags, _retries, _force, _timeout
         )
@@ -126,7 +129,7 @@ class AsyncClient:
         _force: bool | None = None,
         _timeout: int | float | None = None,
         max_workers: int | None = None,
-    ) -> list[AsyncResultRef]: ...
+    ) -> list[AsyncResultRef[Any]]: ...
 
     @overload
     async def submit_many(
@@ -144,7 +147,7 @@ class AsyncClient:
         _force: bool | None = None,
         _timeout: int | float | None = None,
         max_workers: int | None = None,
-    ) -> dict[str, AsyncResultRef]: ...
+    ) -> dict[str, AsyncResultRef[Any]]: ...
 
     async def submit_many(
         self,
@@ -156,7 +159,7 @@ class AsyncClient:
         _force: bool | None = None,
         _timeout: int | float | None = None,
         max_workers: int | None = None,
-    ) -> list[AsyncResultRef] | dict[str, AsyncResultRef]:
+    ) -> list[AsyncResultRef[Any]] | dict[str, AsyncResultRef[Any]]:
         is_dict = isinstance(tasks, dict)
         if is_dict:
             keys, raw_tasks = unpack_dict_tasks(tasks)
@@ -181,7 +184,7 @@ class AsyncClient:
         )
 
         if is_dict:
-            return cast(dict[str, AsyncResultRef], {k: results[k] for k in keys})
+            return cast(dict[str, AsyncResultRef[Any]], {k: results[k] for k in keys})
         return [results[k] for k in keys]
 
     async def log(
@@ -236,6 +239,12 @@ class AsyncClient:
     async def clear(self) -> int:
         return await self.gc(timedelta(days=0))
 
+    async def export(self, path: str | Path) -> None:
+        await export_store(self.store, Path(path))
+
+    async def import_archive(self, path: str | Path) -> int:
+        return await import_store(self.store, Path(path))
+
     async def close(self) -> None:
         await self.store.close()
 
@@ -244,6 +253,30 @@ class AsyncClient:
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await self.close()
+
+    async def map(
+        self,
+        func: Callable[..., T],
+        items: Iterable[Any],
+        *args: Any,
+        _cache: bool | None = None,
+        _tags: dict[str, str] | None = None,
+        _retries: int | None = None,
+        _force: bool | None = None,
+        _timeout: int | float | None = None,
+        max_workers: int | None = None,
+        **kwargs: Any,
+    ) -> list[AsyncResultRef[T]]:
+        task_list: list[Any] = [(func, (item, *args), kwargs) for item in items]
+        return await self.submit_many(
+            task_list,
+            _cache=_cache,
+            _tags=_tags,
+            _retries=_retries,
+            _force=_force,
+            _timeout=_timeout,
+            max_workers=max_workers,
+        )
 
     async def serve(
         self,
