@@ -87,6 +87,8 @@ uv run pytest
 
 **0.3.0 → 0.3.1:** Redis blob data keys renamed from `cashet:blob:{hash}` to `cashet:blob:data:{hash}` to fix a stats double-counting bug. Redis blob object/byte totals are maintained in `cashet:stats:blob` after a one-time backfill for existing caches. Function hashing also now includes defaults / keyword defaults in more cases, and custom object argument hashing includes the defining module. Existing 0.3.0 caches may miss after upgrading. Clear old caches before upgrading if you use Redis or rely on long-lived cache reuse across versions.
 
+**0.3.x → 0.4.0:** Added per-entry TTL and tag-based invalidation. SQLite stores auto-migrate (new `ttl_seconds` and `expires_at` columns). Redis stores encode new fields in commit JSON. Old caches are fully readable after upgrading.
+
 **Upgrading from an incompatible version:** either clear the cache (`cashet clear`) and rebuild, or point the new version at a fresh store directory.
 
 ## Quick Start
@@ -686,6 +688,20 @@ def slow_func():
 
 Timeouts can be combined with retries — a timed-out attempt counts as a failure and will be retried. Local execution uses Python threads, so timeouts are soft: cashet stops waiting and records the attempt as failed, but Python cannot safely kill already-running thread code. Use idempotent task functions; hard cancellation belongs in a process/distributed executor such as a future Celery executor.
 
+**Per-entry TTL:**
+
+```python
+# Per-call (seconds)
+ref = client.submit(fetch_api_data, url, _ttl=3600)
+
+# Per-function via decorator
+@client.task(ttl=3600)
+def fetch_api_data(url):
+    ...
+```
+
+Commits expire automatically after the TTL. Expired commits are skipped by cache lookups and history queries but are not physically deleted until garbage collection runs.
+
 ### `@client.task`
 
 Register a function with cashet metadata and make it directly callable:
@@ -741,6 +757,10 @@ from datetime import timedelta
 evicted = client.gc(older_than=timedelta(days=7))
 # Evict oldest entries until under size limit
 evicted = client.gc(max_size_bytes=1024 * 1024 * 1024)  # 1GB
+
+# Invalidate commits by tags
+deleted = client.invalidate(tags={"experiment": "v1"})
+# deleted = client.invalidate(tags={"experiment": None})  # any commit with 'experiment' tag
 
 # Storage stats
 stats = client.stats()
