@@ -329,23 +329,23 @@ class _SQLiteStoreCore:
 
     def find_by_fingerprint(self, fingerprint: str) -> Commit | None:
         conn = self._connect()
-        cursor = conn.execute(
+        now = datetime.now(UTC)
+        now_iso = now.isoformat()
+        row = conn.execute(
             """SELECT * FROM commits
                WHERE fingerprint = ? AND status IN ('completed', 'cached')
-               ORDER BY created_at DESC""",
-            (fingerprint,),
+               AND (expires_at IS NULL OR expires_at > ?)
+               ORDER BY created_at DESC
+               LIMIT 1""",
+            (fingerprint, now_iso),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            "UPDATE commits SET last_accessed_at = ? WHERE hash = ?",
+            (now_iso, row["hash"]),
         )
-        now = datetime.now(UTC)
-        for row in cursor:
-            commit = self._row_to_commit(row)
-            if commit.expires_at is not None and commit.expires_at <= now:
-                continue
-            conn.execute(
-                "UPDATE commits SET last_accessed_at = ? WHERE hash = ?",
-                (now.isoformat(), row["hash"]),
-            )
-            return commit
-        return None
+        return self._row_to_commit(row)
 
     def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
         conn = self._connect()
