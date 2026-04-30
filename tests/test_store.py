@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from cashet import Client
+from cashet import Client, TaskError
 from cashet.executor import LocalExecutor
 from cashet.hashing import PickleSerializer, build_task_def
 from cashet.models import Commit, ObjectRef, StorageTier, TaskStatus
@@ -275,6 +275,30 @@ class TestProcessSafety:
         assert ref.load() == 7
         assert attempts == 2
 
+    def test_reclaimed_stale_claim_uses_current_timeout(self, store_dir: Path) -> None:
+        import time
+
+        import cashet.dag as dag
+        import cashet.hashing as hashing
+        from cashet.models import TaskStatus
+
+        client = Client(store_dir=store_dir)
+
+        def slow() -> int:
+            time.sleep(0.25)
+            return 7
+
+        task_def = hashing.build_task_def(slow, (), {})
+        input_refs = dag.resolve_input_refs((), {})
+        commit = dag.build_commit(task_def, input_refs)
+        commit.status = TaskStatus.RUNNING
+        commit.created_at = datetime.now(UTC) - timedelta(seconds=400)
+        commit.claimed_at = datetime.now(UTC) - timedelta(seconds=400)
+        client.store.put_commit(commit)
+
+        with pytest.raises(TaskError, match="TimeoutError"):
+            client.submit(slow, _timeout=0.01)
+
     def test_running_claim_lookup_is_not_limited_to_1000_rows(self, store_dir: Path) -> None:
         import cashet.dag as dag
         import cashet.hashing as hashing
@@ -330,6 +354,14 @@ class TestStoreOperations:
         assert ref.load() == 42
         commit = client.log(limit=1)[0]
         assert commit.task_def.retries == 3
+
+    def test_missing_delete_does_not_poison_next_write(self, client: Client) -> None:
+        def stable() -> int:
+            return 42
+
+        assert client.rm("0" * 64) is False
+        ref = client.submit(stable)
+        assert ref.load() == 42
 
     def test_log_filter_by_func(self, client: Client) -> None:
         def foo(x: int) -> int:
@@ -769,6 +801,15 @@ class TestGarbageCollection:
         with pytest.raises(ValueError, match="Ambiguous prefix"):
             client.store.get_history(ambiguous_digit)
 
+    def test_invalid_hash_prefix_does_not_wildcard_match(self, client: Client) -> None:
+        def val() -> int:
+            return 1
+
+        ref = client.submit(val)
+        assert client.show("_") is None
+        assert client.history("_") == []
+        assert client.show(ref.commit_hash) is not None
+
 
 class TestTags:
     def test_submit_with_tags(self, client: Client) -> None:
@@ -938,6 +979,14 @@ class TestDeleteCommit:
     def test_rm_missing_returns_false(self, client: Client) -> None:
         assert client.rm("deadbeef00000000000000000000000000000000") is False
 
+    def test_rm_invalid_hash_prefix_does_not_delete(self, client: Client) -> None:
+        def val() -> int:
+            return 1
+
+        ref = client.submit(val)
+        assert client.rm("_") is False
+        assert client.show(ref.commit_hash) is not None
+
     def test_rm_clears_parent_hash_of_child(self, client: Client) -> None:
         def val() -> int:
             return 1
@@ -1041,3 +1090,104 @@ class TestSizeAwareGC:
         # Time-based eviction keeps it (recent), size-based should evict it
         client.gc(older_than=timedelta(days=1), max_size_bytes=1)
         assert client.stats()["total_commits"] == 0
+
+
+class TestTTL:
+    def test_ttl_roundtrip(self, client: Client) -> None:
+        def val() -> int:
+            return 1
+
+        ref = client.submit(val, _ttl=3600)
+        assert ref.load() == 1
+        commit = client.show(ref.commit_hash)
+        assert commit is not None
+        assert commit.expires_at is not None
+        assert commit.expires_at > datetime.now(UTC)
+        assert commit.task_def.ttl == timedelta(seconds=3600)
+
+    def test_ttl_expiration_causes_reexecution(self, client: Client) -> None:
+        call_count = 0
+
+        def val() -> int:
+            nonlocal call_count
+            call_count += 1
+            return call_count
+
+        ref1 = client.submit(val, _ttl=0.05)
+        assert ref1.load() == 1
+
+        # Should still be cached immediately
+        ref2 = client.submit(val, _ttl=0.05)
+        assert ref2.load() == 1
+        assert ref1.commit_hash == ref2.commit_hash
+
+        # Wait for TTL to expire
+        import time
+
+        time.sleep(0.1)
+
+        ref3 = client.submit(val, _ttl=0.05)
+        assert ref3.load() == 2
+
+    def test_ttl_on_task_decorator(self, client: Client) -> None:
+        @client.task(ttl=3600)
+        def val() -> int:
+            return 1
+
+        ref = val()
+        assert ref.load() == 1
+        commit = client.show(ref.commit_hash)
+        assert commit is not None
+        assert commit.task_def.ttl == timedelta(seconds=3600)
+        assert commit.expires_at is not None
+
+
+class TestTagInvalidation:
+    def test_invalidate_deletes_matching_tags(self, client: Client) -> None:
+        def a(x: int) -> int:
+            return x
+
+        def b(x: int) -> int:
+            return x + 1
+
+        ref_a = client.submit(a, 1, _tags={"model": "v1"})
+        ref_b = client.submit(b, 1, _tags={"model": "v1"})
+        ref_c = client.submit(a, 2, _tags={"model": "v2"})
+
+        assert ref_a.load() == 1
+        assert ref_b.load() == 2
+        assert ref_c.load() == 2
+
+        deleted = client.invalidate({"model": "v1"})
+        assert deleted == 2
+
+        assert client.show(ref_a.commit_hash) is None
+        assert client.show(ref_b.commit_hash) is None
+        assert client.show(ref_c.commit_hash) is not None
+
+    def test_invalidate_bare_key_deletes_any_value(self, client: Client) -> None:
+        def a(x: int) -> int:
+            return x
+
+        def b(x: int) -> int:
+            return x + 1
+
+        ref_a = client.submit(a, 1, _tags={"model": "v1"})
+        ref_b = client.submit(b, 1, _tags={"model": "v2"})
+        ref_c = client.submit(a, 2, _tags={"other": "x"})
+
+        deleted = client.invalidate({"model": None})
+        assert deleted == 2
+
+        assert client.show(ref_a.commit_hash) is None
+        assert client.show(ref_b.commit_hash) is None
+        assert client.show(ref_c.commit_hash) is not None
+
+    def test_invalidate_no_match_returns_zero(self, client: Client) -> None:
+        def a() -> int:
+            return 1
+
+        ref = client.submit(a, _tags={"model": "v1"})
+        deleted = client.invalidate({"model": "v2"})
+        assert deleted == 0
+        assert client.show(ref.commit_hash) is not None

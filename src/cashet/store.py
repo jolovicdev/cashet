@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import zlib
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,11 @@ _BLOB_COMPRESS_THRESHOLD = 256
 _INLINE_THRESHOLD = 1024
 
 logger = logging.getLogger("cashet")
+
+
+# Guard against accidental wildcard matches when user passes invalid characters.
+def _is_hash_prefix(hash: str) -> bool:
+    return 0 < len(hash) <= 64 and all(c in "0123456789abcdefABCDEF" for c in hash)
 
 
 @dataclass
@@ -97,6 +102,9 @@ class _SQLiteStoreCore:
                 dep_versions TEXT,
                 cache INTEGER NOT NULL DEFAULT 1,
                 retries INTEGER NOT NULL DEFAULT 0,
+                force INTEGER NOT NULL DEFAULT 0,
+                timeout_seconds REAL,
+                ttl_seconds REAL,
                 input_refs TEXT,
                 output_hash TEXT,
                 output_size INTEGER,
@@ -108,6 +116,7 @@ class _SQLiteStoreCore:
                 created_at TEXT NOT NULL,
                 claimed_at TEXT NOT NULL,
                 last_accessed_at TEXT,
+                expires_at TEXT,
                 FOREIGN KEY (parent_hash) REFERENCES commits(hash)
             )
         """)
@@ -119,6 +128,9 @@ class _SQLiteStoreCore:
         )
         self._migrate_last_accessed_at(conn)
         self._migrate_retries(conn)
+        self._migrate_task_options(conn)
+        self._migrate_expires_at(conn)
+        self._migrate_ttl(conn)
         self._migrate_claimed_at(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS inline_objects (
@@ -143,6 +155,25 @@ class _SQLiteStoreCore:
             conn.execute(
                 "ALTER TABLE commits ADD COLUMN retries INTEGER NOT NULL DEFAULT 0"
             )
+
+    def _migrate_task_options(self, conn: sqlite3.Connection) -> None:
+        col_names = [r[1] for r in conn.execute("PRAGMA table_info(commits)").fetchall()]
+        if "force" not in col_names:
+            conn.execute(
+                "ALTER TABLE commits ADD COLUMN force INTEGER NOT NULL DEFAULT 0"
+            )
+        if "timeout_seconds" not in col_names:
+            conn.execute("ALTER TABLE commits ADD COLUMN timeout_seconds REAL")
+
+    def _migrate_expires_at(self, conn: sqlite3.Connection) -> None:
+        col_names = [r[1] for r in conn.execute("PRAGMA table_info(commits)").fetchall()]
+        if "expires_at" not in col_names:
+            conn.execute("ALTER TABLE commits ADD COLUMN expires_at TEXT")
+
+    def _migrate_ttl(self, conn: sqlite3.Connection) -> None:
+        col_names = [r[1] for r in conn.execute("PRAGMA table_info(commits)").fetchall()]
+        if "ttl_seconds" not in col_names:
+            conn.execute("ALTER TABLE commits ADD COLUMN ttl_seconds REAL")
 
     def _migrate_claimed_at(self, conn: sqlite3.Connection) -> None:
         col_names = [r[1] for r in conn.execute("PRAGMA table_info(commits)").fetchall()]
@@ -253,13 +284,19 @@ class _SQLiteStoreCore:
         output_hash = commit.output_ref.hash if commit.output_ref else None
         output_size = commit.output_ref.size if commit.output_ref else None
         output_tier = commit.output_ref.tier.value if commit.output_ref else None
+        timeout_seconds = (
+            commit.task_def.timeout.total_seconds() if commit.task_def.timeout else None
+        )
         conn.execute(
             """INSERT OR REPLACE INTO commits
                (hash, fingerprint, func_name, func_hash, args_hash, args_snapshot,
-                func_source, dep_versions, cache, retries, input_refs, output_hash, output_size,
-                output_tier, parent_hash, status, error, tags, created_at,
-                claimed_at, last_accessed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                func_source, dep_versions, cache, retries, force, timeout_seconds,
+                ttl_seconds, input_refs, output_hash, output_size, output_tier, parent_hash,
+                status, error, tags, created_at,
+                claimed_at, last_accessed_at, expires_at)
+               VALUES (
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+               )""",
             (
                 commit.hash,
                 commit.fingerprint,
@@ -271,6 +308,9 @@ class _SQLiteStoreCore:
                 json.dumps(commit.task_def.dep_versions),
                 int(commit.task_def.cache),
                 commit.task_def.retries,
+                int(commit.task_def.force),
+                timeout_seconds,
+                commit.task_def.ttl.total_seconds() if commit.task_def.ttl else None,
                 json.dumps([r.hash for r in commit.input_refs]),
                 output_hash,
                 output_size,
@@ -282,24 +322,29 @@ class _SQLiteStoreCore:
                 commit.created_at.isoformat(),
                 commit.claimed_at.isoformat(),
                 accessed_at,
+                commit.expires_at.isoformat() if commit.expires_at else None,
             ),
         )
 
     def find_by_fingerprint(self, fingerprint: str) -> Commit | None:
         conn = self._connect()
-        row = conn.execute(
+        cursor = conn.execute(
             """SELECT * FROM commits
                WHERE fingerprint = ? AND status IN ('completed', 'cached')
-               ORDER BY created_at DESC LIMIT 1""",
+               ORDER BY created_at DESC""",
             (fingerprint,),
-        ).fetchone()
-        if row is None:
-            return None
-        conn.execute(
-            "UPDATE commits SET last_accessed_at = ? WHERE hash = ?",
-            (datetime.now(UTC).isoformat(), row["hash"]),
         )
-        return self._row_to_commit(row)
+        now = datetime.now(UTC)
+        for row in cursor:
+            commit = self._row_to_commit(row)
+            if commit.expires_at is not None and commit.expires_at <= now:
+                continue
+            conn.execute(
+                "UPDATE commits SET last_accessed_at = ? WHERE hash = ?",
+                (now.isoformat(), row["hash"]),
+            )
+            return commit
+        return None
 
     def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
         conn = self._connect()
@@ -314,7 +359,7 @@ class _SQLiteStoreCore:
         return self._row_to_commit(row)
 
     def get_commit(self, hash: str) -> Commit | None:
-        if not hash:
+        if not _is_hash_prefix(hash):
             return None
         conn = self._connect()
         if len(hash) < 64:
@@ -365,7 +410,7 @@ class _SQLiteStoreCore:
         return [self._row_to_commit(r) for r in rows]
 
     def get_history(self, hash: str) -> list[Commit]:
-        if not hash:
+        if not _is_hash_prefix(hash):
             return []
         conn = self._connect()
         if len(hash) < 64:
@@ -392,7 +437,14 @@ class _SQLiteStoreCore:
                ORDER BY created_at ASC""",
             (fingerprint,),
         ).fetchall()
-        return [self._row_to_commit(r) for r in rows]
+        now = datetime.now(UTC)
+        result: list[Commit] = []
+        for r in rows:
+            c = self._row_to_commit(r)
+            if c.expires_at is not None and c.expires_at <= now:
+                continue
+            result.append(c)
+        return result
 
     def stats(self) -> dict[str, int]:
         conn = self._connect()
@@ -549,39 +601,48 @@ class _SQLiteStoreCore:
             self._delete_orphan_objects(conn, pending_orphans)
         return deleted
 
-    def delete_commit(self, hash: str) -> bool:
-        conn = self._connect(immediate=True)
+    def _delete_commit_body(self, conn: sqlite3.Connection, hash: str) -> tuple[bool, list[str]]:
+        if len(hash) < 64:
+            rows = conn.execute(
+                "SELECT * FROM commits WHERE hash LIKE ?", (hash + "%",)
+            ).fetchall()
+            if not rows:
+                return False, []
+            if len(rows) > 1:
+                matches = ", ".join(r["hash"][:12] for r in rows)
+                raise ValueError(
+                    f"Ambiguous prefix {hash[:12]} matches {len(rows)} commits: {matches}"
+                )
+            target = rows[0]
+        else:
+            target = conn.execute(
+                "SELECT * FROM commits WHERE hash = ?", (hash,)
+            ).fetchone()
+            if target is None:
+                return False, []
+
+        candidates = set(self._row_object_refs(target))
+        conn.execute(
+            "UPDATE commits SET parent_hash = NULL WHERE parent_hash = ?",
+            (target["hash"],),
+        )
+        conn.execute("DELETE FROM commits WHERE hash = ?", (target["hash"],))
+
         orphans: list[str] = []
+        if candidates:
+            orphans = self._find_orphan_objects(conn, candidates)
+        return True, orphans
+
+    def delete_commit(self, hash: str) -> bool:
+        if not _is_hash_prefix(hash):
+            return False
+        conn = self._connect(immediate=True)
         try:
-            if len(hash) < 64:
-                rows = conn.execute(
-                    "SELECT * FROM commits WHERE hash LIKE ?", (hash + "%",)
-                ).fetchall()
-                if not rows:
-                    return False
-                if len(rows) > 1:
-                    matches = ", ".join(r["hash"][:12] for r in rows)
-                    raise ValueError(
-                        f"Ambiguous prefix {hash[:12]} matches {len(rows)} commits: {matches}"
-                    )
-                target = rows[0]
-            else:
-                target = conn.execute(
-                    "SELECT * FROM commits WHERE hash = ?", (hash,)
-                ).fetchone()
-                if target is None:
-                    return False
-
-            candidates = set(self._row_object_refs(target))
-            conn.execute(
-                "UPDATE commits SET parent_hash = NULL WHERE parent_hash = ?",
-                (target["hash"],),
-            )
-            conn.execute("DELETE FROM commits WHERE hash = ?", (target["hash"],))
-
-            if candidates:
-                orphans = self._find_orphan_objects(conn, candidates)
-
+            success, orphans = self._delete_commit_body(conn, hash)
+            if not success:
+                # Avoid leaving a dangling transaction that poisons the next write.
+                conn.execute("ROLLBACK")
+                return False
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -592,8 +653,41 @@ class _SQLiteStoreCore:
                 len(orphans),
             )
             self._delete_orphan_objects(conn, orphans)
-        logger.debug("commit deleted hash=%s", target["hash"][:12])
+        logger.debug("commit deleted hash=%s", hash[:12])
         return True
+
+    def delete_by_tags(self, tags: dict[str, str | None]) -> int:
+        conn = self._connect(immediate=True)
+        query = "SELECT hash FROM commits WHERE 1=1"
+        params: list[Any] = []
+        for key, val in tags.items():
+            if val is None:
+                query += " AND json_extract(tags, ?) IS NOT NULL"
+                params.append(f"$.{key}")
+            else:
+                query += " AND json_extract(tags, ?) = ?"
+                params.append(f"$.{key}")
+                params.append(val)
+        rows = conn.execute(query, params).fetchall()
+        deleted = 0
+        all_orphans: list[str] = []
+        try:
+            for row in rows:
+                success, orphans = self._delete_commit_body(conn, row[0])
+                if success:
+                    deleted += 1
+                    all_orphans.extend(orphans)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        if all_orphans:
+            logger.info(
+                "orphan objects cleaned count=%d",
+                len(all_orphans),
+            )
+            self._delete_orphan_objects(conn, all_orphans)
+        return deleted
 
     def _row_object_refs(self, row: sqlite3.Row) -> list[str]:
         refs: list[str] = []
@@ -672,6 +766,9 @@ class _SQLiteStoreCore:
         tags: dict[str, str] = {}
         if row["tags"]:
             tags = json.loads(row["tags"])
+        row_keys = set(row.keys())
+        timeout_seconds = row["timeout_seconds"] if "timeout_seconds" in row_keys else None
+        ttl_seconds = row["ttl_seconds"] if "ttl_seconds" in row_keys else None
         task_def = TaskDef(
             func_hash=row["func_hash"],
             func_name=row["func_name"],
@@ -681,7 +778,10 @@ class _SQLiteStoreCore:
             dep_versions=dep_versions,
             cache=bool(row["cache"]),
             tags=tags,
-            retries=row["retries"] if "retries" in row.keys() else 0,  # noqa: SIM118
+            retries=row["retries"] if "retries" in row_keys else 0,
+            force=bool(row["force"]) if "force" in row_keys else False,
+            timeout=timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None,
+            ttl=timedelta(seconds=ttl_seconds) if ttl_seconds is not None else None,
         )
         created_at = row["created_at"]
         if isinstance(created_at, str):
@@ -689,6 +789,9 @@ class _SQLiteStoreCore:
         claimed_at = row["claimed_at"]
         if isinstance(claimed_at, str):
             claimed_at = datetime.fromisoformat(claimed_at)
+        expires_at = row["expires_at"]
+        if isinstance(expires_at, str):
+            expires_at = datetime.fromisoformat(expires_at)
         return Commit(
             hash=row["hash"],
             task_def=task_def,
@@ -700,6 +803,7 @@ class _SQLiteStoreCore:
             claimed_at=claimed_at,
             error=row["error"],
             tags=tags,
+            expires_at=expires_at,
         )
 
 
@@ -794,6 +898,10 @@ class AsyncSQLiteStore:
         async with self._write_lock:
             return await asyncio.to_thread(self._core.delete_commit, hash)
 
+    async def delete_by_tags(self, tags: dict[str, str | None]) -> int:
+        async with self._write_lock:
+            return await asyncio.to_thread(self._core.delete_by_tags, tags)
+
     async def close(self) -> None:
         await asyncio.to_thread(self._core.close)
 
@@ -874,6 +982,9 @@ class SQLiteStore:
 
     def delete_commit(self, hash: str) -> bool:
         return self._runner.call(self._async_store.delete_commit(hash))
+
+    def delete_by_tags(self, tags: dict[str, str | None]) -> int:
+        return self._runner.call(self._async_store.delete_by_tags(tags))
 
     def close(self) -> None:
         self._runner.call(self._async_store.close())

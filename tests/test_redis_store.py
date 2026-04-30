@@ -470,6 +470,24 @@ class TestRedisStoreProtocol:
         with pytest.raises(ValueError, match="Ambiguous prefix"):
             redis_store.get_commit("ab")
 
+    def test_invalid_hash_prefix_does_not_wildcard_match(
+        self, redis_store: RedisStore
+    ) -> None:
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+        )
+        commit = Commit(hash="c1" + "0" * 62, task_def=task_def, status=TaskStatus.COMPLETED)
+        redis_store.put_commit(commit)
+
+        assert redis_store.get_commit("*") is None
+        assert redis_store.get_commit("?") is None
+        assert redis_store.delete_commit("*") is False
+        assert redis_store.get_commit(commit.hash) is not None
+
     def test_get_commit_short_prefix(self, redis_store: RedisStore) -> None:
         task_def = TaskDef(
             func_hash="a" * 64,

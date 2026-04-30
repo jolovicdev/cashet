@@ -40,6 +40,11 @@ def _commit_key(hash: str) -> str:
     return f"cashet:commit:{hash}"
 
 
+# Guard against Redis glob patterns (*, ?) being passed as hash arguments.
+def _is_hash_prefix(hash: str) -> bool:
+    return 0 < len(hash) <= 64 and all(c in "0123456789abcdefABCDEF" for c in hash)
+
+
 def _blob_key(hash: str) -> str:
     return f"cashet:blob:data:{hash}"
 
@@ -90,6 +95,10 @@ def _encode_commit(commit: Commit) -> bytes:
         "timeout_seconds": (
             commit.task_def.timeout.total_seconds() if commit.task_def.timeout else None
         ),
+        "ttl_seconds": (
+            commit.task_def.ttl.total_seconds() if commit.task_def.ttl else None
+        ),
+        "expires_at": commit.expires_at.isoformat() if commit.expires_at else None,
         "input_refs": [
             {"hash": r.hash, "size": r.size, "tier": r.tier.value} for r in commit.input_refs
         ],
@@ -125,6 +134,11 @@ def _decode_commit(data: bytes) -> Commit:
             if d.get("timeout_seconds") is not None
             else None
         ),
+        ttl=(
+            timedelta(seconds=d["ttl_seconds"])
+            if d.get("ttl_seconds") is not None
+            else None
+        ),
     )
     input_refs = [
         ObjectRef(
@@ -147,6 +161,9 @@ def _decode_commit(data: bytes) -> Commit:
     claimed_at = (
         datetime.fromisoformat(d["claimed_at"]) if "claimed_at" in d else datetime.now(UTC)
     )
+    expires_at = (
+        datetime.fromisoformat(d["expires_at"]) if d.get("expires_at") is not None else None
+    )
     return Commit(
         hash=d["hash"],
         task_def=task_def,
@@ -158,6 +175,7 @@ def _decode_commit(data: bytes) -> Commit:
         claimed_at=claimed_at,
         error=d.get("error"),
         tags=d.get("tags", {}),
+        expires_at=expires_at,
     )
 
 
@@ -322,7 +340,7 @@ class AsyncRedisStore:
                     continue
 
     async def get_commit(self, hash: str) -> Commit | None:
-        if not hash:
+        if not _is_hash_prefix(hash):
             return None
         if len(hash) < 64:
             matches: list[str] = []
@@ -347,10 +365,13 @@ class AsyncRedisStore:
 
     async def find_by_fingerprint(self, fingerprint: str) -> Commit | None:
         hashes = await self._redis.zrevrange(_fp_key(fingerprint), 0, -1)
+        now = datetime.now(UTC)
         for h in hashes:
             h_str = h.decode() if isinstance(h, bytes) else h
             commit = await self.get_commit(h_str)
             if commit is not None and commit.status in (TaskStatus.COMPLETED, TaskStatus.CACHED):
+                if commit.expires_at is not None and commit.expires_at <= now:
+                    continue
                 await self._touch_commit(h_str)
                 return commit
         return None
@@ -391,18 +412,21 @@ class AsyncRedisStore:
         return commits
 
     async def get_history(self, hash: str) -> list[Commit]:
-        if not hash:
+        if not _is_hash_prefix(hash):
             return []
         commit = await self.get_commit(hash)
         if commit is None:
             return []
         fingerprint = commit.fingerprint
         hashes = await self._redis.zrange(_fp_key(fingerprint), 0, -1)
+        now = datetime.now(UTC)
         commits: list[Commit] = []
         for h in hashes:
             h_str = h.decode() if isinstance(h, bytes) else h
             c = await self.get_commit(h_str)
             if c is not None and c.status in (TaskStatus.COMPLETED, TaskStatus.CACHED):
+                if c.expires_at is not None and c.expires_at <= now:
+                    continue
                 commits.append(c)
         return commits
 
@@ -523,17 +547,34 @@ class AsyncRedisStore:
         return deleted
 
     async def delete_commit(self, hash: str) -> bool:
-        if not hash:
+        if not _is_hash_prefix(hash):
             return False
         if await self._blob_stats_ready():
             return await self._delete_commit(hash)
         async with self._blob_stats_lock():
             return await self._delete_commit(hash)
 
+    async def delete_by_tags(self, tags: dict[str, str | None]) -> int:
+        hashes = await self._redis.zrevrange("cashet:index:all", 0, -1)
+        deleted = 0
+        for h in hashes:
+            h_str = h.decode() if isinstance(h, bytes) else h
+            commit = await self.get_commit(h_str)
+            if (
+                commit is not None
+                and _matches_tags(commit, tags)
+                and await self._delete_commit_obj(commit)
+            ):
+                deleted += 1
+        return deleted
+
     async def _delete_commit(self, hash: str) -> bool:
         commit = await self.get_commit(hash)
         if commit is None:
             return False
+        return await self._delete_commit_obj(commit)
+
+    async def _delete_commit_obj(self, commit: Commit) -> bool:
         resolved_hash = commit.hash
         pipe = self._redis.pipeline()
         _remove_commit_index_commands(pipe, commit, resolved_hash)
@@ -618,6 +659,9 @@ class RedisStore:
 
     def delete_commit(self, hash: str) -> bool:
         return self._runner.call(self._async_store.delete_commit(hash))
+
+    def delete_by_tags(self, tags: dict[str, str | None]) -> int:
+        return self._runner.call(self._async_store.delete_by_tags(tags))
 
     def close(self) -> None:
         self._runner.call(self._async_store.close())
