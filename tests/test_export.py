@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import tarfile
+from io import BytesIO
 from pathlib import Path
 
+import pytest
 import pytest_asyncio
 
 from cashet import Client
@@ -21,6 +24,20 @@ def add(x: int, y: int) -> int:
 
 def greet(name: str) -> str:
     return f"hello {name}"
+
+
+def corrupt_first_blob(src: Path, dst: Path) -> None:
+    with tarfile.open(src, "r:gz") as original, tarfile.open(dst, "w:gz") as patched:
+        corrupted = False
+        for member in original.getmembers():
+            extracted = original.extractfile(member) if member.isfile() else None
+            data = extracted.read() if extracted is not None else b""
+            if member.name.startswith("cashet-export/blobs/") and not corrupted:
+                data = b"corrupt"
+                corrupted = True
+            info = tarfile.TarInfo(member.name)
+            info.size = len(data)
+            patched.addfile(info, BytesIO(data))
 
 
 class TestSyncExport:
@@ -67,6 +84,20 @@ class TestSyncExport:
         client2 = Client(store_dir=tmp_path / ".cashet2")
         count = client2.import_archive(archive)
         assert count == 0
+
+    def test_import_rejects_corrupt_blob_payload(self, client: Client, tmp_path: Path) -> None:
+        ref = client.submit(add, 1, 2)
+        assert ref.load() == 3
+
+        archive = tmp_path / "export.tar.gz"
+        corrupt_archive = tmp_path / "export-corrupt.tar.gz"
+        client.export(archive)
+        corrupt_first_blob(archive, corrupt_archive)
+
+        client2 = Client(store_dir=tmp_path / ".cashet2")
+        with pytest.raises(ValueError, match="hash mismatch"):
+            client2.import_archive(corrupt_archive)
+        assert client2.show(ref.commit_hash) is None
 
 
 class TestAsyncExport:
