@@ -1148,6 +1148,70 @@ class TestTTL:
         assert commit.task_def.ttl == timedelta(seconds=3600)
         assert commit.expires_at is not None
 
+    def test_ttl_on_submit_many(self, client: Client) -> None:
+        def a() -> int:
+            return 1
+
+        def b() -> int:
+            return 2
+
+        refs = client.submit_many([a, b], _ttl=7200)
+        results = [r.load() for r in refs]
+        assert results == [1, 2]
+
+        for ref in refs:
+            commit = client.show(ref.commit_hash)
+            assert commit is not None
+            assert commit.task_def.ttl == timedelta(seconds=7200)
+            assert commit.expires_at is not None
+            assert commit.expires_at > datetime.now(UTC)
+
+    def test_ttl_on_submit_many_dict(self, client: Client) -> None:
+        def a() -> int:
+            return 10
+
+        def b() -> int:
+            return 20
+
+        refs = client.submit_many(
+            {"first": a, "second": b},
+            _ttl=1800,
+        )
+        assert refs["first"].load() == 10
+        assert refs["second"].load() == 20
+
+        for key in ("first", "second"):
+            commit = client.show(refs[key].commit_hash)
+            assert commit is not None, f"{key} commit missing"
+            assert commit.task_def.ttl == timedelta(seconds=1800)
+            assert commit.expires_at is not None
+
+    def test_ttl_on_submit_many_causes_reexecution(self, client: Client) -> None:
+        call_count = 0
+
+        def val_a() -> int:
+            nonlocal call_count
+            call_count += 1
+            return call_count
+
+        def val_b() -> int:
+            nonlocal call_count
+            call_count += 1
+            return call_count
+
+        refs1 = client.submit_many([val_a, val_b], _ttl=0.05)
+        assert [r.load() for r in refs1] == [1, 2]
+
+        refs2 = client.submit_many([val_a, val_b], _ttl=0.05)
+        assert [r.load() for r in refs2] == [1, 2]
+
+        import time
+
+        time.sleep(0.1)
+
+        refs3 = client.submit_many([val_a, val_b], _ttl=0.05)
+        assert [r.load() for r in refs3] == [3, 4]
+
 
 class TestTagInvalidation:
     def test_invalidate_deletes_matching_tags(self, client: Client) -> None:
