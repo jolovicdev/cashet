@@ -62,10 +62,11 @@ class AsyncClient:
         retries: int = 0,
         force: bool = False,
         timeout: int | float | None = None,
+        ttl: int | float | None = None,
     ) -> Callable[..., Any]:
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             task_name = name or fn.__qualname__
-            set_task_metadata(fn, task_name, cache, tags, retries, force, timeout)
+            set_task_metadata(fn, task_name, cache, tags, retries, force, timeout, ttl)
             self._registered_tasks[task_name] = fn
 
             @wraps(fn)
@@ -73,7 +74,7 @@ class AsyncClient:
                 return await self.submit(fn, *args, **kwargs)
 
             wrapper._cashet_wrapped_func = fn  # pyright: ignore[reportAttributeAccessIssue]
-            set_task_metadata(wrapper, task_name, cache, tags, retries, force, timeout)
+            set_task_metadata(wrapper, task_name, cache, tags, retries, force, timeout, ttl)
             return wrapper
 
         if func is not None:
@@ -89,10 +90,11 @@ class AsyncClient:
         _retries: int | None = None,
         _force: bool | None = None,
         _timeout: int | float | None = None,
+        _ttl: int | float | None = None,
         **kwargs: Any,
     ) -> AsyncResultRef[T]:
-        raw_func, cache, tags, retries, force, timeout = resolve_task_config(
-            func, _cache, _tags, _retries, _force, _timeout
+        raw_func, cache, tags, retries, force, timeout, ttl = resolve_task_config(
+            func, _cache, _tags, _retries, _force, _timeout, _ttl
         )
         task_def = build_task_def(
             raw_func,
@@ -103,6 +105,7 @@ class AsyncClient:
             retries=retries,
             force=force,
             timeout=timeout,
+            ttl=ttl,
         )
         commit, _was_cached = await self._executor.submit(
             raw_func, args, kwargs, task_def, self.store, self.serializer
@@ -128,6 +131,7 @@ class AsyncClient:
         _retries: int | None = None,
         _force: bool | None = None,
         _timeout: int | float | None = None,
+        _ttl: int | float | None = None,
         max_workers: int | None = None,
     ) -> list[AsyncResultRef[Any]]: ...
 
@@ -146,6 +150,7 @@ class AsyncClient:
         _retries: int | None = None,
         _force: bool | None = None,
         _timeout: int | float | None = None,
+        _ttl: int | float | None = None,
         max_workers: int | None = None,
     ) -> dict[str, AsyncResultRef[Any]]: ...
 
@@ -158,6 +163,7 @@ class AsyncClient:
         _retries: int | None = None,
         _force: bool | None = None,
         _timeout: int | float | None = None,
+        _ttl: int | float | None = None,
         max_workers: int | None = None,
     ) -> list[AsyncResultRef[Any]] | dict[str, AsyncResultRef[Any]]:
         is_dict = isinstance(tasks, dict)
@@ -167,7 +173,7 @@ class AsyncClient:
             keys, raw_tasks = unpack_list_tasks(tasks)
 
         key_set = set(keys)
-        normalized = normalize_tasks(raw_tasks, _cache, _tags, _retries, _force, _timeout)
+        normalized = normalize_tasks(raw_tasks, _cache, _tags, _retries, _force, _timeout, _ttl)
         deps, task_refs = build_deps(keys, normalized, key_set)
         order = topological_sort(deps)
         workers = max_workers if max_workers is not None else self._max_workers
@@ -229,6 +235,9 @@ class AsyncClient:
     async def rm(self, hash: str) -> bool:
         return await self.store.delete_commit(hash)
 
+    async def invalidate(self, tags: dict[str, str | None]) -> int:
+        return await self.store.delete_by_tags(tags)
+
     async def gc(
         self, older_than: timedelta | None = None, max_size_bytes: int | None = None
     ) -> int:
@@ -264,6 +273,7 @@ class AsyncClient:
         _retries: int | None = None,
         _force: bool | None = None,
         _timeout: int | float | None = None,
+        _ttl: int | float | None = None,
         max_workers: int | None = None,
         **kwargs: Any,
     ) -> list[AsyncResultRef[T]]:
@@ -275,6 +285,7 @@ class AsyncClient:
             _retries=_retries,
             _force=_force,
             _timeout=_timeout,
+            _ttl=_ttl,
             max_workers=max_workers,
         )
 

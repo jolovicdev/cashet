@@ -47,6 +47,7 @@ class TaskDef:
     retries: int = 0
     force: bool = False
     timeout: timedelta | None = None
+    ttl: timedelta | None = None
 
     @property
     def fingerprint(self) -> str:
@@ -65,6 +66,7 @@ class Commit:
     claimed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     error: str | None = None
     tags: dict[str, str] = field(default_factory=dict[str, str])
+    expires_at: datetime | None = None
 
     @property
     def fingerprint(self) -> str:
