@@ -976,6 +976,13 @@ class TestDeleteCommit:
         with pytest.raises(ValueError, match="Ambiguous prefix"):
             client.rm(ambiguous)
 
+        # Verify the rolled-back transaction does not poison the next write.
+        def after() -> int:
+            return 99
+
+        ref = client.submit(after)
+        assert ref.load() == 99
+
     def test_rm_missing_returns_false(self, client: Client) -> None:
         assert client.rm("deadbeef00000000000000000000000000000000") is False
 
