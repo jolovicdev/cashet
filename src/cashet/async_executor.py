@@ -99,8 +99,18 @@ class AsyncLocalExecutor:
                             func_name,
                             claim.hash[:12],
                         )
+                        # Reclaimed claims must run with current task options, not stale ones.
                         claim.claimed_at = datetime.now(UTC)
+                        claim.task_def.cache = task_def.cache
                         claim.task_def.retries = task_def.retries
+                        claim.task_def.force = task_def.force
+                        claim.task_def.timeout = task_def.timeout
+                        claim.task_def.ttl = task_def.ttl
+                        claim.task_def.tags = task_def.tags
+                        claim.tags = task_def.tags
+                        claim.expires_at = (
+                            datetime.now(UTC) + task_def.ttl if task_def.ttl else None
+                        )
                         await store.put_commit(claim)
                         break
                 else:
