@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -1198,3 +1198,186 @@ class TestTagInvalidation:
         deleted = client.invalidate({"model": "v2"})
         assert deleted == 0
         assert client.show(ref.commit_hash) is not None
+
+
+class TestMigrations:
+    _BASE_COLUMNS: ClassVar[list[str]] = [
+        "hash", "fingerprint", "func_name", "func_hash", "args_hash",
+        "args_snapshot", "func_source", "dep_versions", "cache", "input_refs",
+        "output_hash", "output_size", "output_tier", "parent_hash",
+        "status", "error", "tags", "created_at",
+    ]
+    _MIGRATED_COLUMNS: ClassVar[list[str]] = [
+        "last_accessed_at", "retries", "force", "timeout_seconds",
+        "expires_at", "ttl_seconds", "claimed_at",
+    ]
+
+    def _build_base_db(self, db_path: str) -> None:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS commits (
+                hash TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                func_name TEXT NOT NULL,
+                func_hash TEXT NOT NULL,
+                args_hash TEXT NOT NULL,
+                args_snapshot BLOB,
+                func_source TEXT,
+                dep_versions TEXT,
+                cache INTEGER NOT NULL DEFAULT 1,
+                input_refs TEXT,
+                output_hash TEXT,
+                output_size INTEGER,
+                output_tier TEXT,
+                parent_hash TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT,
+                tags TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (parent_hash) REFERENCES commits(hash)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fingerprint ON commits(fingerprint)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_func_name ON commits(func_name)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_created_at ON commits(created_at)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS inline_objects (
+                hash TEXT PRIMARY KEY,
+                data BLOB NOT NULL
+            )
+        """)
+        conn.close()
+
+    def test_migration_from_base_schema(self, tmp_path: Path) -> None:
+        from cashet.store import _SQLiteStoreCore
+
+        root = tmp_path / ".cashet"
+        root.mkdir()
+        db_path = root / "meta.db"
+        (root / "objects").mkdir()
+
+        self._build_base_db(str(db_path))
+
+        core = _SQLiteStoreCore(root)
+        try:
+            col_names = [
+                r[1]
+                for r in core._connect().execute(
+                    "PRAGMA table_info(commits)"
+                ).fetchall()
+            ]
+            for col in self._BASE_COLUMNS + self._MIGRATED_COLUMNS:
+                assert col in col_names, f"Column {col} missing after migration"
+
+            assert "last_accessed_at" in col_names
+            assert "idx_last_accessed_at" in [
+                r[1] for r in core._connect().execute(
+                    "SELECT * FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            ]
+        finally:
+            core.close()
+
+    def test_migration_idempotent(self, tmp_path: Path) -> None:
+        from cashet.store import _SQLiteStoreCore
+
+        root = tmp_path / ".cashet"
+        root.mkdir()
+        db_path = root / "meta.db"
+        (root / "objects").mkdir()
+
+        self._build_base_db(str(db_path))
+
+        core1 = _SQLiteStoreCore(root)
+        core1.close()
+
+        core2 = _SQLiteStoreCore(root)
+        try:
+            col_names = [
+                r[1]
+                for r in core2._connect().execute(
+                    "PRAGMA table_info(commits)"
+                ).fetchall()
+            ]
+            for col in self._BASE_COLUMNS + self._MIGRATED_COLUMNS:
+                assert col in col_names, f"Column {col} missing after second migration"
+        finally:
+            core2.close()
+
+    def test_operations_after_migration(self, tmp_path: Path) -> None:
+        from cashet.store import _SQLiteStoreCore
+
+        root = tmp_path / ".cashet"
+        root.mkdir()
+        db_path = root / "meta.db"
+        (root / "objects").mkdir()
+
+        self._build_base_db(str(db_path))
+
+        core = _SQLiteStoreCore(root)
+        try:
+            from cashet.dag import build_commit, resolve_input_refs
+            from cashet.hashing import build_task_def
+            from cashet.models import TaskStatus
+
+            def add(x: int, y: int) -> int:
+                return x + y
+
+            task_def = build_task_def(
+                add, (2, 3), {}, tags={"env": "test"}, ttl=timedelta(hours=1)
+            )
+            input_refs = resolve_input_refs((2,), {})
+            commit = build_commit(task_def, input_refs)
+            commit.status = TaskStatus.COMPLETED
+
+            blob = core.put_blob(b"result")
+            commit.output_ref = blob
+            core.put_commit(commit)
+
+            fetched = core.get_commit(commit.hash)
+            assert fetched is not None
+            assert fetched.task_def.tags == {"env": "test"}
+            assert fetched.task_def.ttl == timedelta(hours=1)
+            assert fetched.output_ref is not None
+            assert core.get_blob(fetched.output_ref) == b"result"
+        finally:
+            core.close()
+
+    def test_partial_migration_missing_retries_only(self, tmp_path: Path) -> None:
+        from cashet.store import _SQLiteStoreCore
+
+        root = tmp_path / ".cashet"
+        root.mkdir()
+        db_path = root / "meta.db"
+        (root / "objects").mkdir()
+
+        self._build_base_db(str(db_path))
+
+        pre_conn = sqlite3.connect(str(db_path))
+        pre_conn.execute(
+            "ALTER TABLE commits ADD COLUMN last_accessed_at TEXT DEFAULT NULL"
+        )
+        pre_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_last_accessed_at ON commits(last_accessed_at)"
+        )
+        pre_conn.close()
+
+        core = _SQLiteStoreCore(root)
+        try:
+            col_names = [
+                r[1]
+                for r in core._connect().execute(
+                    "PRAGMA table_info(commits)"
+                ).fetchall()
+            ]
+            for col in self._BASE_COLUMNS + self._MIGRATED_COLUMNS:
+                assert col in col_names, f"Column {col} missing: partial migration failed"
+        finally:
+            core.close()

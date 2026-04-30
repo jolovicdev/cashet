@@ -124,9 +124,6 @@ class _SQLiteStoreCore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fingerprint ON commits(fingerprint)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_func_name ON commits(func_name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON commits(created_at)")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_last_accessed_at ON commits(last_accessed_at)"
-        )
         self._migrate_last_accessed_at(conn)
         self._migrate_retries(conn)
         self._migrate_task_options(conn)
@@ -149,6 +146,9 @@ class _SQLiteStoreCore:
             conn.execute(
                 "UPDATE commits SET last_accessed_at = created_at WHERE last_accessed_at IS NULL"
             )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_last_accessed_at ON commits(last_accessed_at)"
+        )
 
     def _migrate_retries(self, conn: sqlite3.Connection) -> None:
         col_names = [r[1] for r in conn.execute("PRAGMA table_info(commits)").fetchall()]
