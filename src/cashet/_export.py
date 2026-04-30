@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import tarfile
@@ -52,6 +53,8 @@ def _task_def_to_dict(task_def: TaskDef) -> dict[str, Any]:
     }
     if task_def.timeout is not None:
         result["timeout"] = task_def.timeout.total_seconds()
+    if task_def.ttl is not None:
+        result["ttl"] = task_def.ttl.total_seconds()
     return result
 
 
@@ -59,6 +62,9 @@ def _dict_to_task_def(data: dict[str, Any]) -> TaskDef:
     timeout: timedelta | None = None
     if "timeout" in data and data["timeout"] is not None:
         timeout = timedelta(seconds=data["timeout"])
+    ttl: timedelta | None = None
+    if "ttl" in data and data["ttl"] is not None:
+        ttl = timedelta(seconds=data["ttl"])
     return TaskDef(
         func_hash=data["func_hash"],
         func_name=data["func_name"],
@@ -71,6 +77,7 @@ def _dict_to_task_def(data: dict[str, Any]) -> TaskDef:
         retries=data.get("retries", 0),
         force=data.get("force", False),
         timeout=timeout,
+        ttl=ttl,
     )
 
 
@@ -88,6 +95,8 @@ def _commit_to_dict(commit: Commit) -> dict[str, Any]:
     }
     if commit.output_ref is not None:
         result["output_ref"] = _object_ref_to_dict(commit.output_ref)
+    if commit.expires_at is not None:
+        result["expires_at"] = commit.expires_at.isoformat()
     return result
 
 
@@ -95,6 +104,9 @@ def _dict_to_commit(data: dict[str, Any]) -> Commit:
     output_ref: ObjectRef | None = None
     if "output_ref" in data and data["output_ref"] is not None:
         output_ref = _dict_to_object_ref(data["output_ref"])
+    expires_at = None
+    if "expires_at" in data and data["expires_at"] is not None:
+        expires_at = datetime.fromisoformat(data["expires_at"])
     return Commit(
         hash=data["hash"],
         task_def=_dict_to_task_def(data["task_def"]),
@@ -106,6 +118,7 @@ def _dict_to_commit(data: dict[str, Any]) -> Commit:
         claimed_at=datetime.fromisoformat(data["claimed_at"]),
         error=data.get("error"),
         tags=data.get("tags", {}),
+        expires_at=expires_at,
     )
 
 
@@ -230,7 +243,15 @@ async def import_store(store: AsyncStore, tar_path: Path) -> int:
                         tf = tar.extractfile(blob_member)
                         if tf is not None:
                             with tf:
-                                blob_refs[h] = await store.put_blob(tf.read())
+                                # Prevent corrupted or tampered archives from poisoning the store.
+                                blob_data = tf.read()
+                                actual_hash = hashlib.sha256(blob_data).hexdigest()
+                                if actual_hash != h:
+                                    raise ValueError(
+                                        f"Archive blob hash mismatch for {h[:12]}: "
+                                        f"got {actual_hash[:12]}"
+                                    )
+                                blob_refs[h] = await store.put_blob(blob_data)
                     else:
                         logger.warning("missing blob in archive hash=%s", h[:12])
                         missing_blobs.add(h)

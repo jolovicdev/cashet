@@ -56,5 +56,8 @@ class SyncStoreAdapter:
     async def delete_commit(self, hash: str) -> bool:
         return await asyncio.to_thread(self._store.delete_commit, hash)
 
+    async def delete_by_tags(self, tags: dict[str, str | None]) -> int:
+        return await asyncio.to_thread(self._store.delete_by_tags, tags)
+
     async def close(self) -> None:
         await asyncio.to_thread(self._store.close)

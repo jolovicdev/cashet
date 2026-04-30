@@ -39,7 +39,8 @@ def resolve_task_config(
     _retries: int | None,
     _force: bool | None,
     _timeout: int | float | None,
-) -> tuple[Any, bool, dict[str, str], int, bool, timedelta | None]:
+    _ttl: int | float | None = None,
+) -> tuple[Any, bool, dict[str, str], int, bool, timedelta | None, timedelta | None]:
     raw_func = getattr(func, "_cashet_wrapped_func", func)
     cache = _cache if _cache is not None else getattr(raw_func, "_cashet_cache", True)
     tags = _tags if _tags is not None else getattr(raw_func, "_cashet_tags", {})
@@ -49,7 +50,9 @@ def resolve_task_config(
         _timeout if _timeout is not None else getattr(raw_func, "_cashet_timeout", None)
     )
     timeout = timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
-    return raw_func, cache, tags, retries, force, timeout
+    ttl_seconds = _ttl if _ttl is not None else getattr(raw_func, "_cashet_ttl", None)
+    ttl = timedelta(seconds=ttl_seconds) if ttl_seconds is not None else None
+    return raw_func, cache, tags, retries, force, timeout, ttl
 
 
 def set_task_metadata(
@@ -60,6 +63,7 @@ def set_task_metadata(
     retries: int,
     force: bool,
     timeout: int | float | None,
+    ttl: int | float | None = None,
 ) -> None:
     target: Any = func
     target._cashet_cache = cache
@@ -68,6 +72,7 @@ def set_task_metadata(
     target._cashet_retries = retries
     target._cashet_force = force
     target._cashet_timeout = timeout
+    target._cashet_ttl = ttl
 
 
 def resolve_status(status: TaskStatus | str | None) -> TaskStatus | None:

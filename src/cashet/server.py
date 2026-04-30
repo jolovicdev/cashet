@@ -203,6 +203,7 @@ async def _async_submit(request: Request) -> JSONResponse:
     retries = data.get("retries", 0)
     force = data.get("force", False)
     timeout = data.get("timeout")
+    ttl = data.get("ttl")
 
     start = time.perf_counter()
     try:
@@ -214,6 +215,7 @@ async def _async_submit(request: Request) -> JSONResponse:
             _retries=retries,
             _force=force,
             _timeout=timeout,
+            _ttl=ttl,
             **kwargs,
         )
         result = await ref.load()
@@ -407,6 +409,7 @@ async def _submit(request: Request) -> JSONResponse:
     retries = data.get("retries", 0)
     force = data.get("force", False)
     timeout = data.get("timeout")
+    ttl = data.get("ttl")
 
     start = time.perf_counter()
 
@@ -420,6 +423,7 @@ async def _submit(request: Request) -> JSONResponse:
                 _retries=retries,
                 _force=force,
                 _timeout=timeout,
+                _ttl=ttl,
                 **kwargs,
             )
             result = ref.load()

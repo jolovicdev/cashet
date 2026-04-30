@@ -13,7 +13,8 @@ from cashet.protocols import AsyncStore
 
 BatchKey = int | str
 NormalizedTask = tuple[
-    Any, tuple[Any, ...], dict[str, Any], bool, dict[str, str], int, bool, timedelta | None
+    Any, tuple[Any, ...], dict[str, Any], bool, dict[str, str], int, bool,
+    timedelta | None, timedelta | None,
 ]
 
 logger = logging.getLogger("cashet")
@@ -35,6 +36,7 @@ def normalize_tasks(
     default_retries: int | None = None,
     default_force: bool | None = None,
     default_timeout: int | float | None = None,
+    default_ttl: int | float | None = None,
 ) -> list[NormalizedTask]:
     normalized: list[NormalizedTask] = []
     for i, task in enumerate(raw_tasks):
@@ -59,15 +61,16 @@ def normalize_tasks(
             raise TypeError(f"Task {i}: expected args as tuple, got {type(args).__name__}")
         if not isinstance(kwargs, dict):
             raise TypeError(f"Task {i}: expected kwargs as dict, got {type(kwargs).__name__}")
-        raw_func, cache, tags, retries, force, timeout = resolve_task_config(
+        raw_func, cache, tags, retries, force, timeout, ttl = resolve_task_config(
             func,
             default_cache,
             default_tags,
             default_retries,
             default_force,
             default_timeout,
+            default_ttl,
         )
-        normalized.append((raw_func, args, kwargs, cache, tags, retries, force, timeout))
+        normalized.append((raw_func, args, kwargs, cache, tags, retries, force, timeout, ttl))
     return normalized
 
 
@@ -79,7 +82,7 @@ def build_deps(
     deps: dict[BatchKey, set[BatchKey]] = {k: set() for k in keys}
     task_refs: dict[BatchKey, list[tuple[str, Any, BatchKey]]] = {}
     for key, item in zip(keys, normalized, strict=True):
-        _func, args, kwargs, _cache, _tags, _retries, _force, _timeout = item
+        _func, args, kwargs, _cache, _tags, _retries, _force, _timeout, _ttl = item
         for j, arg in enumerate(args):
             if isinstance(arg, TaskRef):
                 deps[key].add(arg.key)
@@ -174,7 +177,7 @@ async def execute_batch(
     _validate_max_workers(max_workers)
 
     async def _run_single(key: BatchKey) -> AsyncResultRef[Any]:
-        func, args, kwargs, cache, tags, retries, force, timeout = normalized[pos[key]]
+        func, args, kwargs, cache, tags, retries, force, timeout, ttl = normalized[pos[key]]
         logger.debug(
             "batch task started key=%s func=%s",
             key,
@@ -192,6 +195,7 @@ async def execute_batch(
             retries=retries,
             force=force,
             timeout=timeout,
+            ttl=ttl,
         )
         commit, _was_cached = await executor.submit(
             func, hash_args, hash_kwargs, task_def, store, serializer

@@ -435,6 +435,7 @@ def build_task_def(
     retries: int = 0,
     force: bool = False,
     timeout: timedelta | None = None,
+    ttl: timedelta | None = None,
 ) -> TaskDef:
     func_hash = hash_function(func)
     args_hash_val = hash_args(*args, **kwargs)
@@ -453,4 +454,5 @@ def build_task_def(
         retries=retries,
         force=force,
         timeout=timeout,
+        ttl=ttl,
     )

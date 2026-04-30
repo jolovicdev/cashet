@@ -96,10 +96,11 @@ class Client:
         retries: int = 0,
         force: bool = False,
         timeout: int | float | None = None,
+        ttl: int | float | None = None,
     ) -> Callable[..., Any]:
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             task_name = name or fn.__qualname__
-            set_task_metadata(fn, task_name, cache, tags, retries, force, timeout)
+            set_task_metadata(fn, task_name, cache, tags, retries, force, timeout, ttl)
             self._registered_tasks[task_name] = fn
 
             @wraps(fn)
@@ -107,7 +108,7 @@ class Client:
                 return self.submit(fn, *args, **kwargs)
 
             wrapper._cashet_wrapped_func = fn  # pyright: ignore[reportAttributeAccessIssue]
-            set_task_metadata(wrapper, task_name, cache, tags, retries, force, timeout)
+            set_task_metadata(wrapper, task_name, cache, tags, retries, force, timeout, ttl)
             return wrapper
 
         if func is not None:
@@ -123,6 +124,7 @@ class Client:
         _retries: int | None = None,
         _force: bool | None = None,
         _timeout: int | float | None = None,
+        _ttl: int | float | None = None,
         **kwargs: Any,
     ) -> ResultRef[T]:
         async_ref = self._runner.call(
@@ -134,6 +136,7 @@ class Client:
                 _retries=_retries,
                 _force=_force,
                 _timeout=_timeout,
+                _ttl=_ttl,
                 **kwargs,
             )
         )
@@ -153,6 +156,7 @@ class Client:
         _retries: int | None = None,
         _force: bool | None = None,
         _timeout: int | float | None = None,
+        _ttl: int | float | None = None,
         max_workers: int | None = None,
     ) -> list[ResultRef[Any]]: ...
 
@@ -171,6 +175,7 @@ class Client:
         _retries: int | None = None,
         _force: bool | None = None,
         _timeout: int | float | None = None,
+        _ttl: int | float | None = None,
         max_workers: int | None = None,
     ) -> dict[str, ResultRef[Any]]: ...
 
@@ -183,6 +188,7 @@ class Client:
         _retries: int | None = None,
         _force: bool | None = None,
         _timeout: int | float | None = None,
+        _ttl: int | float | None = None,
         max_workers: int | None = None,
     ) -> list[ResultRef[Any]] | dict[str, ResultRef[Any]]:
         is_dict = isinstance(tasks, dict)
@@ -192,7 +198,7 @@ class Client:
             keys, raw_tasks = unpack_list_tasks(tasks)
 
         key_set = set(keys)
-        normalized = normalize_tasks(raw_tasks, _cache, _tags, _retries, _force, _timeout)
+        normalized = normalize_tasks(raw_tasks, _cache, _tags, _retries, _force, _timeout, _ttl)
         deps, _task_refs = build_deps(keys, normalized, key_set)
         _order = topological_sort(deps)
         workers = max_workers if max_workers is not None else self._max_workers
@@ -205,6 +211,7 @@ class Client:
                 _retries=_retries,
                 _force=_force,
                 _timeout=_timeout,
+                _ttl=_ttl,
                 max_workers=workers,
             )
         )
@@ -243,6 +250,9 @@ class Client:
     def rm(self, hash: str) -> bool:
         return self._runner.call(self._async_client.rm(hash))
 
+    def invalidate(self, tags: dict[str, str | None]) -> int:
+        return self._runner.call(self._async_client.invalidate(tags))
+
     def gc(self, older_than: timedelta | None = None, max_size_bytes: int | None = None) -> int:
         return self._runner.call(self._async_client.gc(older_than, max_size_bytes))
 
@@ -259,6 +269,7 @@ class Client:
         _retries: int | None = None,
         _force: bool | None = None,
         _timeout: int | float | None = None,
+        _ttl: int | float | None = None,
         max_workers: int | None = None,
         **kwargs: Any,
     ) -> list[ResultRef[T]]:
@@ -272,6 +283,7 @@ class Client:
                 _retries=_retries,
                 _force=_force,
                 _timeout=_timeout,
+                _ttl=_ttl,
                 max_workers=max_workers,
                 **kwargs,
             )

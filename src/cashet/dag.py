@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+from datetime import UTC, datetime
 from typing import Any, Generic, TypeVar
 
 from cashet.hashing import Serializer
@@ -30,7 +31,13 @@ def resolve_input_refs(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Ob
 
 class AsyncResultRef(Generic[T]):
     __slots__ = (
-        "_commit_hash", "_load_lock", "_loaded", "_ref", "_serializer", "_store", "_value"
+        "_commit_hash",
+        "_load_lock",
+        "_loaded",
+        "_ref",
+        "_serializer",
+        "_store",
+        "_value",
     )
 
     def __init__(
@@ -166,6 +173,9 @@ def build_commit(
     if not task_def.cache or task_def.force:
         salt = f"{time.time_ns()}"
     commit_hash = compute_commit_hash(task_def, input_refs, salt=salt)
+    expires_at = None
+    if task_def.ttl is not None:
+        expires_at = datetime.now(UTC) + task_def.ttl
     return Commit(
         hash=commit_hash,
         task_def=task_def,
@@ -173,4 +183,5 @@ def build_commit(
         parent_hash=parent_hash,
         status=TaskStatus.PENDING,
         tags=task_def.tags,
+        expires_at=expires_at,
     )
