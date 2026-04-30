@@ -40,9 +40,10 @@ def _commit_key(hash: str) -> str:
     return f"cashet:commit:{hash}"
 
 
-# Guard against Redis glob patterns (*, ?) being passed as hash arguments.
-def _is_hash_prefix(hash: str) -> bool:
-    return 0 < len(hash) <= 64 and all(c in "0123456789abcdefABCDEF" for c in hash)
+def _normalize_hash_prefix(hash: str) -> str | None:
+    if 0 < len(hash) <= 64 and all(c in "0123456789abcdefABCDEF" for c in hash):
+        return hash.lower()
+    return None
 
 
 def _blob_key(hash: str) -> str:
@@ -340,8 +341,10 @@ class AsyncRedisStore:
                     continue
 
     async def get_commit(self, hash: str) -> Commit | None:
-        if not _is_hash_prefix(hash):
+        normalized = _normalize_hash_prefix(hash)
+        if normalized is None:
             return None
+        hash = normalized
         if len(hash) < 64:
             matches: list[str] = []
             async for key in self._redis.scan_iter(match=_commit_key(hash) + "*", count=100):
@@ -412,8 +415,10 @@ class AsyncRedisStore:
         return commits
 
     async def get_history(self, hash: str) -> list[Commit]:
-        if not _is_hash_prefix(hash):
+        normalized = _normalize_hash_prefix(hash)
+        if normalized is None:
             return []
+        hash = normalized
         commit = await self.get_commit(hash)
         if commit is None:
             return []
@@ -547,8 +552,10 @@ class AsyncRedisStore:
         return deleted
 
     async def delete_commit(self, hash: str) -> bool:
-        if not _is_hash_prefix(hash):
+        normalized = _normalize_hash_prefix(hash)
+        if normalized is None:
             return False
+        hash = normalized
         if await self._blob_stats_ready():
             return await self._delete_commit(hash)
         async with self._blob_stats_lock():

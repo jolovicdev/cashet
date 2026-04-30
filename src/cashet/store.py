@@ -21,9 +21,10 @@ _INLINE_THRESHOLD = 1024
 logger = logging.getLogger("cashet")
 
 
-# Guard against accidental wildcard matches when user passes invalid characters.
-def _is_hash_prefix(hash: str) -> bool:
-    return 0 < len(hash) <= 64 and all(c in "0123456789abcdefABCDEF" for c in hash)
+def _normalize_hash_prefix(hash: str) -> str | None:
+    if 0 < len(hash) <= 64 and all(c in "0123456789abcdefABCDEF" for c in hash):
+        return hash.lower()
+    return None
 
 
 @dataclass
@@ -359,8 +360,10 @@ class _SQLiteStoreCore:
         return self._row_to_commit(row)
 
     def get_commit(self, hash: str) -> Commit | None:
-        if not _is_hash_prefix(hash):
+        normalized = _normalize_hash_prefix(hash)
+        if normalized is None:
             return None
+        hash = normalized
         conn = self._connect()
         if len(hash) < 64:
             rows = conn.execute(
@@ -410,8 +413,10 @@ class _SQLiteStoreCore:
         return [self._row_to_commit(r) for r in rows]
 
     def get_history(self, hash: str) -> list[Commit]:
-        if not _is_hash_prefix(hash):
+        normalized = _normalize_hash_prefix(hash)
+        if normalized is None:
             return []
+        hash = normalized
         conn = self._connect()
         if len(hash) < 64:
             rows = conn.execute(
@@ -634,8 +639,10 @@ class _SQLiteStoreCore:
         return True, orphans
 
     def delete_commit(self, hash: str) -> bool:
-        if not _is_hash_prefix(hash):
+        normalized = _normalize_hash_prefix(hash)
+        if normalized is None:
             return False
+        hash = normalized
         conn = self._connect(immediate=True)
         try:
             success, orphans = self._delete_commit_body(conn, hash)
