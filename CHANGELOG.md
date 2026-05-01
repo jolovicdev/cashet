@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.2 (unreleased)
+## 0.4.2 — 1.5.2026.
 
 ### Performance
 - `delete_by_tags` in SQLite batches all matching rows into a single DELETE with one
