@@ -73,3 +73,4 @@ HTTP server: `client.serve(host, port, require_token=None)` exposes endpoints ov
 - Never modify `uv.lock` manually — use `uv` commands
 - PyPI-ready package with proper metadata and classifiers
 - Import name is `cashet`, CLI entry point is `cashet`
+- Update CHANGELOG.md before tagging a release.
