@@ -62,6 +62,14 @@ def _status_key(status: str) -> str:
     return f"cashet:index:status:{status}"
 
 
+def _tag_key(key: str) -> str:
+    return f"cashet:tag:{key}"
+
+
+def _tag_value_key(key: str, value: str) -> str:
+    return f"cashet:tag:{key}:{value}"
+
+
 def _access_key() -> str:
     return "cashet:index:last_accessed"
 
@@ -234,13 +242,17 @@ def _index_commit_commands(pipe: Any, commit: Commit) -> None:
     pipe.set(_commit_key(commit.hash), _encode_commit(commit))
     ts = commit.created_at.timestamp()
     pipe.zadd("cashet:index:all", {commit.hash: ts})
-    pipe.zadd(_fp_key(commit.fingerprint), {commit.hash: ts})
+    expires_ts = commit.expires_at.timestamp() if commit.expires_at else float("inf")
+    pipe.zadd(_fp_key(commit.fingerprint), {commit.hash: expires_ts})
     pipe.zadd(_func_key(commit.task_def.func_name), {commit.hash: ts})
     now_ts = datetime.now(UTC).timestamp()
     pipe.zadd(_access_key(), {commit.hash: now_ts})
     for status in TaskStatus:
         pipe.srem(_status_key(status.value), commit.hash)
     pipe.sadd(_status_key(commit.status.value), commit.hash)
+    for key, val in commit.tags.items():
+        pipe.sadd(_tag_key(key), commit.hash)
+        pipe.sadd(_tag_value_key(key, val), commit.hash)
 
 
 def _remove_commit_index_commands(pipe: Any, commit: Commit, resolved_hash: str) -> None:
@@ -251,6 +263,9 @@ def _remove_commit_index_commands(pipe: Any, commit: Commit, resolved_hash: str)
     pipe.zrem(_access_key(), resolved_hash)
     for status in TaskStatus:
         pipe.srem(_status_key(status.value), resolved_hash)
+    for key, val in commit.tags.items():
+        pipe.srem(_tag_key(key), resolved_hash)
+        pipe.srem(_tag_value_key(key, val), resolved_hash)
 
 
 def _commit_hash_from_key(raw: Any) -> str:
@@ -367,14 +382,14 @@ class AsyncRedisStore:
         return _decode_commit(data)
 
     async def find_by_fingerprint(self, fingerprint: str) -> Commit | None:
-        hashes = await self._redis.zrevrange(_fp_key(fingerprint), 0, -1)
-        now = datetime.now(UTC)
+        now_ts = datetime.now(UTC).timestamp()
+        hashes = await self._redis.zrevrangebyscore(
+            _fp_key(fingerprint), max="+inf", min=f"({now_ts}"
+        )
         for h in hashes:
             h_str = h.decode() if isinstance(h, bytes) else h
             commit = await self.get_commit(h_str)
             if commit is not None and commit.status in (TaskStatus.COMPLETED, TaskStatus.CACHED):
-                if commit.expires_at is not None and commit.expires_at <= now:
-                    continue
                 await self._touch_commit(h_str)
                 return commit
         return None
@@ -562,20 +577,27 @@ class AsyncRedisStore:
             return await self._delete_commit(hash)
 
     async def delete_by_tags(self, tags: dict[str, str | None]) -> int:
-        hashes = await self._redis.zrevrange("cashet:index:all", 0, -1)
+        set_keys: list[str] = []
+        for key, val in tags.items():
+            set_keys.append(_tag_key(key) if val is None else _tag_value_key(key, val))
+        if len(set_keys) == 1:
+            hashes = await self._redis.smembers(set_keys[0])
+        else:
+            hashes = await self._redis.sinter(set_keys)
         deleted = 0
         for h in hashes:
             h_str = h.decode() if isinstance(h, bytes) else h
-            commit = await self.get_commit(h_str)
-            if (
-                commit is not None
-                and _matches_tags(commit, tags)
-                and await self._delete_commit_obj(commit)
-            ):
+            if await self._delete_commit_obj_by_hash(h_str):
                 deleted += 1
         return deleted
 
     async def _delete_commit(self, hash: str) -> bool:
+        commit = await self.get_commit(hash)
+        if commit is None:
+            return False
+        return await self._delete_commit_obj(commit)
+
+    async def _delete_commit_obj_by_hash(self, hash: str) -> bool:
         commit = await self.get_commit(hash)
         if commit is None:
             return False
