@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.3 — 1.5.2026.
+
+### Fixed
+- Add `freezegun` to dev dependencies so TTL/GC tests don't fail with
+  `ModuleNotFoundError` on fresh installs or CI.
+- Restore `expires_at <= now` race guard in Redis `find_by_fingerprint` after
+  the `ZREVRANGEBYSCORE` pushdown — a commit can expire between the server-side
+  filter and the `get_commit` call.
+
 ## 0.4.2 — 1.5.2026.
 
 ### Performance
