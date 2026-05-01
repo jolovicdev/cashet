@@ -665,7 +665,7 @@ class _SQLiteStoreCore:
 
     def delete_by_tags(self, tags: dict[str, str | None]) -> int:
         conn = self._connect(immediate=True)
-        query = "SELECT hash FROM commits WHERE 1=1"
+        query = "SELECT hash, output_hash, input_refs FROM commits WHERE 1=1"
         params: list[Any] = []
         for key, val in tags.items():
             if val is None:
@@ -676,23 +676,34 @@ class _SQLiteStoreCore:
                 params.append(f"$.{key}")
                 params.append(val)
         rows = conn.execute(query, params).fetchall()
-        deleted = 0
-        all_orphans: list[str] = []
+        if not rows:
+            conn.execute("ROLLBACK")
+            return 0
+        hashes = [r[0] for r in rows]
+        candidates: set[str] = set()
+        for r in rows:
+            if r[1]:
+                candidates.add(r[1])
+            if r[2]:
+                for h in json.loads(r[2]):
+                    candidates.add(h)
         try:
-            for row in rows:
-                success, orphans = self._delete_commit_body(conn, row[0])
-                if success:
-                    deleted += 1
-                    all_orphans.extend(orphans)
+            placeholders = ", ".join("?" for _ in hashes)
+            conn.execute(
+                f"UPDATE commits SET parent_hash = NULL WHERE parent_hash IN ({placeholders})",
+                hashes,
+            )
+            conn.execute(
+                f"DELETE FROM commits WHERE hash IN ({placeholders})", hashes
+            )
+            deleted = len(hashes)
+            all_orphans = self._find_orphan_objects(conn, candidates) if candidates else []
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
         if all_orphans:
-            logger.info(
-                "orphan objects cleaned count=%d",
-                len(all_orphans),
-            )
+            logger.info("orphan objects cleaned count=%d", len(all_orphans))
             self._delete_orphan_objects(conn, all_orphans)
         return deleted
 

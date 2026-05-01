@@ -276,6 +276,23 @@ def rm_cmd(hash: str) -> None:
         raise SystemExit(1)
 
 
+@main.command("invalidate")
+@click.option("--tag", "-t", "tags", multiple=True, required=True, help="Tag key=value or key")
+def invalidate_cmd(tags: tuple[str, ...]) -> None:
+    """Delete all commits matching tag criteria"""
+    client = _client()
+    parsed = _parse_tags(tags)
+    if parsed is None:
+        console.print("[red]At least one --tag is required.[/red]")
+        raise SystemExit(1)
+    try:
+        deleted = client.invalidate(parsed)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1) from None
+    console.print(f"[green]Invalidated {deleted} commit(s).[/green]")
+
+
 def _parse_size(size_str: str) -> int:
     size_str = size_str.strip().upper()
     units = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}

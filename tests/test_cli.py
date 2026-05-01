@@ -349,3 +349,46 @@ class TestExportImport:
 
         client2 = Client(store_dir=store_dir2)
         assert client2.get(ref.commit_hash) == 3
+
+
+class TestInvalidate:
+    def test_invalidate_deletes_matching(self, cli_runner: CliRunner, store_dir: Path) -> None:
+        client = Client(store_dir=store_dir)
+
+        def val() -> int:
+            return 1
+
+        client.submit(val, _tags={"env": "test"})
+        result = _invoke(cli_runner, ["invalidate", "-t", "env=test"], store_dir)
+        assert result.exit_code == 0
+        assert "Invalidated 1 commit(s)" in result.output
+
+    def test_invalidate_bare_key(self, cli_runner: CliRunner, store_dir: Path) -> None:
+        client = Client(store_dir=store_dir)
+
+        def val_a() -> int:
+            return 1
+
+        def val_b() -> int:
+            return 2
+
+        client.submit(val_a, _tags={"env": "prod"})
+        client.submit(val_b, _tags={"env": "staging"})
+        result = _invoke(cli_runner, ["invalidate", "-t", "env"], store_dir)
+        assert result.exit_code == 0
+        assert "Invalidated 2 commit(s)" in result.output
+
+    def test_invalidate_no_match(self, cli_runner: CliRunner, store_dir: Path) -> None:
+        client = Client(store_dir=store_dir)
+
+        def val() -> int:
+            return 1
+
+        client.submit(val, _tags={"env": "prod"})
+        result = _invoke(cli_runner, ["invalidate", "-t", "env=staging"], store_dir)
+        assert result.exit_code == 0
+        assert "Invalidated 0 commit(s)" in result.output
+
+    def test_invalidate_requires_tag(self, cli_runner: CliRunner, store_dir: Path) -> None:
+        result = _invoke(cli_runner, ["invalidate"], store_dir)
+        assert result.exit_code != 0

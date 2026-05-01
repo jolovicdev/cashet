@@ -560,3 +560,75 @@ class TestRedisStoreWithClient:
 
         assert call_count == 1
         assert len({r.hash for r in refs}) == 1
+
+    def test_delete_by_tags_exact_match(self, redis_store: RedisStore) -> None:
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+            tags={"env": "test"},
+        )
+        commit = Commit(
+            hash="d" * 64, task_def=task_def, tags={"env": "test"}, status=TaskStatus.COMPLETED
+        )
+        redis_store.put_commit(commit)
+        assert redis_store.get_commit("d" * 64) is not None
+
+        deleted = redis_store.delete_by_tags({"env": "test"})
+        assert deleted == 1
+        assert redis_store.get_commit("d" * 64) is None
+
+    def test_delete_by_tags_bare_key(self, redis_store: RedisStore) -> None:
+        for i, env in enumerate(["prod", "staging"]):
+            task_def = TaskDef(
+                func_hash=f"{i:064d}",
+                func_name="f",
+                func_source="def f(): pass",
+                args_hash="b" * 64,
+                args_snapshot=b"",
+                tags={"env": env},
+            )
+            commit = Commit(
+                hash=f"{i:064d}", task_def=task_def, tags={"env": env},
+                status=TaskStatus.COMPLETED,
+            )
+            redis_store.put_commit(commit)
+
+        deleted = redis_store.delete_by_tags({"env": None})
+        assert deleted == 2
+
+    def test_delete_by_tags_multi_condition(self, redis_store: RedisStore) -> None:
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+            tags={"env": "prod", "model": "v2"},
+        )
+        commit = Commit(
+            hash="e" * 64, task_def=task_def, tags={"env": "prod", "model": "v2"},
+            status=TaskStatus.COMPLETED,
+        )
+        redis_store.put_commit(commit)
+
+        tag_unmatched = TaskDef(
+            func_hash="c" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="d" * 64,
+            args_snapshot=b"",
+            tags={"env": "prod", "model": "v1"},
+        )
+        commit2 = Commit(
+            hash="f" * 64, task_def=tag_unmatched, tags={"env": "prod", "model": "v1"},
+            status=TaskStatus.COMPLETED,
+        )
+        redis_store.put_commit(commit2)
+
+        deleted = redis_store.delete_by_tags({"env": "prod", "model": "v2"})
+        assert deleted == 1
+        assert redis_store.get_commit("e" * 64) is None
+        assert redis_store.get_commit("f" * 64) is not None

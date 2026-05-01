@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.2 — 1.5.2026.
+
+### Performance
+- `delete_by_tags` in SQLite batches all matching rows into a single DELETE with one
+  orphan-detection pass instead of row-by-row `_delete_commit_body` calls.
+- `delete_by_tags` in Redis uses tag-set indexes (`cashet:tag:{key}`,
+  `cashet:tag:{key}:{value}`) with SINTER instead of a full `zrevrange(all)` scan.
+- `find_by_fingerprint` in Redis pushes TTL filtering server-side via
+  `ZREVRANGEBYSCORE` using `expires_at` timestamp as the sorted-set score.
+
+### Added
+- `cashet invalidate -t key=value` / `-t key` CLI command.
+
+### Fixed
+- Deterministic TTL and GC tests using `freezegun` instead of `time.sleep`.
+
 ## 0.4.1 — 1.5.2026.
 
 ### Fixed
