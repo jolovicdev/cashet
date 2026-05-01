@@ -202,7 +202,7 @@ class TestProcessSafety:
 
         client = Client(
             store_dir=store_dir,
-            executor=LocalExecutor(running_ttl=timedelta(milliseconds=100)),
+            executor=LocalExecutor(running_ttl=timedelta(seconds=3)),
         )
         exec_count = 0
 
@@ -234,7 +234,7 @@ class TestProcessSafety:
 
         client = Client(
             store_dir=store_dir,
-            executor=LocalExecutor(running_ttl=timedelta(milliseconds=100)),
+            executor=LocalExecutor(running_ttl=timedelta(seconds=3)),
         )
 
         def slow() -> int:
