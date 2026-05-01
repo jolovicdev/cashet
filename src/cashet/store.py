@@ -21,9 +21,10 @@ _INLINE_THRESHOLD = 1024
 logger = logging.getLogger("cashet")
 
 
-# Guard against accidental wildcard matches when user passes invalid characters.
-def _is_hash_prefix(hash: str) -> bool:
-    return 0 < len(hash) <= 64 and all(c in "0123456789abcdefABCDEF" for c in hash)
+def _normalize_hash_prefix(hash: str) -> str | None:
+    if 0 < len(hash) <= 64 and all(c in "0123456789abcdefABCDEF" for c in hash):
+        return hash.lower()
+    return None
 
 
 @dataclass
@@ -123,9 +124,6 @@ class _SQLiteStoreCore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fingerprint ON commits(fingerprint)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_func_name ON commits(func_name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON commits(created_at)")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_last_accessed_at ON commits(last_accessed_at)"
-        )
         self._migrate_last_accessed_at(conn)
         self._migrate_retries(conn)
         self._migrate_task_options(conn)
@@ -148,6 +146,9 @@ class _SQLiteStoreCore:
             conn.execute(
                 "UPDATE commits SET last_accessed_at = created_at WHERE last_accessed_at IS NULL"
             )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_last_accessed_at ON commits(last_accessed_at)"
+        )
 
     def _migrate_retries(self, conn: sqlite3.Connection) -> None:
         col_names = [r[1] for r in conn.execute("PRAGMA table_info(commits)").fetchall()]
@@ -328,23 +329,23 @@ class _SQLiteStoreCore:
 
     def find_by_fingerprint(self, fingerprint: str) -> Commit | None:
         conn = self._connect()
-        cursor = conn.execute(
+        now = datetime.now(UTC)
+        now_iso = now.isoformat()
+        row = conn.execute(
             """SELECT * FROM commits
                WHERE fingerprint = ? AND status IN ('completed', 'cached')
-               ORDER BY created_at DESC""",
-            (fingerprint,),
+               AND (expires_at IS NULL OR expires_at > ?)
+               ORDER BY created_at DESC
+               LIMIT 1""",
+            (fingerprint, now_iso),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            "UPDATE commits SET last_accessed_at = ? WHERE hash = ?",
+            (now_iso, row["hash"]),
         )
-        now = datetime.now(UTC)
-        for row in cursor:
-            commit = self._row_to_commit(row)
-            if commit.expires_at is not None and commit.expires_at <= now:
-                continue
-            conn.execute(
-                "UPDATE commits SET last_accessed_at = ? WHERE hash = ?",
-                (now.isoformat(), row["hash"]),
-            )
-            return commit
-        return None
+        return self._row_to_commit(row)
 
     def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
         conn = self._connect()
@@ -359,8 +360,10 @@ class _SQLiteStoreCore:
         return self._row_to_commit(row)
 
     def get_commit(self, hash: str) -> Commit | None:
-        if not _is_hash_prefix(hash):
+        normalized = _normalize_hash_prefix(hash)
+        if normalized is None:
             return None
+        hash = normalized
         conn = self._connect()
         if len(hash) < 64:
             rows = conn.execute(
@@ -410,8 +413,10 @@ class _SQLiteStoreCore:
         return [self._row_to_commit(r) for r in rows]
 
     def get_history(self, hash: str) -> list[Commit]:
-        if not _is_hash_prefix(hash):
+        normalized = _normalize_hash_prefix(hash)
+        if normalized is None:
             return []
+        hash = normalized
         conn = self._connect()
         if len(hash) < 64:
             rows = conn.execute(
@@ -634,8 +639,10 @@ class _SQLiteStoreCore:
         return True, orphans
 
     def delete_commit(self, hash: str) -> bool:
-        if not _is_hash_prefix(hash):
+        normalized = _normalize_hash_prefix(hash)
+        if normalized is None:
             return False
+        hash = normalized
         conn = self._connect(immediate=True)
         try:
             success, orphans = self._delete_commit_body(conn, hash)
