@@ -390,6 +390,8 @@ class AsyncRedisStore:
             h_str = h.decode() if isinstance(h, bytes) else h
             commit = await self.get_commit(h_str)
             if commit is not None and commit.status in (TaskStatus.COMPLETED, TaskStatus.CACHED):
+                if commit.expires_at is not None and commit.expires_at <= datetime.now(UTC):
+                    continue
                 await self._touch_commit(h_str)
                 return commit
         return None
