@@ -716,7 +716,7 @@ class TestGarbageCollection:
         assert client.stats()["total_commits"] == 0
 
     def test_gc_exact_orphan_detection(self, client: Client) -> None:
-        import time
+        from freezegun import freeze_time
 
         def produce() -> bytes:
             return b"keep_me"
@@ -724,16 +724,17 @@ class TestGarbageCollection:
         def consume(data: bytes) -> bytes:
             return data + b"_consumed"
 
-        ref1 = client.submit(produce)
-        time.sleep(1.1)
-        client.submit(consume, ref1)
-        assert client.stats()["total_commits"] == 2
-        assert client.stats()["stored_objects"] >= 1
+        with freeze_time("2026-01-01 00:00:00") as frozen:
+            ref1 = client.submit(produce)
+            frozen.tick(1.1)
+            client.submit(consume, ref1)
+            assert client.stats()["total_commits"] == 2
+            assert client.stats()["stored_objects"] >= 1
 
-        cutoff = datetime.now(UTC) - timedelta(seconds=0.5)
-        client.store.evict(cutoff)
-        assert client.stats()["total_commits"] == 1
-        assert client.stats()["stored_objects"] >= 1
+            cutoff = datetime.now(UTC) - timedelta(seconds=0.5)
+            client.store.evict(cutoff)
+            assert client.stats()["total_commits"] == 1
+            assert client.stats()["stored_objects"] >= 1
 
     def test_client_close(self, store_dir: Path) -> None:
         client = Client(store_dir=store_dir)
@@ -1113,6 +1114,8 @@ class TestTTL:
         assert commit.task_def.ttl == timedelta(seconds=3600)
 
     def test_ttl_expiration_causes_reexecution(self, client: Client) -> None:
+        from freezegun import freeze_time
+
         call_count = 0
 
         def val() -> int:
@@ -1120,21 +1123,18 @@ class TestTTL:
             call_count += 1
             return call_count
 
-        ref1 = client.submit(val, _ttl=0.05)
-        assert ref1.load() == 1
+        with freeze_time("2026-01-01 00:00:00") as frozen:
+            ref1 = client.submit(val, _ttl=0.05)
+            assert ref1.load() == 1
 
-        # Should still be cached immediately
-        ref2 = client.submit(val, _ttl=0.05)
-        assert ref2.load() == 1
-        assert ref1.commit_hash == ref2.commit_hash
+            ref2 = client.submit(val, _ttl=0.05)
+            assert ref2.load() == 1
+            assert ref1.commit_hash == ref2.commit_hash
 
-        # Wait for TTL to expire
-        import time
+            frozen.tick(0.1)
 
-        time.sleep(0.1)
-
-        ref3 = client.submit(val, _ttl=0.05)
-        assert ref3.load() == 2
+            ref3 = client.submit(val, _ttl=0.05)
+            assert ref3.load() == 2
 
     def test_ttl_on_task_decorator(self, client: Client) -> None:
         @client.task(ttl=3600)
@@ -1187,6 +1187,8 @@ class TestTTL:
             assert commit.expires_at is not None
 
     def test_ttl_on_submit_many_causes_reexecution(self, client: Client) -> None:
+        from freezegun import freeze_time
+
         call_count = 0
 
         def val_a() -> int:
@@ -1199,18 +1201,17 @@ class TestTTL:
             call_count += 1
             return call_count
 
-        refs1 = client.submit_many([val_a, val_b], _ttl=0.05)
-        assert [r.load() for r in refs1] == [1, 2]
+        with freeze_time("2026-01-01 00:00:00") as frozen:
+            refs1 = client.submit_many([val_a, val_b], _ttl=0.05)
+            assert [r.load() for r in refs1] == [1, 2]
 
-        refs2 = client.submit_many([val_a, val_b], _ttl=0.05)
-        assert [r.load() for r in refs2] == [1, 2]
+            refs2 = client.submit_many([val_a, val_b], _ttl=0.05)
+            assert [r.load() for r in refs2] == [1, 2]
 
-        import time
+            frozen.tick(0.1)
 
-        time.sleep(0.1)
-
-        refs3 = client.submit_many([val_a, val_b], _ttl=0.05)
-        assert [r.load() for r in refs3] == [3, 4]
+            refs3 = client.submit_many([val_a, val_b], _ttl=0.05)
+            assert [r.load() for r in refs3] == [3, 4]
 
 
 class TestTagInvalidation:
