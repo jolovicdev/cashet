@@ -321,8 +321,8 @@ class _SQLiteStoreCore:
                 commit.error,
                 json.dumps(commit.tags),
                 commit.created_at.isoformat(),
-                commit.claimed_at.isoformat(),
                 accessed_at,
+                commit.claimed_at.isoformat(),
                 commit.expires_at.isoformat() if commit.expires_at else None,
             ),
         )
