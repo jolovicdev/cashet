@@ -299,6 +299,27 @@ class TestProcessSafety:
         with pytest.raises(TaskError, match="TimeoutError"):
             client.submit(slow, _timeout=0.01)
 
+    def test_old_created_at_trumps_recent_claimed_at(self, store_dir: Path) -> None:
+        import cashet.dag as dag
+        import cashet.hashing as hashing
+        from cashet.models import TaskStatus
+
+        client = Client(store_dir=store_dir)
+
+        def work() -> int:
+            return 42
+
+        task_def = hashing.build_task_def(work, (), {})
+        input_refs = dag.resolve_input_refs((), {})
+        commit = dag.build_commit(task_def, input_refs)
+        commit.status = TaskStatus.RUNNING
+        commit.created_at = datetime.now(UTC) - timedelta(seconds=400)
+        commit.claimed_at = datetime.now(UTC) - timedelta(seconds=5)
+        client.store.put_commit(commit)
+
+        ref = client.submit(work)
+        assert ref.load() == 42
+
     def test_running_claim_lookup_is_not_limited_to_1000_rows(self, store_dir: Path) -> None:
         import cashet.dag as dag
         import cashet.hashing as hashing

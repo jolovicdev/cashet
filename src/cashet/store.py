@@ -352,7 +352,7 @@ class _SQLiteStoreCore:
         row = conn.execute(
             """SELECT * FROM commits
                WHERE fingerprint = ? AND status = 'running'
-               ORDER BY claimed_at DESC LIMIT 1""",
+               ORDER BY created_at DESC LIMIT 1""",
             (fingerprint,),
         ).fetchone()
         if row is None:

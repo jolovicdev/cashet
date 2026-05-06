@@ -62,6 +62,9 @@ class Commit:
     output_ref: ObjectRef | None = None
     parent_hash: str | None = None
     status: TaskStatus = TaskStatus.PENDING
+    # created_at is the canonical anchor for task lifetime; it never changes
+    # and is used for stale-claim detection so that pending tasks cannot hide
+    # behind a recent heartbeat.
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     claimed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     error: str | None = None

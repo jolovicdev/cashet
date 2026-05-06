@@ -46,7 +46,9 @@ async def _async_store_lock(
 
 
 def _is_stale_claim(commit: Commit, ttl: timedelta) -> bool:
-    return datetime.now(UTC) - commit.claimed_at > ttl
+    # Use created_at so that long-pending tasks (created but never successfully
+    # claimed) are still eligible for reclaim, rather than being stuck forever.
+    return datetime.now(UTC) - commit.created_at > ttl
 
 
 class AsyncLocalExecutor:
