@@ -66,6 +66,8 @@ class Commit:
     claimed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     error: str | None = None
     tags: dict[str, str] = field(default_factory=dict[str, str])
+    # Set once at creation; reclaimed stale claims keep the original
+    # window so that callers can rely on a stable expiration horizon.
     expires_at: datetime | None = None
 
     @property

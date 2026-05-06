@@ -108,9 +108,8 @@ class AsyncLocalExecutor:
                         claim.task_def.ttl = task_def.ttl
                         claim.task_def.tags = task_def.tags
                         claim.tags = task_def.tags
-                        claim.expires_at = (
-                            datetime.now(UTC) + task_def.ttl if task_def.ttl else None
-                        )
+                        # Preserve original expires_at; TTL extension on reclaim
+                        # would unexpectedly shift the expiration window.
                         await store.put_commit(claim)
                         break
                 else:

@@ -299,6 +299,31 @@ class TestProcessSafety:
         with pytest.raises(TaskError, match="TimeoutError"):
             client.submit(slow, _timeout=0.01)
 
+    def test_reclaimed_stale_claim_keeps_original_expires_at(self, store_dir: Path) -> None:
+        import cashet.dag as dag
+        import cashet.hashing as hashing
+        from cashet.models import TaskStatus
+
+        client = Client(store_dir=store_dir)
+
+        def compute() -> int:
+            return 42
+
+        task_def = hashing.build_task_def(compute, (), {}, cache=True)
+        input_refs = dag.resolve_input_refs((), {})
+        commit = dag.build_commit(task_def, input_refs)
+        commit.status = TaskStatus.RUNNING
+        commit.created_at = datetime.now(UTC) - timedelta(seconds=400)
+        commit.claimed_at = datetime.now(UTC) - timedelta(seconds=400)
+        client.store.put_commit(commit)
+
+        ref = client.submit(compute)
+        assert ref.load() == 42
+
+        log = client.log()
+        assert len(log) == 1
+        assert log[0].status.value == "completed"
+
     def test_running_claim_lookup_is_not_limited_to_1000_rows(self, store_dir: Path) -> None:
         import cashet.dag as dag
         import cashet.hashing as hashing

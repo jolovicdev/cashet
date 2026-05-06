@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -280,6 +281,32 @@ class TestAsyncTaskDecorator:
         ref2 = await async_client.submit(non_cached)
         assert await ref1.load() == 1
         assert await ref2.load() == 2
+
+    async def test_cached_task_with_ttl_and_stale_reclaim(
+        self, async_client: AsyncClient
+    ) -> None:
+        import cashet.dag as dag
+        import cashet.hashing as hashing
+        from cashet.models import TaskStatus
+
+        counter = 0
+
+        def work() -> int:
+            nonlocal counter
+            counter += 1
+            return counter
+
+        task_def = hashing.build_task_def(work, (), {}, cache=True)
+        input_refs = dag.resolve_input_refs((), {})
+        commit = dag.build_commit(task_def, input_refs)
+        commit.status = TaskStatus.RUNNING
+        commit.created_at = datetime.now(UTC) - timedelta(seconds=400)
+        commit.claimed_at = datetime.now(UTC) - timedelta(seconds=400)
+        await async_client.store.put_commit(commit)
+
+        ref = await async_client.submit(work, _cache=True)
+        assert await ref.load() == 1
+        assert counter == 1
 
     async def test_task_decorator_callable_returns_async_result_ref(
         self, async_client: AsyncClient
