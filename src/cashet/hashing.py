@@ -347,7 +347,7 @@ def _stable_repr_to(
         _visited.add(obj_id)
         buf.write("{")
         first = True
-        for item in sorted(obj, key=repr):
+        for item in sorted(obj, key=hash):
             if not first:
                 buf.write(", ")
             first = False
@@ -362,7 +362,7 @@ def _stable_repr_to(
         _visited.add(obj_id)
         buf.write("frozenset({")
         first = True
-        for item in sorted(obj, key=repr):
+        for item in sorted(obj, key=hash):
             if not first:
                 buf.write(", ")
             first = False
@@ -377,7 +377,7 @@ def _stable_repr_to(
         _visited.add(obj_id)
         buf.write("{")
         first = True
-        for key, val in sorted(obj.items(), key=lambda p: repr(p[0])):
+        for key, val in sorted(obj.items(), key=lambda p: hash(p[0])):
             if not first:
                 buf.write(", ")
             first = False

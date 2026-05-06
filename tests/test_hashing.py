@@ -257,6 +257,26 @@ class TestProgressiveHash:
         ref2 = client.submit(identity, {1: 2})
         assert ref1.hash != ref2.hash
 
+    def test_dict_insertion_order_invariant(self, client: Client) -> None:
+        def identity(data: Any) -> Any:
+            return data
+
+        d1 = {"x": 1, "y": 2, "z": 3}
+        d2 = {"z": 3, "y": 2, "x": 1}
+        ref1 = client.submit(identity, d1)
+        ref2 = client.submit(identity, d2)
+        assert ref1.hash == ref2.hash
+
+    def test_set_insertion_order_invariant(self, client: Client) -> None:
+        def identity(data: Any) -> Any:
+            return data
+
+        s1 = {"a", "b", "c"}
+        s2 = {"c", "b", "a"}
+        ref1 = client.submit(identity, s1)
+        ref2 = client.submit(identity, s2)
+        assert ref1.hash == ref2.hash
+
 
 class TestRecursiveStructures:
     def test_recursive_list_does_not_crash(self, client: Client) -> None:
