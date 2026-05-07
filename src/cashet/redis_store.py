@@ -120,7 +120,7 @@ def _encode_commit(commit: Commit) -> bytes:
         "tags": commit.tags,
         "created_at": commit.created_at.isoformat(),
         "claimed_at": commit.claimed_at.isoformat(),
-        "last_accessed_at": datetime.now(UTC).isoformat(),
+        "last_accessed_at": commit.claimed_at.isoformat(),
     }
     return json.dumps(d, separators=(",", ":")).encode()
 

@@ -271,9 +271,8 @@ class _SQLiteStoreCore:
 
     def put_commit(self, commit: Commit) -> None:
         conn = self._connect(immediate=True)
-        now = datetime.now(UTC).isoformat()
         try:
-            self._put_commit_row(conn, commit, now)
+            self._put_commit_row(conn, commit, commit.claimed_at.isoformat())
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -329,8 +328,7 @@ class _SQLiteStoreCore:
 
     def find_by_fingerprint(self, fingerprint: str) -> Commit | None:
         conn = self._connect()
-        now = datetime.now(UTC)
-        now_iso = now.isoformat()
+        now_iso = datetime.now(UTC).isoformat()
         row = conn.execute(
             """SELECT * FROM commits
                WHERE fingerprint = ? AND status IN ('completed', 'cached')
@@ -341,10 +339,6 @@ class _SQLiteStoreCore:
         ).fetchone()
         if row is None:
             return None
-        conn.execute(
-            "UPDATE commits SET last_accessed_at = ? WHERE hash = ?",
-            (now_iso, row["hash"]),
-        )
         return self._row_to_commit(row)
 
     def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:

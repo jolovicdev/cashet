@@ -1099,6 +1099,45 @@ class TestSizeAwareGC:
         client.gc(older_than=timedelta(days=1), max_size_bytes=1)
         assert client.stats()["total_commits"] == 0
 
+    def test_last_accessed_at_derived_from_claimed_at(self, client: Client) -> None:
+        def work() -> int:
+            return 42
+
+        ref = client.submit(work)
+        assert ref.load() == 42
+
+        conn = client.store._connect()
+        row = conn.execute(
+            "SELECT claimed_at, last_accessed_at FROM commits WHERE hash = ?",
+            (ref.commit_hash,),
+        ).fetchone()
+        assert row["claimed_at"] == row["last_accessed_at"]
+
+    def test_cache_hit_does_not_shift_last_accessed_at(self, client: Client) -> None:
+        def work() -> int:
+            return 42
+
+        ref1 = client.submit(work)
+        assert ref1.load() == 42
+
+        conn = client.store._connect()
+        row_before = conn.execute(
+            "SELECT last_accessed_at FROM commits WHERE hash = ?",
+            (ref1.commit_hash,),
+        ).fetchone()
+        la_before = row_before["last_accessed_at"]
+
+        ref2 = client.submit(work)
+        assert ref2.load() == 42
+
+        row_after = conn.execute(
+            "SELECT last_accessed_at FROM commits WHERE hash = ?",
+            (ref1.commit_hash,),
+        ).fetchone()
+        la_after = row_after["last_accessed_at"]
+
+        assert la_before == la_after
+
 
 class TestTTL:
     def test_ttl_roundtrip(self, client: Client) -> None:

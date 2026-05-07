@@ -315,6 +315,49 @@ class TestAsyncTaskDecorator:
         assert do_thing.__doc__ == "A docstring."
         assert hasattr(do_thing, "_cashet_wrapped_func")
 
+    async def test_last_accessed_at_derived_from_claimed_at(
+        self, async_client: AsyncClient
+    ) -> None:
+        def work() -> int:
+            return 42
+
+        ref = await async_client.submit(work)
+        assert await ref.load() == 42
+
+        conn = async_client.store._core._connect()
+        row = conn.execute(
+            "SELECT claimed_at, last_accessed_at FROM commits WHERE hash = ?",
+            (ref.commit_hash,),
+        ).fetchone()
+        assert row["claimed_at"] == row["last_accessed_at"]
+
+    async def test_cache_hit_does_not_shift_last_accessed_at(
+        self, async_client: AsyncClient
+    ) -> None:
+        def work() -> int:
+            return 42
+
+        ref1 = await async_client.submit(work)
+        assert await ref1.load() == 42
+
+        conn = async_client.store._core._connect()
+        row_before = conn.execute(
+            "SELECT last_accessed_at FROM commits WHERE hash = ?",
+            (ref1.commit_hash,),
+        ).fetchone()
+        la_before = row_before["last_accessed_at"]
+
+        ref2 = await async_client.submit(work)
+        assert await ref2.load() == 42
+
+        row_after = conn.execute(
+            "SELECT last_accessed_at FROM commits WHERE hash = ?",
+            (ref1.commit_hash,),
+        ).fetchone()
+        la_after = row_after["last_accessed_at"]
+
+        assert la_before == la_after
+
 
 class TestAsyncContextManager:
     async def test_async_with(self) -> None:
