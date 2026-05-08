@@ -56,7 +56,7 @@ def resolve_task_config(
 
 
 def duration_from_seconds(seconds: int | float | None) -> timedelta | None:
-    return timedelta(seconds=seconds) if seconds else None
+    return timedelta(seconds=seconds) if seconds is not None else None
 
 
 def set_task_metadata(
