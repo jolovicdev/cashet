@@ -470,6 +470,8 @@ import requests
 r = requests.post("http://localhost:8000/submit", json={"task": "add", "args": [3, 4]})
 ```
 
+The sync and async server handlers accept the same submit options.
+
 Endpoints:
 
 | Method | Path | Description |
