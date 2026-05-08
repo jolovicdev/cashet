@@ -90,7 +90,9 @@ def normalize_tag_filters(
 ) -> dict[str, str | None]:
     if not tags:
         return {}
-    return {str(key): str(value) for key, value in tags.items() if value is not None}
+if not tags:
+    return {}
+return {str(k): str(v) if v is not None else None for k, v in tags.items()}
 
 
 async def load_result(commit: Commit, store: AsyncStore, serializer: Serializer) -> Any:
