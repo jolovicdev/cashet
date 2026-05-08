@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tarfile
+from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 
@@ -75,6 +76,23 @@ class TestSyncExport:
 
         count = client.import_archive(archive)
         assert count == 0
+
+    def test_export_import_preserves_task_timing_options(
+        self, client: Client, tmp_path: Path
+    ) -> None:
+        ref = client.submit(add, 5, 6, _timeout=1.5, _ttl=900)
+        assert ref.load() == 11
+
+        archive = tmp_path / "export.tar.gz"
+        client.export(archive)
+
+        client2 = Client(store_dir=tmp_path / ".cashet2")
+        assert client2.import_archive(archive) == 1
+
+        imported = client2.show(ref.commit_hash)
+        assert imported is not None
+        assert imported.task_def.timeout == timedelta(seconds=1.5)
+        assert imported.task_def.ttl == timedelta(seconds=900)
 
     def test_export_empty_store(self, client: Client, tmp_path: Path) -> None:
         archive = tmp_path / "empty.tar.gz"

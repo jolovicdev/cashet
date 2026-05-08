@@ -5,11 +5,12 @@ import hashlib
 import json
 import logging
 import tarfile
-from datetime import datetime, timedelta
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from cashet._client_base import duration_from_seconds
 from cashet.models import Commit, ObjectRef, StorageTier, TaskDef, TaskStatus
 from cashet.protocols import AsyncStore
 
@@ -59,12 +60,8 @@ def _task_def_to_dict(task_def: TaskDef) -> dict[str, Any]:
 
 
 def _dict_to_task_def(data: dict[str, Any]) -> TaskDef:
-    timeout: timedelta | None = None
-    if "timeout" in data and data["timeout"] is not None:
-        timeout = timedelta(seconds=data["timeout"])
-    ttl: timedelta | None = None
-    if "ttl" in data and data["ttl"] is not None:
-        ttl = timedelta(seconds=data["ttl"])
+    timeout = duration_from_seconds(data.get("timeout"))
+    ttl = duration_from_seconds(data.get("ttl"))
     return TaskDef(
         func_hash=data["func_hash"],
         func_name=data["func_name"],

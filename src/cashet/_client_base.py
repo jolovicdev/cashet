@@ -49,10 +49,14 @@ def resolve_task_config(
     timeout_seconds = (
         _timeout if _timeout is not None else getattr(raw_func, "_cashet_timeout", None)
     )
-    timeout = timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
     ttl_seconds = _ttl if _ttl is not None else getattr(raw_func, "_cashet_ttl", None)
-    ttl = timedelta(seconds=ttl_seconds) if ttl_seconds is not None else None
+    timeout = duration_from_seconds(timeout_seconds)
+    ttl = duration_from_seconds(ttl_seconds)
     return raw_func, cache, tags, retries, force, timeout, ttl
+
+
+def duration_from_seconds(seconds: int | float | None) -> timedelta | None:
+    return timedelta(seconds=seconds) if seconds else None
 
 
 def set_task_metadata(
