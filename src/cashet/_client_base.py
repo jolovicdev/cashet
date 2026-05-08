@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -83,6 +83,14 @@ def resolve_status(status: TaskStatus | str | None) -> TaskStatus | None:
             valid = ", ".join(s.value for s in TaskStatus)
             raise ValueError(f"Invalid status '{status}'. Valid values: {valid}") from e
     return status
+
+
+def normalize_tag_filters(
+    tags: Mapping[str, str | None] | None,
+) -> dict[str, str | None]:
+    if not tags:
+        return {}
+    return {str(key): str(value) for key, value in tags.items() if value is not None}
 
 
 async def load_result(commit: Commit, store: AsyncStore, serializer: Serializer) -> Any:

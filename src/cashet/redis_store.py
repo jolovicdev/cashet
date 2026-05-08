@@ -9,6 +9,7 @@ from typing import Any
 
 from redis.exceptions import WatchError
 
+from cashet._client_base import normalize_tag_filters
 from cashet._runner import BlockingAsyncRunner
 from cashet.models import Commit, ObjectRef, StorageTier, TaskDef, TaskStatus
 
@@ -412,6 +413,7 @@ class AsyncRedisStore:
         status: TaskStatus | None = None,
         tags: dict[str, str | None] | None = None,
     ) -> list[Commit]:
+        tag_filters = normalize_tag_filters(tags)
         if func_name:
             hashes = await self._redis.zrevrange(_func_key(func_name), 0, -1)
         else:
@@ -424,7 +426,7 @@ class AsyncRedisStore:
                 continue
             if status is not None and commit.status != status:
                 continue
-            if tags is not None and not _matches_tags(commit, tags):
+            if tags is not None and not _matches_tags(commit, tag_filters):
                 continue
             commits.append(commit)
             if len(commits) >= limit:
@@ -579,8 +581,11 @@ class AsyncRedisStore:
             return await self._delete_commit(hash)
 
     async def delete_by_tags(self, tags: dict[str, str | None]) -> int:
+        tag_filters = normalize_tag_filters(tags)
+        if not tag_filters:
+            return 0
         set_keys: list[str] = []
-        for key, val in tags.items():
+        for key, val in tag_filters.items():
             set_keys.append(_tag_key(key) if val is None else _tag_value_key(key, val))
         if len(set_keys) == 1:
             hashes = await self._redis.smembers(set_keys[0])

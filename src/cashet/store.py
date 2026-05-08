@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from cashet._client_base import normalize_tag_filters
 from cashet._runner import BlockingAsyncRunner
 from cashet.models import Commit, ObjectRef, StorageTier, TaskDef, TaskStatus
 
@@ -390,6 +391,7 @@ class _SQLiteStoreCore:
         tags: dict[str, str | None] | None = None,
     ) -> list[Commit]:
         conn = self._connect()
+        tag_filters = normalize_tag_filters(tags)
         query = "SELECT * FROM commits WHERE 1=1"
         params: list[Any] = []
         if func_name:
@@ -398,8 +400,8 @@ class _SQLiteStoreCore:
         if status:
             query += " AND status = ?"
             params.append(status.value)
-        if tags:
-            for key, val in tags.items():
+        if tag_filters:
+            for key, val in tag_filters.items():
                 if val is None:
                     query += " AND json_extract(tags, ?) IS NOT NULL"
                     params.append(f"$.{key}")
@@ -665,9 +667,13 @@ class _SQLiteStoreCore:
 
     def delete_by_tags(self, tags: dict[str, str | None]) -> int:
         conn = self._connect(immediate=True)
+        tag_filters = normalize_tag_filters(tags)
+        if not tag_filters:
+            conn.execute("ROLLBACK")
+            return 0
         query = "SELECT hash, output_hash, input_refs FROM commits WHERE 1=1"
         params: list[Any] = []
-        for key, val in tags.items():
+        for key, val in tag_filters.items():
             if val is None:
                 query += " AND json_extract(tags, ?) IS NOT NULL"
                 params.append(f"$.{key}")
