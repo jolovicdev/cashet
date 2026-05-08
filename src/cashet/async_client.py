@@ -8,6 +8,7 @@ from typing import Any, TypeVar, cast, overload
 
 from cashet._batch import (
     build_deps,
+    build_map_tasks,
     execute_batch,
     normalize_tasks,
     topological_sort,
@@ -277,7 +278,7 @@ class AsyncClient:
         max_workers: int | None = None,
         **kwargs: Any,
     ) -> list[AsyncResultRef[T]]:
-        task_list: list[Any] = [(func, (item, *args), kwargs) for item in items]
+        task_list = build_map_tasks(func, items, args, kwargs)
         return await self.submit_many(
             task_list,
             _cache=_cache,

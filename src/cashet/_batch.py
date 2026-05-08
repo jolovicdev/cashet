@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable, Iterable
 from datetime import timedelta
 from typing import Any
 
@@ -72,6 +73,18 @@ def normalize_tasks(
         )
         normalized.append((raw_func, args, kwargs, cache, tags, retries, force, timeout, ttl))
     return normalized
+
+
+def build_map_tasks(
+    func: Callable[..., Any],
+    items: Iterable[Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> list[Any]:
+    return [
+        (func, (*item, *args) if isinstance(item, tuple) else (item, *args), kwargs)
+        for item in items
+    ]
 
 
 def build_deps(

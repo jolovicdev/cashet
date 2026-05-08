@@ -27,6 +27,10 @@ def greet(name: str, greeting: str = "hello") -> str:
     return f"{greeting} {name}"
 
 
+def add_pair(x: int, y: int) -> int:
+    return x + y
+
+
 class TestSyncMap:
     def test_map_basic(self, client: Client) -> None:
         refs = client.map(double, [1, 2, 3])
@@ -37,6 +41,10 @@ class TestSyncMap:
     def test_map_with_extra_args(self, client: Client) -> None:
         refs = client.map(add, [1, 2, 3], 10)
         assert [r.load() for r in refs] == [11, 12, 13]
+
+    def test_map_with_tuple_items(self, client: Client) -> None:
+        refs = client.map(add_pair, [(1, 2), (3, 4)])
+        assert [r.load() for r in refs] == [3, 7]
 
     def test_map_with_kwargs(self, client: Client) -> None:
         refs = client.map(greet, ["alice", "bob"], greeting="hi")
@@ -73,6 +81,10 @@ class TestAsyncMap:
     async def test_map_with_extra_args(self, async_client: AsyncClient) -> None:
         refs = await async_client.map(add, [1, 2, 3], 10)
         assert [await r.load() for r in refs] == [11, 12, 13]
+
+    async def test_map_with_tuple_items(self, async_client: AsyncClient) -> None:
+        refs = await async_client.map(add_pair, [(1, 2), (3, 4)])
+        assert [await r.load() for r in refs] == [3, 7]
 
     async def test_map_caching(self, async_client: AsyncClient) -> None:
         call_count = 0
