@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -83,6 +83,18 @@ def resolve_status(status: TaskStatus | str | None) -> TaskStatus | None:
             valid = ", ".join(s.value for s in TaskStatus)
             raise ValueError(f"Invalid status '{status}'. Valid values: {valid}") from e
     return status
+
+
+def resolve_submit_options(
+    data: Mapping[str, Any],
+) -> tuple[bool, dict[str, str], int, bool, Any, Any]:
+    cache = data.get("cache") or True
+    tags = data.get("tags") or {}
+    retries = data.get("retries", 0)
+    force = data.get("force", False)
+    timeout = data.get("timeout")
+    ttl = data.get("ttl")
+    return cache, tags, retries, force, timeout, ttl
 
 
 async def load_result(commit: Commit, store: AsyncStore, serializer: Serializer) -> Any:

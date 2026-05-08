@@ -17,6 +17,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from cashet._client_base import resolve_submit_options
 from cashet.async_client import AsyncClient
 from cashet.client import Client
 
@@ -198,12 +199,7 @@ async def _async_submit(request: Request) -> JSONResponse:
     if error is not None:
         return error
 
-    cache = data.get("cache", True)
-    tags = data.get("tags", {})
-    retries = data.get("retries", 0)
-    force = data.get("force", False)
-    timeout = data.get("timeout")
-    ttl = data.get("ttl")
+    cache, tags, retries, force, timeout, ttl = resolve_submit_options(data)
 
     start = time.perf_counter()
     try:
@@ -404,12 +400,7 @@ async def _submit(request: Request) -> JSONResponse:
     if error is not None:
         return error
 
-    cache = data.get("cache", True)
-    tags = data.get("tags", {})
-    retries = data.get("retries", 0)
-    force = data.get("force", False)
-    timeout = data.get("timeout")
-    ttl = data.get("ttl")
+    cache, tags, retries, force, timeout, ttl = resolve_submit_options(data)
 
     start = time.perf_counter()
 
