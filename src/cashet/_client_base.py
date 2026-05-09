@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -53,6 +53,18 @@ def resolve_task_config(
     ttl_seconds = _ttl if _ttl is not None else getattr(raw_func, "_cashet_ttl", None)
     ttl = timedelta(seconds=ttl_seconds) if ttl_seconds is not None else None
     return raw_func, cache, tags, retries, force, timeout, ttl
+
+
+def resolve_submit_options(
+    data: Mapping[str, Any],
+) -> tuple[bool, dict[str, str], int, bool, Any, Any]:
+    cache = data.get("cache", True)
+    tags = data.get("tags", {})
+    retries = data.get("retries", 0)
+    force = data.get("force", False)
+    timeout = data.get("timeout")
+    ttl = data.get("ttl")
+    return cache, tags, retries, force, timeout, ttl
 
 
 def set_task_metadata(

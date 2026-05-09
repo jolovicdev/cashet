@@ -148,6 +148,15 @@ class TestServerSubmit:
         assert response.json()["error"] == "Internal server error"
         assert "secret internal path" not in response.text
 
+    def test_submit_cache_false_creates_new_commit(self, server_client: TestClient) -> None:
+        payload = {"task": "add", "args": [3, 4], "cache": False}
+        first = server_client.post("/submit", json=payload)
+        second = server_client.post("/submit", json=payload)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert first.json()["commit_hash"] != second.json()["commit_hash"]
+
 
 class TestAsyncServerSubmit:
     async def test_async_submit_registered_task_with_sqlite(self, tmp_path: Path) -> None:
