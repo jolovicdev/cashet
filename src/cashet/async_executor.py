@@ -254,7 +254,7 @@ class AsyncLocalExecutor:
 
         return commit
 
-    async def _resolve_value(self, value: Any, visited: set[int] | None = None) -> Any:
+    async def _resolve_value(self, value: Any, memo: dict[int, Any] | None = None) -> Any:
         async_load = getattr(value, "__cashet_async_load__", None)
         if async_load is not None:
             return await async_load()
@@ -262,39 +262,39 @@ class AsyncLocalExecutor:
             if inspect.iscoroutinefunction(value.load):
                 return await value.load()
             return await asyncio.to_thread(value.load)
-        if visited is None:
-            visited = set()
+        if memo is None:
+            memo = {}
         value_id = id(value)
-        if value_id in visited:
-            return value
+        if value_id in memo:
+            return memo[value_id]
         if isinstance(value, dict):
-            visited.add(value_id)
-            resolved = {
-                await self._resolve_value(k, visited): await self._resolve_value(v, visited)
-                for k, v in value.items()
-            }
-            visited.discard(value_id)
-            return resolved
+            dict_result: dict[Any, Any] = {}
+            memo[value_id] = dict_result
+            for k, v in value.items():
+                dict_result[await self._resolve_value(k, memo)] = await self._resolve_value(v, memo)
+            return dict_result
         if isinstance(value, list):
-            visited.add(value_id)
-            resolved = [await self._resolve_value(item, visited) for item in value]
-            visited.discard(value_id)
-            return resolved
+            list_result: list[Any] = []
+            memo[value_id] = list_result
+            for item in value:
+                list_result.append(await self._resolve_value(item, memo))
+            return list_result
         if isinstance(value, tuple):
-            visited.add(value_id)
-            resolved = tuple(await self._resolve_value(item, visited) for item in value)
-            visited.discard(value_id)
-            return resolved
+            resolved_items = [await self._resolve_value(item, memo) for item in value]
+            tuple_result = tuple(resolved_items)
+            memo[value_id] = tuple_result
+            return tuple_result
         if isinstance(value, set):
-            visited.add(value_id)
-            resolved = {await self._resolve_value(item, visited) for item in value}
-            visited.discard(value_id)
-            return resolved
+            set_result: set[Any] = set()
+            memo[value_id] = set_result
+            for item in value:
+                set_result.add(await self._resolve_value(item, memo))
+            return set_result
         if isinstance(value, frozenset):
-            visited.add(value_id)
-            resolved = frozenset(await self._resolve_value(item, visited) for item in value)
-            visited.discard(value_id)
-            return resolved
+            resolved_items = [await self._resolve_value(item, memo) for item in value]
+            frozenset_result = frozenset(resolved_items)
+            memo[value_id] = frozenset_result
+            return frozenset_result
         return value
 
     async def _resolve_args(self, args: tuple[Any, ...]) -> tuple[Any, ...]:
