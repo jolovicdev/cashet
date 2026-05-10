@@ -18,9 +18,21 @@ from cashet.store import AsyncSQLiteStore, SQLiteStore
 
 try:
     from cashet.redis_store import AsyncRedisStore, RedisStore
-except ImportError:
-    AsyncRedisStore = None  # type: ignore[misc,assignment]
-    RedisStore = None  # type: ignore[misc,assignment]
+except ImportError as e:
+    _redis_import_error = e
+
+    class AsyncRedisStore:  # type: ignore[no-redef]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise ImportError(
+                "AsyncRedisStore requires the redis extra. "
+                "Install it with `cashet[redis]`."
+            ) from _redis_import_error
+
+    class RedisStore:  # type: ignore[no-redef]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise ImportError(
+                "RedisStore requires the redis extra. Install it with `cashet[redis]`."
+            ) from _redis_import_error
 
 _log_level = os.environ.get("CASHET_LOG", "").upper()
 if _log_level in ("DEBUG", "INFO", "WARNING", "ERROR"):
