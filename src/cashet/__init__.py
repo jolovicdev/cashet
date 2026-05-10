@@ -1,5 +1,6 @@
 import logging
 import os
+from typing import Any
 
 from cashet.async_client import AsyncClient
 from cashet.client import Client
@@ -17,22 +18,29 @@ from cashet.protocols import AsyncStore, Executor, Store
 from cashet.store import AsyncSQLiteStore, SQLiteStore
 
 try:
-    from cashet.redis_store import AsyncRedisStore, RedisStore
+    from cashet.redis_store import AsyncRedisStore as _AsyncRedisStore
+    from cashet.redis_store import RedisStore as _RedisStore
 except ImportError as e:
     _redis_import_error = e
 
-    class AsyncRedisStore:  # type: ignore[no-redef]
+    class _UnavailableAsyncRedisStore:
         def __init__(self, *args: object, **kwargs: object) -> None:
             raise ImportError(
                 "AsyncRedisStore requires the redis extra. "
                 "Install it with `cashet[redis]`."
             ) from _redis_import_error
 
-    class RedisStore:  # type: ignore[no-redef]
+    class _UnavailableRedisStore:
         def __init__(self, *args: object, **kwargs: object) -> None:
             raise ImportError(
                 "RedisStore requires the redis extra. Install it with `cashet[redis]`."
             ) from _redis_import_error
+
+    AsyncRedisStore: Any = _UnavailableAsyncRedisStore
+    RedisStore: Any = _UnavailableRedisStore
+else:
+    AsyncRedisStore = _AsyncRedisStore
+    RedisStore = _RedisStore
 
 _log_level = os.environ.get("CASHET_LOG", "").upper()
 if _log_level in ("DEBUG", "INFO", "WARNING", "ERROR"):
