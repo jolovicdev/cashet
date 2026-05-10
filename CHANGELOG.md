@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.4 — 11.5.2026.
+
+### Fixed
+- Await `async def` task callables submitted through `AsyncClient` instead of
+  trying to cache the coroutine object.
+- Include immutable referenced global values in function hashes so global
+  constants invalidate cached results when changed.
+- Resolve nested `ResultRef` / `AsyncResultRef` values inside containers and
+  record them as input refs in commit metadata.
+- Raise a clear `cashet[redis]` install error when `RedisStore` or
+  `AsyncRedisStore` is imported from a base install without the Redis extra.
+
 ## 0.4.3 — 1.5.2026.
 
 ### Fixed
