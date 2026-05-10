@@ -47,6 +47,13 @@ class TestAsyncClientSubmit:
         ref = await async_client.submit(greet, "world", greeting="hi")
         assert await ref.load() == "hi, world"
 
+    async def test_submit_async_function(self, async_client: AsyncClient) -> None:
+        async def double(x: int) -> int:
+            return x * 2
+
+        ref = await async_client.submit(double, 21)
+        assert await ref.load() == 42
+
     async def test_async_result_ref_chaining(self, async_client: AsyncClient) -> None:
         def step1() -> int:
             return 10

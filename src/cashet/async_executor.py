@@ -201,15 +201,9 @@ class AsyncLocalExecutor:
                 try:
                     resolved_args = await self._resolve_args(args)
                     resolved_kwargs = await self._resolve_kwargs(kwargs)
-                    if effective_timeout is not None:
-                        result = await asyncio.wait_for(
-                            asyncio.to_thread(func, *resolved_args, **resolved_kwargs),
-                            timeout=effective_timeout.total_seconds(),
-                        )
-                    else:
-                        result = await asyncio.to_thread(
-                            func, *resolved_args, **resolved_kwargs
-                        )
+                    result = await self._call_task(
+                        func, resolved_args, resolved_kwargs, effective_timeout
+                    )
                     output_ref = await self._store_result(result, store, serializer)
                     commit.output_ref = output_ref
                     commit.status = TaskStatus.COMPLETED
@@ -279,6 +273,32 @@ class AsyncLocalExecutor:
         for k, v in kwargs.items():
             resolved[k] = await self._resolve_value(v)
         return resolved
+
+    async def _call_task(
+        self,
+        func: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        timeout: timedelta | None,
+    ) -> Any:
+        if timeout is None:
+            return await self._call_task_body(func, args, kwargs)
+        async with asyncio.timeout(timeout.total_seconds()):
+            return await self._call_task_body(func, args, kwargs)
+
+    async def _call_task_body(
+        self,
+        func: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        if inspect.iscoroutinefunction(func):
+            result = await func(*args, **kwargs)
+        else:
+            result = await asyncio.to_thread(func, *args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     async def _store_result(
         self, result: Any, store: AsyncStore, serializer: Serializer
