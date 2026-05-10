@@ -271,7 +271,8 @@ class AsyncLocalExecutor:
             dict_result: dict[Any, Any] = {}
             memo[value_id] = dict_result
             for k, v in value.items():
-                dict_result[await self._resolve_value(k, memo)] = await self._resolve_value(v, memo)
+                key = await self._resolve_value(k, memo)
+                dict_result[key] = await self._resolve_value(v, memo)
             return dict_result
         if isinstance(value, list):
             list_result: list[Any] = []
