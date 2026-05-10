@@ -68,6 +68,20 @@ class TestAsyncClientSubmit:
         assert commit is not None
         assert [ref.hash for ref in commit.input_refs] == [r1.hash]
 
+    async def test_nested_async_result_ref_chaining(self, async_client: AsyncClient) -> None:
+        def step1() -> int:
+            return 10
+
+        def step2(payload: dict[str, int]) -> int:
+            return payload["value"] * 3
+
+        r1 = await async_client.submit(step1)
+        r2 = await async_client.submit(step2, {"value": r1})
+        assert await r2.load() == 30
+        commit = await async_client.show(r2.commit_hash)
+        assert commit is not None
+        assert [ref.hash for ref in commit.input_refs] == [r1.hash]
+
 
 class TestAsyncClientSubmitMany:
     async def test_submit_many_basic(self, async_client: AsyncClient) -> None:

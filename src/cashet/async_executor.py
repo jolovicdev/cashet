@@ -254,7 +254,7 @@ class AsyncLocalExecutor:
 
         return commit
 
-    async def _resolve_value(self, value: Any) -> Any:
+    async def _resolve_value(self, value: Any, visited: set[int] | None = None) -> Any:
         async_load = getattr(value, "__cashet_async_load__", None)
         if async_load is not None:
             return await async_load()
@@ -262,6 +262,39 @@ class AsyncLocalExecutor:
             if inspect.iscoroutinefunction(value.load):
                 return await value.load()
             return await asyncio.to_thread(value.load)
+        if visited is None:
+            visited = set()
+        value_id = id(value)
+        if value_id in visited:
+            return value
+        if isinstance(value, dict):
+            visited.add(value_id)
+            resolved = {
+                await self._resolve_value(k, visited): await self._resolve_value(v, visited)
+                for k, v in value.items()
+            }
+            visited.discard(value_id)
+            return resolved
+        if isinstance(value, list):
+            visited.add(value_id)
+            resolved = [await self._resolve_value(item, visited) for item in value]
+            visited.discard(value_id)
+            return resolved
+        if isinstance(value, tuple):
+            visited.add(value_id)
+            resolved = tuple(await self._resolve_value(item, visited) for item in value)
+            visited.discard(value_id)
+            return resolved
+        if isinstance(value, set):
+            visited.add(value_id)
+            resolved = {await self._resolve_value(item, visited) for item in value}
+            visited.discard(value_id)
+            return resolved
+        if isinstance(value, frozenset):
+            visited.add(value_id)
+            resolved = frozenset(await self._resolve_value(item, visited) for item in value)
+            visited.discard(value_id)
+            return resolved
         return value
 
     async def _resolve_args(self, args: tuple[Any, ...]) -> tuple[Any, ...]:

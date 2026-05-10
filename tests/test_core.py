@@ -223,6 +223,21 @@ class TestDAGResolution:
         result_ref = client.submit(double, data_ref)
         assert result_ref.load() == [2, 4, 6]
 
+    def test_nested_result_ref_as_input(self, client: Client) -> None:
+        def gen_data() -> list[int]:
+            return [1, 2, 3]
+
+        def double(payload: dict[str, list[int]]) -> list[int]:
+            return [x * 2 for x in payload["data"]]
+
+        data_ref = client.submit(gen_data)
+        result_ref = client.submit(double, {"data": data_ref})
+        assert result_ref.load() == [2, 4, 6]
+
+        commit = client.show(result_ref.commit_hash)
+        assert commit is not None
+        assert [ref.hash for ref in commit.input_refs] == [data_ref.hash]
+
     def test_chained_pipeline(self, client: Client) -> None:
         def step1() -> int:
             return 10
