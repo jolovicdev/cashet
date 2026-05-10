@@ -258,6 +258,25 @@ def _is_user_function(func: types.FunctionType) -> bool:
     return not _is_stdlib_or_site_path(mod_file)
 
 
+_HASHED_GLOBAL_TYPES = (type(None), bool, int, float, str, bytes, complex)
+
+
+def _should_hash_global_value(obj: Any, visited: set[int] | None = None) -> bool:
+    if isinstance(obj, _HASHED_GLOBAL_TYPES):
+        return True
+    if visited is None:
+        visited = set()
+    obj_id = id(obj)
+    if obj_id in visited:
+        return False
+    if isinstance(obj, tuple | frozenset):
+        visited.add(obj_id)
+        result = all(_should_hash_global_value(item, visited) for item in obj)
+        visited.discard(obj_id)
+        return result
+    return False
+
+
 def hash_function(
     func: types.FunctionType,
     include_deps: bool = True,
@@ -299,11 +318,16 @@ def hash_function(
             except ValueError:
                 pass
     for name in sorted(func.__code__.co_names):
-        ref = func.__globals__.get(name)
+        if name not in func.__globals__:
+            continue
+        ref = func.__globals__[name]
         if isinstance(ref, types.FunctionType) and _is_user_function(ref):
             dep_hash = hash_function(ref, include_deps=False, visited=visited)
             if dep_hash:
                 h.update(f"{name}:{dep_hash}".encode())
+        elif _should_hash_global_value(ref):
+            h.update(f"<global:{name}>".encode())
+            _stable_hash(ref, h)
     if non_func_closures:
         names = ", ".join(non_func_closures)
         warnings.warn(

@@ -407,6 +407,19 @@ class TestDynamicSource:
         assert ref1.load() == 1
         assert ref2.load() == 2
 
+    def test_exec_function_invalidates_on_global_value_change(self, client: Client) -> None:
+        namespace: dict[str, Any] = {"MULTIPLIER": 2}
+        exec("def f(x):\n    return x * MULTIPLIER", namespace)
+        func = namespace["f"]
+        ref1 = client.submit(func, 10)
+
+        namespace["MULTIPLIER"] = 3
+        ref2 = client.submit(func, 10)
+
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == 20
+        assert ref2.load() == 30
+
     def test_lambda_hashes_by_bytecode(self, client: Client) -> None:
         f = lambda x: x * 3  # noqa: E731
         ref1 = client.submit(f, 4)
