@@ -5,10 +5,13 @@
 ### Fixed
 - Await `async def` task callables submitted through `AsyncClient` instead of
   trying to cache the coroutine object.
-- Include immutable referenced global values in function hashes so global
-  constants invalidate cached results when changed.
+- Include immutable referenced global values, including globals referenced only
+  inside nested code objects, in function hashes so global constants invalidate
+  cached results when changed.
 - Resolve nested `ResultRef` / `AsyncResultRef` values inside containers and
-  record them as input refs in commit metadata.
+  record deduplicated input refs in commit metadata.
+- Preserve tuple subclasses while resolving refs and keep dict/frozenset
+  resolution from creating unhashable container members.
 - Raise a clear `cashet[redis]` install error when `RedisStore` or
   `AsyncRedisStore` is imported from a base install without the Redis extra.
 
