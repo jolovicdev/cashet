@@ -1,12 +1,25 @@
 from __future__ import annotations
 
+from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pytest_asyncio
 
 from cashet.async_client import AsyncClient
 from cashet.dag import AsyncResultRef, TaskRef
+
+
+class DeferredResult:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __await__(self) -> Generator[Any, None, str]:
+        async def run() -> str:
+            return f"executed:{self.value}"
+
+        return run().__await__()
 
 
 @pytest_asyncio.fixture
@@ -53,6 +66,30 @@ class TestAsyncClientSubmit:
 
         ref = await async_client.submit(double, 21)
         assert await ref.load() == 42
+
+    async def test_submit_sync_function_returning_awaitable_value(
+        self, async_client: AsyncClient
+    ) -> None:
+        def returns_deferred() -> DeferredResult:
+            return DeferredResult("sync")
+
+        ref = await async_client.submit(returns_deferred)
+        result = await ref.load()
+
+        assert isinstance(result, DeferredResult)
+        assert result.value == "sync"
+
+    async def test_submit_async_function_returning_awaitable_value(
+        self, async_client: AsyncClient
+    ) -> None:
+        async def returns_deferred() -> DeferredResult:
+            return DeferredResult("async")
+
+        ref = await async_client.submit(returns_deferred)
+        result = await ref.load()
+
+        assert isinstance(result, DeferredResult)
+        assert result.value == "async"
 
     async def test_async_result_ref_chaining(self, async_client: AsyncClient) -> None:
         def step1() -> int:

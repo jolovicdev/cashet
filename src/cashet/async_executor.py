@@ -370,12 +370,8 @@ class AsyncLocalExecutor:
         kwargs: dict[str, Any],
     ) -> Any:
         if inspect.iscoroutinefunction(func):
-            result = await func(*args, **kwargs)
-        else:
-            result = await asyncio.to_thread(func, *args, **kwargs)
-        if inspect.isawaitable(result):
-            return await result
-        return result
+            return await func(*args, **kwargs)
+        return await asyncio.to_thread(func, *args, **kwargs)
 
     async def _store_result(
         self, result: Any, store: AsyncStore, serializer: Serializer
