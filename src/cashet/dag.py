@@ -18,15 +18,41 @@ class TaskRef:
         self.key = key
 
 
+def _collect_input_refs(value: Any, refs: list[ObjectRef], visited: set[int]) -> None:
+    if hasattr(value, "__cashet_ref__"):
+        refs.append(value.__cashet_ref__())
+        return
+    value_id = id(value)
+    if value_id in visited:
+        return
+    if isinstance(value, dict):
+        visited.add(value_id)
+        for key, val in value.items():
+            _collect_input_refs(key, refs, visited)
+            _collect_input_refs(val, refs, visited)
+        visited.discard(value_id)
+    elif isinstance(value, list | tuple | set | frozenset):
+        visited.add(value_id)
+        for item in value:
+            _collect_input_refs(item, refs, visited)
+        visited.discard(value_id)
+
+
 def resolve_input_refs(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[ObjectRef]:
     refs: list[ObjectRef] = []
+    visited: set[int] = set()
     for arg in args:
-        if hasattr(arg, "__cashet_ref__"):
-            refs.append(arg.__cashet_ref__())
+        _collect_input_refs(arg, refs, visited)
     for val in kwargs.values():
-        if hasattr(val, "__cashet_ref__"):
-            refs.append(val.__cashet_ref__())
-    return refs
+        _collect_input_refs(val, refs, visited)
+    unique_refs: list[ObjectRef] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if ref.hash in seen:
+            continue
+        seen.add(ref.hash)
+        unique_refs.append(ref)
+    return unique_refs
 
 
 class AsyncResultRef(Generic[T]):

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.4 — 11.5.2026.
+
+### Fixed
+- Await `async def` task callables submitted through `AsyncClient` instead of
+  trying to cache the coroutine object.
+- Include immutable referenced global values, including globals referenced only
+  inside nested code objects, in function hashes so global constants invalidate
+  cached results when changed.
+- Resolve nested `ResultRef` / `AsyncResultRef` values inside containers and
+  record deduplicated input refs in commit metadata.
+- Preserve tuple subclasses while resolving refs and keep dict/frozenset
+  resolution from creating unhashable container members.
+- Preserve awaitable objects returned by task functions instead of awaiting
+  returned values a second time.
+- Include stable immutable built-in globals such as `range`, `slice`, and
+  `datetime` values in function hashes.
+- Raise a clear `cashet[redis]` install error when `RedisStore` or
+  `AsyncRedisStore` is imported from a base install without the Redis extra.
+
 ## 0.4.3 — 1.5.2026.
 
 ### Fixed

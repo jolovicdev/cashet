@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import datetime as _datetime
 import hashlib
 import inspect
 import io
@@ -258,6 +259,61 @@ def _is_user_function(func: types.FunctionType) -> bool:
     return not _is_stdlib_or_site_path(mod_file)
 
 
+_HASHED_GLOBAL_TYPES = (
+    type(None),
+    bool,
+    int,
+    float,
+    str,
+    bytes,
+    complex,
+    range,
+    _datetime.date,
+    _datetime.datetime,
+    _datetime.time,
+    _datetime.timedelta,
+    _datetime.timezone,
+)
+
+
+def _should_hash_global_value(obj: Any, visited: set[int] | None = None) -> bool:
+    if isinstance(obj, _HASHED_GLOBAL_TYPES):
+        return True
+    if visited is None:
+        visited = set()
+    obj_id = id(obj)
+    if obj_id in visited:
+        return False
+    if isinstance(obj, slice):
+        visited.add(obj_id)
+        result = all(
+            _should_hash_global_value(item, visited)
+            for item in (obj.start, obj.stop, obj.step)
+        )
+        visited.discard(obj_id)
+        return result
+    if isinstance(obj, tuple | frozenset):
+        visited.add(obj_id)
+        result = all(_should_hash_global_value(item, visited) for item in obj)
+        visited.discard(obj_id)
+        return result
+    return False
+
+
+def _code_names(code: types.CodeType, visited: set[int] | None = None) -> set[str]:
+    if visited is None:
+        visited = set()
+    code_id = id(code)
+    if code_id in visited:
+        return set()
+    visited.add(code_id)
+    names = set(code.co_names)
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            names.update(_code_names(const, visited))
+    return names
+
+
 def hash_function(
     func: types.FunctionType,
     include_deps: bool = True,
@@ -298,12 +354,17 @@ def hash_function(
                     non_func_closures.append(name)
             except ValueError:
                 pass
-    for name in sorted(func.__code__.co_names):
-        ref = func.__globals__.get(name)
+    for name in sorted(_code_names(func.__code__)):
+        if name not in func.__globals__:
+            continue
+        ref = func.__globals__[name]
         if isinstance(ref, types.FunctionType) and _is_user_function(ref):
             dep_hash = hash_function(ref, include_deps=False, visited=visited)
             if dep_hash:
                 h.update(f"{name}:{dep_hash}".encode())
+        elif _should_hash_global_value(ref):
+            h.update(f"<global:{name}>".encode())
+            _stable_hash(ref, h)
     if non_func_closures:
         names = ", ".join(non_func_closures)
         warnings.warn(

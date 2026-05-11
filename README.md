@@ -426,7 +426,7 @@ async def main():
         max_workers=1,         # max parallelism for submit_many (default: 1, sequential)
     )
 
-    def square(x: int) -> int:
+    async def square(x: int) -> int:
         return x * x
 
     ref = await client.submit(square, 5)
@@ -436,7 +436,7 @@ async def main():
 asyncio.run(main())
 ```
 
-`AsyncClient` mirrors `Client` — `submit()`, `submit_many()`, `log()`, `show()`, `get()`, `stats()`, `gc()`, `rm()`, `clear()`, `serve()` are all `async def`. `submit()` returns `AsyncResultRef` with `async load()`. Chain tasks by passing `AsyncResultRef` as an argument.
+`AsyncClient` mirrors `Client` — `submit()`, `submit_many()`, `log()`, `show()`, `get()`, `stats()`, `gc()`, `rm()`, `clear()`, `serve()` are all `async def`. `submit()` accepts both sync and async callables, and returns `AsyncResultRef` with `async load()`. Chain tasks by passing `AsyncResultRef` as an argument.
 
 ### HTTP Server
 
@@ -849,6 +849,7 @@ A lazy reference to a stored result. Pass it as an argument to chain tasks:
 ```python
 step1 = client.submit(func_a, input_data)
 step2 = client.submit(func_b, step1)  # step1 auto-resolves to its output
+step3 = client.submit(func_c, {"payload": step2})  # nested refs resolve too
 ```
 
 `ResultRef` is generic — `submit()` infers the return type from the function annotation:
@@ -940,8 +941,9 @@ client.submit(func, arg1, arg2)
 
 **Key design decisions:**
 
-- **Closure variables are not hashed** and emit a `ClosureWarning` if present. Function identity is source code, defaults, keyword defaults, and referenced helper functions; not arbitrary runtime state. If you need cache invalidation based on a value, pass it as an explicit argument.
+- **Closure variables are not hashed** and emit a `ClosureWarning` if present. Function identity is source code, defaults, keyword defaults, immutable referenced globals, and referenced helper functions; not arbitrary runtime state. If you need cache invalidation based on a mutable value, pass it as an explicit argument.
 - **Referenced user-defined helper functions are hashed recursively.** If your cached function calls or references a helper from your own project (via `co_names` / `globals`), that helper's source is included in the cache key. Change the helper and the caller's cache invalidates. Builtin and stdlib functions are skipped. This behavior is automatic and invisible — no decorators or imports needed.
+- **Nested refs resolve through containers.** `ResultRef` and `AsyncResultRef` values inside lists, tuples, sets, frozensets, and dicts are loaded before execution and recorded as commit input refs.
 - **Blobs are deduplicated by content hash.** Identical results share one blob on disk.
 - **Source is hashed as an AST.** Comments, docstrings, and whitespace changes don't invalidate the cache.
 - **Custom object arguments include their class module and qualname** in the argument hash so same-named classes from different modules do not collide.

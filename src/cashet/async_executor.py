@@ -7,7 +7,7 @@ import logging
 import time
 import traceback
 import weakref
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Hashable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -47,6 +47,42 @@ async def _async_store_lock(
 
 def _is_stale_claim(commit: Commit, ttl: timedelta) -> bool:
     return datetime.now(UTC) - commit.claimed_at > ttl
+
+
+def _contains_resolvable_ref(value: Any, visited: set[int] | None = None) -> bool:
+    if hasattr(value, "__cashet_ref__"):
+        return True
+    if visited is None:
+        visited = set()
+    value_id = id(value)
+    if value_id in visited:
+        return False
+    if isinstance(value, dict):
+        visited.add(value_id)
+        result = any(_contains_resolvable_ref(v, visited) for v in value.values())
+        visited.discard(value_id)
+        return result
+    if isinstance(value, list | tuple | set | frozenset):
+        visited.add(value_id)
+        result = any(_contains_resolvable_ref(item, visited) for item in value)
+        visited.discard(value_id)
+        return result
+    return False
+
+
+def _rebuild_tuple(value: tuple[Any, ...], resolved_items: list[Any]) -> tuple[Any, ...]:
+    if all(original is resolved for original, resolved in zip(value, resolved_items, strict=True)):
+        return value
+    if type(value) is tuple:
+        return tuple(resolved_items)
+    try:
+        return type(value)(*resolved_items)
+    except TypeError:
+        pass
+    try:
+        return type(value)(resolved_items)
+    except TypeError:
+        return tuple(resolved_items)
 
 
 class AsyncLocalExecutor:
@@ -201,15 +237,9 @@ class AsyncLocalExecutor:
                 try:
                     resolved_args = await self._resolve_args(args)
                     resolved_kwargs = await self._resolve_kwargs(kwargs)
-                    if effective_timeout is not None:
-                        result = await asyncio.wait_for(
-                            asyncio.to_thread(func, *resolved_args, **resolved_kwargs),
-                            timeout=effective_timeout.total_seconds(),
-                        )
-                    else:
-                        result = await asyncio.to_thread(
-                            func, *resolved_args, **resolved_kwargs
-                        )
+                    result = await self._call_task(
+                        func, resolved_args, resolved_kwargs, effective_timeout
+                    )
                     output_ref = await self._store_result(result, store, serializer)
                     commit.output_ref = output_ref
                     commit.status = TaskStatus.COMPLETED
@@ -260,7 +290,7 @@ class AsyncLocalExecutor:
 
         return commit
 
-    async def _resolve_value(self, value: Any) -> Any:
+    async def _resolve_value(self, value: Any, memo: dict[int, Any] | None = None) -> Any:
         async_load = getattr(value, "__cashet_async_load__", None)
         if async_load is not None:
             return await async_load()
@@ -268,6 +298,47 @@ class AsyncLocalExecutor:
             if inspect.iscoroutinefunction(value.load):
                 return await value.load()
             return await asyncio.to_thread(value.load)
+        if memo is None:
+            memo = {}
+        if not _contains_resolvable_ref(value):
+            return value
+        value_id = id(value)
+        if value_id in memo:
+            return memo[value_id]
+        if isinstance(value, dict):
+            dict_result: dict[Any, Any] = {}
+            memo[value_id] = dict_result
+            for k, v in value.items():
+                dict_result[k] = await self._resolve_value(v, memo)
+            return dict_result
+        if isinstance(value, list):
+            list_result: list[Any] = []
+            memo[value_id] = list_result
+            for item in value:
+                list_result.append(await self._resolve_value(item, memo))
+            return list_result
+        if isinstance(value, tuple):
+            resolved_items = [await self._resolve_value(item, memo) for item in value]
+            tuple_result = _rebuild_tuple(value, resolved_items)
+            memo[value_id] = tuple_result
+            return tuple_result
+        if isinstance(value, set):
+            set_result: set[Any] = set()
+            memo[value_id] = set_result
+            for item in value:
+                resolved_item = await self._resolve_value(item, memo)
+                set_result.add(resolved_item if isinstance(resolved_item, Hashable) else item)
+            return set_result
+        if isinstance(value, frozenset):
+            resolved_items = []
+            for item in value:
+                resolved_item = await self._resolve_value(item, memo)
+                resolved_items.append(
+                    resolved_item if isinstance(resolved_item, Hashable) else item
+                )
+            frozenset_result = frozenset(resolved_items)
+            memo[value_id] = frozenset_result
+            return frozenset_result
         return value
 
     async def _resolve_args(self, args: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -279,6 +350,28 @@ class AsyncLocalExecutor:
         for k, v in kwargs.items():
             resolved[k] = await self._resolve_value(v)
         return resolved
+
+    async def _call_task(
+        self,
+        func: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        timeout: timedelta | None,
+    ) -> Any:
+        if timeout is None:
+            return await self._call_task_body(func, args, kwargs)
+        async with asyncio.timeout(timeout.total_seconds()):
+            return await self._call_task_body(func, args, kwargs)
+
+    async def _call_task_body(
+        self,
+        func: Any,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        if inspect.iscoroutinefunction(func):
+            return await func(*args, **kwargs)
+        return await asyncio.to_thread(func, *args, **kwargs)
 
     async def _store_result(
         self, result: Any, store: AsyncStore, serializer: Serializer
