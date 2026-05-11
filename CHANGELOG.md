@@ -12,6 +12,10 @@
   record deduplicated input refs in commit metadata.
 - Preserve tuple subclasses while resolving refs and keep dict/frozenset
   resolution from creating unhashable container members.
+- Preserve awaitable objects returned by task functions instead of awaiting
+  returned values a second time.
+- Include stable immutable built-in globals such as `range`, `slice`, and
+  `datetime` values in function hashes.
 - Raise a clear `cashet[redis]` install error when `RedisStore` or
   `AsyncRedisStore` is imported from a base install without the Redis extra.
 
