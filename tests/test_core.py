@@ -268,6 +268,21 @@ class TestDAGResolution:
         data_ref = client.submit(gen_data)
         assert client.submit(count_items, frozenset({data_ref})).load() == 1
 
+    def test_duplicate_nested_input_refs_are_deduplicated(self, client: Client) -> None:
+        def gen_data() -> int:
+            return 10
+
+        def total(values: list[int]) -> int:
+            return sum(values)
+
+        data_ref = client.submit(gen_data)
+        result_ref = client.submit(total, [data_ref, data_ref])
+        assert result_ref.load() == 20
+
+        commit = client.show(result_ref.commit_hash)
+        assert commit is not None
+        assert [ref.hash for ref in commit.input_refs] == [data_ref.hash]
+
     def test_chained_pipeline(self, client: Client) -> None:
         def step1() -> int:
             return 10

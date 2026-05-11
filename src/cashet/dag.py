@@ -45,7 +45,14 @@ def resolve_input_refs(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Ob
         _collect_input_refs(arg, refs, visited)
     for val in kwargs.values():
         _collect_input_refs(val, refs, visited)
-    return refs
+    unique_refs: list[ObjectRef] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if ref.hash in seen:
+            continue
+        seen.add(ref.hash)
+        unique_refs.append(ref)
+    return unique_refs
 
 
 class AsyncResultRef(Generic[T]):
