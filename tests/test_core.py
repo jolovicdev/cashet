@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -237,6 +237,36 @@ class TestDAGResolution:
         commit = client.show(result_ref.commit_hash)
         assert commit is not None
         assert [ref.hash for ref in commit.input_refs] == [data_ref.hash]
+
+    def test_tuple_subclass_arg_preserved_without_refs(self, client: Client) -> None:
+        class Point(NamedTuple):
+            x: int
+            y: int
+
+        def add_point(point: Point) -> int:
+            return point.x + point.y
+
+        assert client.submit(add_point, Point(1, 2)).load() == 3
+
+    def test_ref_dict_key_not_resolved_to_unhashable_value(self, client: Client) -> None:
+        def gen_data() -> list[int]:
+            return [1, 2, 3]
+
+        def count_keys(payload: dict[object, str]) -> int:
+            return len(payload)
+
+        data_ref = client.submit(gen_data)
+        assert client.submit(count_keys, {data_ref: "value"}).load() == 1
+
+    def test_ref_in_frozenset_stays_hashable_if_result_is_not(self, client: Client) -> None:
+        def gen_data() -> list[int]:
+            return [1, 2, 3]
+
+        def count_items(items: frozenset[object]) -> int:
+            return len(items)
+
+        data_ref = client.submit(gen_data)
+        assert client.submit(count_items, frozenset({data_ref})).load() == 1
 
     def test_chained_pipeline(self, client: Client) -> None:
         def step1() -> int:

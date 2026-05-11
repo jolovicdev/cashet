@@ -7,7 +7,7 @@ import logging
 import time
 import traceback
 import weakref
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Hashable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -47,6 +47,42 @@ async def _async_store_lock(
 
 def _is_stale_claim(commit: Commit, ttl: timedelta) -> bool:
     return datetime.now(UTC) - commit.claimed_at > ttl
+
+
+def _contains_resolvable_ref(value: Any, visited: set[int] | None = None) -> bool:
+    if hasattr(value, "__cashet_ref__"):
+        return True
+    if visited is None:
+        visited = set()
+    value_id = id(value)
+    if value_id in visited:
+        return False
+    if isinstance(value, dict):
+        visited.add(value_id)
+        result = any(_contains_resolvable_ref(v, visited) for v in value.values())
+        visited.discard(value_id)
+        return result
+    if isinstance(value, list | tuple | set | frozenset):
+        visited.add(value_id)
+        result = any(_contains_resolvable_ref(item, visited) for item in value)
+        visited.discard(value_id)
+        return result
+    return False
+
+
+def _rebuild_tuple(value: tuple[Any, ...], resolved_items: list[Any]) -> tuple[Any, ...]:
+    if all(original is resolved for original, resolved in zip(value, resolved_items, strict=True)):
+        return value
+    if type(value) is tuple:
+        return tuple(resolved_items)
+    try:
+        return type(value)(*resolved_items)
+    except TypeError:
+        pass
+    try:
+        return type(value)(resolved_items)
+    except TypeError:
+        return tuple(resolved_items)
 
 
 class AsyncLocalExecutor:
@@ -264,6 +300,8 @@ class AsyncLocalExecutor:
             return await asyncio.to_thread(value.load)
         if memo is None:
             memo = {}
+        if not _contains_resolvable_ref(value):
+            return value
         value_id = id(value)
         if value_id in memo:
             return memo[value_id]
@@ -271,8 +309,7 @@ class AsyncLocalExecutor:
             dict_result: dict[Any, Any] = {}
             memo[value_id] = dict_result
             for k, v in value.items():
-                key = await self._resolve_value(k, memo)
-                dict_result[key] = await self._resolve_value(v, memo)
+                dict_result[k] = await self._resolve_value(v, memo)
             return dict_result
         if isinstance(value, list):
             list_result: list[Any] = []
@@ -282,17 +319,23 @@ class AsyncLocalExecutor:
             return list_result
         if isinstance(value, tuple):
             resolved_items = [await self._resolve_value(item, memo) for item in value]
-            tuple_result = tuple(resolved_items)
+            tuple_result = _rebuild_tuple(value, resolved_items)
             memo[value_id] = tuple_result
             return tuple_result
         if isinstance(value, set):
             set_result: set[Any] = set()
             memo[value_id] = set_result
             for item in value:
-                set_result.add(await self._resolve_value(item, memo))
+                resolved_item = await self._resolve_value(item, memo)
+                set_result.add(resolved_item if isinstance(resolved_item, Hashable) else item)
             return set_result
         if isinstance(value, frozenset):
-            resolved_items = [await self._resolve_value(item, memo) for item in value]
+            resolved_items = []
+            for item in value:
+                resolved_item = await self._resolve_value(item, memo)
+                resolved_items.append(
+                    resolved_item if isinstance(resolved_item, Hashable) else item
+                )
             frozenset_result = frozenset(resolved_items)
             memo[value_id] = frozenset_result
             return frozenset_result
