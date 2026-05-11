@@ -277,6 +277,20 @@ def _should_hash_global_value(obj: Any, visited: set[int] | None = None) -> bool
     return False
 
 
+def _code_names(code: types.CodeType, visited: set[int] | None = None) -> set[str]:
+    if visited is None:
+        visited = set()
+    code_id = id(code)
+    if code_id in visited:
+        return set()
+    visited.add(code_id)
+    names = set(code.co_names)
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            names.update(_code_names(const, visited))
+    return names
+
+
 def hash_function(
     func: types.FunctionType,
     include_deps: bool = True,
@@ -317,7 +331,7 @@ def hash_function(
                     non_func_closures.append(name)
             except ValueError:
                 pass
-    for name in sorted(func.__code__.co_names):
+    for name in sorted(_code_names(func.__code__)):
         if name not in func.__globals__:
             continue
         ref = func.__globals__[name]
