@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+from datetime import date
 from typing import Any
 
 from cashet import Client
@@ -432,6 +433,45 @@ class TestDynamicSource:
         assert ref1.hash != ref2.hash
         assert ref1.load() == [20]
         assert ref2.load() == [30]
+
+    def test_exec_function_invalidates_on_range_global_change(self, client: Client) -> None:
+        namespace: dict[str, Any] = {"WINDOW": range(2)}
+        exec("def f():\n    return list(WINDOW)", namespace)
+        func = namespace["f"]
+        ref1 = client.submit(func)
+
+        namespace["WINDOW"] = range(3)
+        ref2 = client.submit(func)
+
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == [0, 1]
+        assert ref2.load() == [0, 1, 2]
+
+    def test_exec_function_invalidates_on_slice_global_change(self, client: Client) -> None:
+        namespace: dict[str, Any] = {"PART": slice(0, 2)}
+        exec("def f(xs):\n    return xs[PART]", namespace)
+        func = namespace["f"]
+        ref1 = client.submit(func, [1, 2, 3])
+
+        namespace["PART"] = slice(1, 3)
+        ref2 = client.submit(func, [1, 2, 3])
+
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == [1, 2]
+        assert ref2.load() == [2, 3]
+
+    def test_exec_function_invalidates_on_date_global_change(self, client: Client) -> None:
+        namespace: dict[str, Any] = {"START": date(2026, 5, 11)}
+        exec("def f():\n    return START.isoformat()", namespace)
+        func = namespace["f"]
+        ref1 = client.submit(func)
+
+        namespace["START"] = date(2026, 5, 12)
+        ref2 = client.submit(func)
+
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == "2026-05-11"
+        assert ref2.load() == "2026-05-12"
 
     def test_lambda_hashes_by_bytecode(self, client: Client) -> None:
         f = lambda x: x * 3  # noqa: E731

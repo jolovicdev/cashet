@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import datetime as _datetime
 import hashlib
 import inspect
 import io
@@ -258,7 +259,21 @@ def _is_user_function(func: types.FunctionType) -> bool:
     return not _is_stdlib_or_site_path(mod_file)
 
 
-_HASHED_GLOBAL_TYPES = (type(None), bool, int, float, str, bytes, complex)
+_HASHED_GLOBAL_TYPES = (
+    type(None),
+    bool,
+    int,
+    float,
+    str,
+    bytes,
+    complex,
+    range,
+    _datetime.date,
+    _datetime.datetime,
+    _datetime.time,
+    _datetime.timedelta,
+    _datetime.timezone,
+)
 
 
 def _should_hash_global_value(obj: Any, visited: set[int] | None = None) -> bool:
@@ -269,6 +284,14 @@ def _should_hash_global_value(obj: Any, visited: set[int] | None = None) -> bool
     obj_id = id(obj)
     if obj_id in visited:
         return False
+    if isinstance(obj, slice):
+        visited.add(obj_id)
+        result = all(
+            _should_hash_global_value(item, visited)
+            for item in (obj.start, obj.stop, obj.step)
+        )
+        visited.discard(obj_id)
+        return result
     if isinstance(obj, tuple | frozenset):
         visited.add(obj_id)
         result = all(_should_hash_global_value(item, visited) for item in obj)
