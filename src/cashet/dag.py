@@ -6,7 +6,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any, Generic, TypeVar
 
-from cashet.hashing import Serializer
+from cashet.hashing import Serializer, object_state
 from cashet.models import Commit, ObjectRef, TaskDef, TaskStatus
 from cashet.protocols import AsyncStore
 
@@ -36,6 +36,13 @@ def _collect_input_refs(value: Any, refs: list[ObjectRef], visited: set[int]) ->
         for item in value:
             _collect_input_refs(item, refs, visited)
         visited.discard(value_id)
+    else:
+        state = object_state(value)
+        if state is not None:
+            visited.add(value_id)
+            for item in state.values():
+                _collect_input_refs(item, refs, visited)
+            visited.discard(value_id)
 
 
 def resolve_input_refs(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[ObjectRef]:

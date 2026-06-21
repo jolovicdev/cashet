@@ -12,6 +12,7 @@ import textwrap
 import types
 import warnings
 from datetime import timedelta
+from functools import lru_cache
 from typing import Any, Protocol, runtime_checkable
 
 from cashet.models import TaskDef
@@ -380,7 +381,8 @@ def hash_function(
     return h.hexdigest()
 
 
-def _slot_names(cls: type) -> list[str]:
+@lru_cache(maxsize=1024)
+def _slot_names(cls: type) -> tuple[str, ...]:
     names: list[str] = []
     for klass in cls.__mro__:
         slots = klass.__dict__.get("__slots__")
@@ -392,13 +394,13 @@ def _slot_names(cls: type) -> list[str]:
             if name in ("__dict__", "__weakref__"):
                 continue
             names.append(name)
-    return names
+    return tuple(names)
 
 
 _UNSET = object()
 
 
-def _object_state(obj: Any) -> dict[str, Any] | None:
+def object_state(obj: Any) -> dict[str, Any] | None:
     state: dict[str, Any] = {}
     instance_dict = getattr(obj, "__dict__", None)
     if isinstance(instance_dict, dict):
@@ -488,7 +490,7 @@ def _stable_repr_to(
     elif hasattr(obj, "__cashet_ref__"):
         buf.write(f"<ref:{obj.__cashet_ref__().hash}>")
     else:
-        state = _object_state(obj)
+        state = object_state(obj)
         if state is not None:
             obj_id = id(obj)
             if obj_id in _visited:
