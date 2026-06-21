@@ -21,7 +21,7 @@ from cashet._client_base import (
     resolve_task_config,
     set_task_metadata,
 )
-from cashet._export import export_store, import_store
+from cashet._export import ImportResult, export_store, import_store
 from cashet.async_executor import AsyncLocalExecutor
 from cashet.dag import AsyncResultRef
 from cashet.hashing import PickleSerializer, Serializer, build_task_def, warn_default_pickle
@@ -251,7 +251,7 @@ class AsyncClient:
     async def export(self, path: str | Path) -> None:
         await export_store(self.store, Path(path))
 
-    async def import_archive(self, path: str | Path) -> int:
+    async def import_archive(self, path: str | Path) -> ImportResult:
         return await import_store(self.store, Path(path))
 
     async def close(self) -> None:

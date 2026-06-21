@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
 from cashet import Client
-from cashet.hashing import ClosureWarning, _ast_canonical, hash_function
+from cashet.hashing import (
+    ClosureWarning,
+    UnhashableArgWarning,
+    _ast_canonical,
+    hash_args,
+    hash_function,
+)
 
 
 class TestHashingEdgeCases:
@@ -123,6 +130,71 @@ class TestHashingEdgeCases:
         assert ref2.load() == 2
 
 
+class TestObjectStateHashing:
+    def test_slotted_objects_with_equal_state_hash_equal(self) -> None:
+        class Point:
+            __slots__ = ("x", "y")
+
+            def __init__(self, x: int, y: int) -> None:
+                self.x = x
+                self.y = y
+
+        assert hash_args(Point(1, 2)) == hash_args(Point(1, 2))
+
+    def test_slotted_objects_with_different_state_hash_differ(self) -> None:
+        class Point:
+            __slots__ = ("x", "y")
+
+            def __init__(self, x: int, y: int) -> None:
+                self.x = x
+                self.y = y
+
+        assert hash_args(Point(1, 2)) != hash_args(Point(1, 3))
+
+    def test_dataclass_with_slots_hashes_by_value(self) -> None:
+        @dataclass(slots=True)
+        class Config:
+            name: str
+            limit: int
+
+        assert hash_args(Config("a", 1)) == hash_args(Config("a", 1))
+        assert hash_args(Config("a", 1)) != hash_args(Config("a", 2))
+
+    def test_mixed_dict_and_slots_state_both_hashed(self) -> None:
+        class Base:
+            __slots__ = ("__dict__", "a")
+
+            def __init__(self, a: int, b: int) -> None:
+                self.a = a
+                self.b = b
+
+        assert hash_args(Base(1, 2)) == hash_args(Base(1, 2))
+        assert hash_args(Base(1, 2)) != hash_args(Base(1, 9))
+
+    def test_opaque_object_warns(self) -> None:
+        class Opaque:
+            __slots__ = ()
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            hash_args(Opaque())
+        unhashable = [x for x in w if issubclass(x.category, UnhashableArgWarning)]
+        assert len(unhashable) >= 1
+
+    def test_custom_repr_object_does_not_warn(self) -> None:
+        class Stable:
+            __slots__ = ()
+
+            def __repr__(self) -> str:
+                return "Stable()"
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            hash_args(Stable())
+        unhashable = [x for x in w if issubclass(x.category, UnhashableArgWarning)]
+        assert len(unhashable) == 0
+
+
 class TestASTNormalizedHashing:
     def test_comment_stripped(self) -> None:
         src1 = "def foo(x):\n    # important\n    return x + 1"
@@ -143,6 +215,19 @@ class TestASTNormalizedHashing:
         src1 = 'def foo(x):\n    """original"""\n    return x'
         src2 = 'def foo(x):\n    """updated docs"""\n    return x'
         assert _ast_canonical(src1) == _ast_canonical(src2)
+
+    def test_only_docstring_function_does_not_crash(self) -> None:
+        src = 'def f():\n    """only docs"""'
+        out = _ast_canonical(src)
+        assert "only docs" not in out
+        assert _ast_canonical(src) == out
+
+    def test_canonical_form_is_parseable_source(self) -> None:
+        import ast
+
+        out = _ast_canonical("def f(x):\n    # note\n    return x+1")
+        # ast.unparse yields source text (round-trippable), unlike ast.dump.
+        ast.parse(out)
 
     def test_different_functions_different_hash(self) -> None:
         def add(x: int, y: int) -> int:
@@ -420,6 +505,44 @@ class TestDynamicSource:
         assert ref1.hash != ref2.hash
         assert ref1.load() == 20
         assert ref2.load() == 30
+
+    def test_exec_function_invalidates_on_dict_global_change(self, client: Client) -> None:
+        namespace: dict[str, Any] = {"CONFIG": {"factor": 2}}
+        exec("def f(x):\n    return x * CONFIG['factor']", namespace)
+        func = namespace["f"]
+        ref1 = client.submit(func, 10)
+
+        namespace["CONFIG"] = {"factor": 3}
+        ref2 = client.submit(func, 10)
+
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == 20
+        assert ref2.load() == 30
+
+    def test_exec_function_invalidates_on_list_global_change(self, client: Client) -> None:
+        namespace: dict[str, Any] = {"WEIGHTS": [1, 2]}
+        exec("def f():\n    return sum(WEIGHTS)", namespace)
+        func = namespace["f"]
+        ref1 = client.submit(func)
+
+        namespace["WEIGHTS"] = [1, 2, 3]
+        ref2 = client.submit(func)
+
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == 3
+        assert ref2.load() == 6
+
+    def test_global_container_with_unstable_member_not_hashed(self, client: Client) -> None:
+        namespace: dict[str, Any] = {"REGISTRY": {"handler": object()}}
+        exec("def f():\n    return len(REGISTRY)", namespace)
+        func = namespace["f"]
+        ref1 = client.submit(func)
+
+        namespace["REGISTRY"] = {"handler": object()}
+        ref2 = client.submit(func)
+
+        assert ref1.hash == ref2.hash
+        assert ref1.load() == 1
 
     def test_comprehension_invalidates_on_global_value_change(self, client: Client) -> None:
         namespace: dict[str, Any] = {"MULTIPLIER": 2}

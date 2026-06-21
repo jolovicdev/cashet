@@ -18,6 +18,9 @@ _DECR_DELETE_SCRIPT = """
     local ref_key = KEYS[1]
     local blob_key = KEYS[2]
     local stats_key = KEYS[3]
+    if redis.call('EXISTS', ref_key) == 0 then
+        return 0
+    end
     local count = redis.call('DECR', ref_key)
     if count <= 0 then
         local existed = redis.call('EXISTS', blob_key)
@@ -54,6 +57,10 @@ def _fp_key(fingerprint: str) -> str:
     return f"cashet:index:fingerprint:{fingerprint}"
 
 
+def _running_key(fingerprint: str) -> str:
+    return f"cashet:index:running:{fingerprint}"
+
+
 def _func_key(func_name: str) -> str:
     return f"cashet:index:func:{func_name}"
 
@@ -63,11 +70,13 @@ def _status_key(status: str) -> str:
 
 
 def _tag_key(key: str) -> str:
-    return f"cashet:tag:{key}"
+    return f"cashet:tagk:{key}"
 
 
 def _tag_value_key(key: str, value: str) -> str:
-    return f"cashet:tag:{key}:{value}"
+    # Length-prefix the key so a ':' inside a tag key or value can never make
+    # two distinct (key, value) pairs collide onto the same set.
+    return f"cashet:tagv:{len(key)}:{key}:{value}"
 
 
 def _access_key() -> str:
@@ -250,6 +259,10 @@ def _index_commit_commands(pipe: Any, commit: Commit) -> None:
     for status in TaskStatus:
         pipe.srem(_status_key(status.value), commit.hash)
     pipe.sadd(_status_key(commit.status.value), commit.hash)
+    if commit.status == TaskStatus.RUNNING:
+        pipe.sadd(_running_key(commit.fingerprint), commit.hash)
+    else:
+        pipe.srem(_running_key(commit.fingerprint), commit.hash)
     for key, val in commit.tags.items():
         pipe.sadd(_tag_key(key), commit.hash)
         pipe.sadd(_tag_value_key(key, val), commit.hash)
@@ -259,6 +272,7 @@ def _remove_commit_index_commands(pipe: Any, commit: Commit, resolved_hash: str)
     pipe.delete(_commit_key(resolved_hash))
     pipe.zrem("cashet:index:all", resolved_hash)
     pipe.zrem(_fp_key(commit.fingerprint), resolved_hash)
+    pipe.srem(_running_key(commit.fingerprint), resolved_hash)
     pipe.zrem(_func_key(commit.task_def.func_name), resolved_hash)
     pipe.zrem(_access_key(), resolved_hash)
     for status in TaskStatus:
@@ -397,7 +411,7 @@ class AsyncRedisStore:
         return None
 
     async def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
-        hashes = await self._redis.zrevrange(_fp_key(fingerprint), 0, -1)
+        hashes = await self._redis.smembers(_running_key(fingerprint))
         for h in hashes:
             h_str = h.decode() if isinstance(h, bytes) else h
             commit = await self.get_commit(h_str)

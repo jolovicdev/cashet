@@ -9,9 +9,6 @@ from pathlib import Path
 from typing import Any, TypeVar, cast, overload
 
 from cashet._batch import (
-    build_deps,
-    normalize_tasks,
-    topological_sort,
     unpack_dict_tasks,
     unpack_list_tasks,
 )
@@ -19,6 +16,7 @@ from cashet._client_base import (
     resolve_store_dir,
     set_task_metadata,
 )
+from cashet._export import ImportResult
 from cashet._runner import BlockingAsyncRunner
 from cashet.adapters import SyncStoreAdapter
 from cashet.async_client import AsyncClient
@@ -192,15 +190,12 @@ class Client:
         max_workers: int | None = None,
     ) -> list[ResultRef[Any]] | dict[str, ResultRef[Any]]:
         is_dict = isinstance(tasks, dict)
+        # Only the keys are needed here to map results back; the async client owns
+        # normalization, dependency resolution, and topological ordering.
         if is_dict:
-            keys, raw_tasks = unpack_dict_tasks(tasks)
+            keys, _ = unpack_dict_tasks(tasks)
         else:
-            keys, raw_tasks = unpack_list_tasks(tasks)
-
-        key_set = set(keys)
-        normalized = normalize_tasks(raw_tasks, _cache, _tags, _retries, _force, _timeout, _ttl)
-        deps, _task_refs = build_deps(keys, normalized, key_set)
-        _order = topological_sort(deps)
+            keys, _ = unpack_list_tasks(tasks)
         workers = max_workers if max_workers is not None else self._max_workers
 
         async_results = self._runner.call(
@@ -314,7 +309,7 @@ class Client:
     def export(self, path: str | Path) -> None:
         self._runner.call(self._async_client.export(path))
 
-    def import_archive(self, path: str | Path) -> int:
+    def import_archive(self, path: str | Path) -> ImportResult:
         return self._runner.call(self._async_client.import_archive(path))
 
     def close(self) -> None:

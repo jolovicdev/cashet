@@ -12,12 +12,17 @@ import textwrap
 import types
 import warnings
 from datetime import timedelta
+from functools import lru_cache
 from typing import Any, Protocol, runtime_checkable
 
 from cashet.models import TaskDef
 
 
 class ClosureWarning(UserWarning):
+    pass
+
+
+class UnhashableArgWarning(UserWarning):
     pass
 
 
@@ -203,10 +208,13 @@ def hash_source(source: str) -> str:
 
 
 def _ast_canonical(source: str) -> str:
+    # ast.unparse normalizes whitespace and comments like ast.dump but, being
+    # source text rather than the internal AST repr, stays stable across Python
+    # versions whose ast.dump field set differs (e.g. type_params in 3.12).
     try:
         tree = ast.parse(source)
         _strip_docstrings(tree)
-        return ast.dump(tree)
+        return ast.unparse(tree)
     except SyntaxError:
         return source
 
@@ -225,6 +233,8 @@ def _strip_docstrings(node: ast.AST) -> None:
             and isinstance(child.body[0].value.value, str)
         ):
             child.body = child.body[1:]
+            if not child.body:
+                child.body = [ast.Pass()]
 
 
 def _is_stdlib_or_site_path(path: str) -> bool:
@@ -292,9 +302,17 @@ def _should_hash_global_value(obj: Any, visited: set[int] | None = None) -> bool
         )
         visited.discard(obj_id)
         return result
-    if isinstance(obj, tuple | frozenset):
+    if isinstance(obj, tuple | frozenset | list | set):
         visited.add(obj_id)
         result = all(_should_hash_global_value(item, visited) for item in obj)
+        visited.discard(obj_id)
+        return result
+    if isinstance(obj, dict):
+        visited.add(obj_id)
+        result = all(
+            _should_hash_global_value(k, visited) and _should_hash_global_value(v, visited)
+            for k, v in obj.items()
+        )
         visited.discard(obj_id)
         return result
     return False
@@ -376,6 +394,37 @@ def hash_function(
     return h.hexdigest()
 
 
+@lru_cache(maxsize=1024)
+def _slot_names(cls: type) -> tuple[str, ...]:
+    names: list[str] = []
+    for klass in cls.__mro__:
+        slots = klass.__dict__.get("__slots__")
+        if slots is None:
+            continue
+        if isinstance(slots, str):
+            slots = (slots,)
+        for name in slots:
+            if name in ("__dict__", "__weakref__"):
+                continue
+            names.append(name)
+    return tuple(names)
+
+
+_UNSET = object()
+
+
+def object_state(obj: Any) -> dict[str, Any] | None:
+    state: dict[str, Any] = {}
+    instance_dict = getattr(obj, "__dict__", None)
+    if isinstance(instance_dict, dict):
+        state.update(instance_dict)
+    for name in _slot_names(type(obj)):
+        value = getattr(obj, name, _UNSET)
+        if value is not _UNSET:
+            state[name] = value
+    return state or None
+
+
 def _stable_repr_to(
     buf: io.StringIO, obj: Any, _visited: set[int] | None = None
 ) -> None:
@@ -453,18 +502,30 @@ def _stable_repr_to(
         buf.write(f"<type:{obj.__module__}.{obj.__qualname__}>")
     elif hasattr(obj, "__cashet_ref__"):
         buf.write(f"<ref:{obj.__cashet_ref__().hash}>")
-    elif hasattr(obj, "__dict__"):
-        obj_id = id(obj)
-        if obj_id in _visited:
-            buf.write(f"<{type(obj).__module__}.{type(obj).__qualname__}:...>")
-            return
-        _visited.add(obj_id)
-        buf.write(f"<{type(obj).__module__}.{type(obj).__qualname__}:")
-        _stable_repr_to(buf, obj.__dict__, _visited)
-        buf.write(">")
-        _visited.discard(obj_id)
     else:
-        buf.write(repr(obj))
+        state = object_state(obj)
+        if state is not None:
+            obj_id = id(obj)
+            if obj_id in _visited:
+                buf.write(f"<{type(obj).__module__}.{type(obj).__qualname__}:...>")
+                return
+            _visited.add(obj_id)
+            buf.write(f"<{type(obj).__module__}.{type(obj).__qualname__}:")
+            _stable_repr_to(buf, state, _visited)
+            buf.write(">")
+            _visited.discard(obj_id)
+        else:
+            if type(obj).__repr__ is object.__repr__:
+                warnings.warn(
+                    f"Argument of type "
+                    f"{type(obj).__module__}.{type(obj).__qualname__} has no "
+                    f"__dict__/__slots__ and uses the default repr; it cannot be "
+                    f"hashed by value and will not cache reliably. Pass a "
+                    f"value-stable representation instead.",
+                    UnhashableArgWarning,
+                    stacklevel=2,
+                )
+            buf.write(repr(obj))
 
 
 def _stable_hash(

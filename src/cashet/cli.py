@@ -119,7 +119,7 @@ def show_cmd(hash: str) -> None:
         raise SystemExit(1) from None
     if commit is None:
         console.print(f"[red]Commit {hash} not found.[/red]")
-        return
+        raise SystemExit(1)
     out_hash = commit.output_ref.hash[:12] if commit.output_ref else "none"
     out_size = commit.output_ref.size if commit.output_ref else 0
     parent = commit.parent_hash[:12] if commit.parent_hash else "none"
@@ -164,7 +164,7 @@ def get_cmd(hash: str, output: str | None) -> None:
         raise SystemExit(1) from None
     if commit is None or commit.output_ref is None:
         console.print(f"[red]No result for {hash}[/red]")
-        return
+        raise SystemExit(1)
     ref = client.store.get_blob(commit.output_ref)
     if output:
         pathlib.Path(output).write_bytes(ref)
@@ -357,11 +357,15 @@ def import_archive(path: str) -> None:
 
     client = _client()
     try:
-        count = client.import_archive(path)
+        result = client.import_archive(path)
     except (OSError, tarfile.TarError, ValueError) as e:
         console.print(f"[red]Import failed: {e}[/red]")
         raise SystemExit(1) from None
-    console.print(f"[green]Imported {count} commit(s) from {path}[/green]")
+    console.print(f"[green]Imported {result.imported} commit(s) from {path}[/green]")
+    if result.skipped:
+        console.print(
+            f"[yellow]Skipped {result.skipped} commit(s) with missing blobs[/yellow]"
+        )
 
 
 if __name__ == "__main__":

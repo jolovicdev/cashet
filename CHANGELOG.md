@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.4.5 - 21.6.2026.
+
+### Fixed
+- Hash objects by their `__slots__`/`__dict__` state instead of the memory
+  address. Slotted value types (including `@dataclass(slots=True)`) cached by
+  identity before, so identical calls missed the cache every run and lossy
+  custom reprs could collide. Truly opaque objects now warn instead of silently
+  address-hashing.
+- Record `ResultRef` values nested inside custom-object attributes in commit
+  lineage, matching what the hasher already accounts for, so garbage collection
+  cannot evict a blob a commit still depends on.
+- Hash referenced module-global `dict`/`list`/`set` values consistently with
+  scalars, so config-style globals invalidate the cache when they change.
+- Canonicalize function source with `ast.unparse` instead of `ast.dump`, which
+  keeps the same comment/whitespace/docstring insensitivity but stays stable
+  across Python versions whose `ast.dump` field set differs.
+- Treat the `last_accessed_at` bump on a cache hit as best-effort so a locked
+  database no longer turns a successful lookup into an error.
+- Skip a post-eviction `VACUUM` that is blocked by a concurrent writer instead
+  of failing an eviction whose deletes already committed.
+- Prevent Redis tag index key collisions: presence and value indexes now use
+  distinct prefixes and the value key length-prefixes the tag key, so a `:` in
+  a key or value can no longer cross-match unrelated commits.
+- Make the Redis blob delete script idempotent against a missing reference
+  counter so it cannot drop a blob another commit still references.
+- Enforce the HTTP server request size limit on the bytes actually received,
+  closing a bypass for chunked requests that omit `Content-Length`. On
+  token-protected servers, unauthenticated requests are now rejected before any
+  body is buffered.
+- Validate handler input (returning 400) and wrap every server handler in a
+  generic 500 barrier so malformed input and internal errors no longer leak
+  stack traces; `/gc` also accepts an empty body and falls back to defaults.
+- Report commits skipped during a lossy import. A truncated archive no longer
+  looks like a clean import.
+- Exit non-zero from `cashet show` and `cashet get` when a commit is missing,
+  matching `cashet rm`.
+- Cancel in-flight sibling tasks when a parallel `submit_many` task fails,
+  instead of leaving them running after the error is surfaced.
+
+### Performance
+- Redis `find_running_by_fingerprint` uses a per-fingerprint running-claim index
+  for O(1) lookup instead of scanning a fingerprint's full commit history on
+  every submit.
+
+### Changed
+- `import_archive` (sync and async) now returns an `ImportResult(imported,
+  skipped)` named tuple instead of a bare imported count.
+- Sync `submit_many` no longer recomputes the dependency graph that the async
+  client already builds.
+
+### Notes
+- The hashing fixes change function and argument cache keys, so results cached
+  by earlier versions recompute on first access. Blobs are content-addressed and
+  remain until garbage collected.
+- The Redis tag index key scheme changed. Tag indexes written by older versions
+  are not migrated; rewrite affected commits to rebuild them.
+
 ## 0.4.4 — 11.5.2026.
 
 ### Fixed

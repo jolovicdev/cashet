@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from typing import Any
 
+import pytest
 import pytest_asyncio
 
 from cashet import Client
@@ -93,3 +96,62 @@ class TestAsyncMap:
     async def test_map_empty(self, async_client: AsyncClient) -> None:
         refs = await async_client.map(double, [])
         assert refs == []
+
+
+class TestBatchCancellation:
+    async def test_failure_cancels_in_flight_siblings(self) -> None:
+        from cashet._batch import execute_batch
+        from cashet.models import Commit, TaskDef, TaskError, TaskStatus
+
+        sibling_started = asyncio.Event()
+        sibling_cancelled = asyncio.Event()
+
+        def failing() -> int:
+            return 0
+
+        def sibling() -> int:
+            return 0
+
+        fail_commit = Commit(
+            hash="f" * 64,
+            task_def=TaskDef(
+                func_hash="x", func_name="failing", func_source="",
+                args_hash="y", args_snapshot=b"",
+            ),
+            output_ref=None,
+            error="boom",
+            status=TaskStatus.FAILED,
+        )
+
+        class StubExecutor:
+            async def submit(self, func: Any, *_: Any) -> tuple[Commit, bool]:
+                if func is sibling:
+                    sibling_started.set()
+                    try:
+                        await asyncio.sleep(30)
+                    except asyncio.CancelledError:
+                        sibling_cancelled.set()
+                        raise
+                    raise AssertionError("sibling should have been cancelled")
+                await sibling_started.wait()
+                return fail_commit, False
+
+        keys: list[Any] = ["fail", "sib"]
+        normalized: list[Any] = [
+            (failing, (), {}, True, {}, 0, False, None, None),
+            (sibling, (), {}, True, {}, 0, False, None, None),
+        ]
+        with pytest.raises(TaskError):
+            await execute_batch(
+                order=keys,
+                keys=keys,
+                normalized=normalized,
+                task_refs={},
+                deps={"fail": set(), "sib": set()},
+                executor=StubExecutor(),
+                store=None,  # type: ignore[arg-type]
+                serializer=None,  # type: ignore[arg-type]
+                max_workers=2,
+            )
+        assert sibling_started.is_set()
+        assert sibling_cancelled.is_set()

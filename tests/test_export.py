@@ -40,6 +40,22 @@ def corrupt_first_blob(src: Path, dst: Path) -> None:
             patched.addfile(info, BytesIO(data))
 
 
+def drop_first_blob_and_manifest(src: Path, dst: Path) -> None:
+    with tarfile.open(src, "r:gz") as original, tarfile.open(dst, "w:gz") as patched:
+        dropped = False
+        for member in original.getmembers():
+            if member.name == "cashet-export/manifest.json":
+                continue
+            if member.name.startswith("cashet-export/blobs/") and not dropped:
+                dropped = True
+                continue
+            extracted = original.extractfile(member) if member.isfile() else None
+            data = extracted.read() if extracted is not None else b""
+            info = tarfile.TarInfo(member.name)
+            info.size = len(data)
+            patched.addfile(info, BytesIO(data))
+
+
 class TestSyncExport:
     def test_export_import_roundtrip(self, client: Client, tmp_path: Path) -> None:
         ref1 = client.submit(add, 1, 2)
@@ -52,8 +68,8 @@ class TestSyncExport:
         assert archive.exists()
 
         client2 = Client(store_dir=tmp_path / ".cashet2")
-        count = client2.import_archive(archive)
-        assert count == 2
+        result = client2.import_archive(archive)
+        assert result.imported == 2
 
         imported1 = client2.show(ref1.commit_hash)
         assert imported1 is not None
@@ -73,8 +89,8 @@ class TestSyncExport:
         archive = tmp_path / "export.tar.gz"
         client.export(archive)
 
-        count = client.import_archive(archive)
-        assert count == 0
+        result = client.import_archive(archive)
+        assert result.imported == 0
 
     def test_export_empty_store(self, client: Client, tmp_path: Path) -> None:
         archive = tmp_path / "empty.tar.gz"
@@ -82,8 +98,8 @@ class TestSyncExport:
         assert archive.exists()
 
         client2 = Client(store_dir=tmp_path / ".cashet2")
-        count = client2.import_archive(archive)
-        assert count == 0
+        result = client2.import_archive(archive)
+        assert result.imported == 0
 
     def test_import_rejects_corrupt_blob_payload(self, client: Client, tmp_path: Path) -> None:
         ref = client.submit(add, 1, 2)
@@ -98,6 +114,22 @@ class TestSyncExport:
         with pytest.raises(ValueError, match="hash mismatch"):
             client2.import_archive(corrupt_archive)
         assert client2.show(ref.commit_hash) is None
+
+    def test_import_reports_skipped_commits_with_missing_blobs(
+        self, client: Client, tmp_path: Path
+    ) -> None:
+        client.submit(add, 1, 2).load()
+        client.submit(greet, "world").load()
+
+        archive = tmp_path / "export.tar.gz"
+        lossy = tmp_path / "lossy.tar.gz"
+        client.export(archive)
+        drop_first_blob_and_manifest(archive, lossy)
+
+        client2 = Client(store_dir=tmp_path / ".cashet2")
+        result = client2.import_archive(lossy)
+        assert result.imported == 1
+        assert result.skipped == 1
 
 
 class TestAsyncExport:
@@ -114,8 +146,8 @@ class TestAsyncExport:
         assert archive.exists()
 
         client2 = AsyncClient(store_dir=tmp_path / ".cashet2")
-        count = await client2.import_archive(archive)
-        assert count == 2
+        result = await client2.import_archive(archive)
+        assert result.imported == 2
 
         imported1 = await client2.show(ref1.commit_hash)
         assert imported1 is not None
@@ -136,5 +168,5 @@ class TestAsyncExport:
         archive = tmp_path / "export.tar.gz"
         await async_client.export(archive)
 
-        count = await async_client.import_archive(archive)
-        assert count == 0
+        result = await async_client.import_archive(archive)
+        assert result.imported == 0

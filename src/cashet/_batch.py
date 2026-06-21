@@ -228,16 +228,25 @@ async def execute_batch(
             tasks[task] = key
 
     _schedule_ready()
-    while tasks:
-        done, _ = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            key = tasks.pop(task)
-            results[key] = task.result()
-            for dependent in rev[key]:
-                in_degree[dependent] -= 1
-                if in_degree[dependent] == 0:
-                    ready.append(dependent)
-            _schedule_ready()
+    try:
+        while tasks:
+            done, _ = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                key = tasks.pop(task)
+                results[key] = task.result()
+                for dependent in rev[key]:
+                    in_degree[dependent] -= 1
+                    if in_degree[dependent] == 0:
+                        ready.append(dependent)
+                _schedule_ready()
+    except BaseException:
+        # On any failure, cancel and drain in-flight siblings so they cannot keep
+        # running (and writing commits) after the error has been surfaced.
+        for pending in tasks:
+            pending.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
     logger.info("batch completed task_count=%d", len(keys))
     return results

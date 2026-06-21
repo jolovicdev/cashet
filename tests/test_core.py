@@ -283,6 +283,27 @@ class TestDAGResolution:
         assert commit is not None
         assert [ref.hash for ref in commit.input_refs] == [data_ref.hash]
 
+    def test_ref_in_custom_object_attribute_recorded_as_input(self, client: Client) -> None:
+        class Box:
+            __slots__ = ("payload",)
+
+            def __init__(self, payload: object) -> None:
+                self.payload = payload
+
+        def gen_data() -> int:
+            return 42
+
+        def consume(box: object) -> int:
+            return 1
+
+        data_ref = client.submit(gen_data)
+        result_ref = client.submit(consume, Box(data_ref))
+        assert result_ref.load() == 1
+
+        commit = client.show(result_ref.commit_hash)
+        assert commit is not None
+        assert data_ref.hash in [ref.hash for ref in commit.input_refs]
+
     def test_chained_pipeline(self, client: Client) -> None:
         def step1() -> int:
             return 10

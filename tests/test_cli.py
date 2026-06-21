@@ -104,7 +104,7 @@ class TestShow:
 
     def test_show_missing(self, cli_runner: CliRunner, store_dir: Path) -> None:
         result = _invoke(cli_runner, ["show", "deadbeef"], store_dir)
-        assert result.exit_code == 0
+        assert result.exit_code == 1
         assert "not found" in result.output
 
     def test_show_ambiguous_hash(self, cli_runner: CliRunner, store_dir: Path) -> None:
@@ -152,7 +152,7 @@ class TestGet:
 
     def test_get_missing(self, cli_runner: CliRunner, store_dir: Path) -> None:
         result = _invoke(cli_runner, ["get", "deadbeef"], store_dir)
-        assert result.exit_code == 0
+        assert result.exit_code == 1
         assert "No result" in result.output
 
     def test_get_ambiguous_hash(self, cli_runner: CliRunner, store_dir: Path) -> None:
