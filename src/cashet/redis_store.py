@@ -18,6 +18,9 @@ _DECR_DELETE_SCRIPT = """
     local ref_key = KEYS[1]
     local blob_key = KEYS[2]
     local stats_key = KEYS[3]
+    if redis.call('EXISTS', ref_key) == 0 then
+        return 0
+    end
     local count = redis.call('DECR', ref_key)
     if count <= 0 then
         local existed = redis.call('EXISTS', blob_key)

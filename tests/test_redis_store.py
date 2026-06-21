@@ -580,6 +580,34 @@ class TestRedisStoreWithClient:
         assert deleted == 1
         assert redis_store.get_commit("d" * 64) is None
 
+    def test_delete_does_not_drop_blob_when_ref_counter_missing(
+        self, redis_store: RedisStore
+    ) -> None:
+        import redis as _redis
+
+        from cashet.redis_store import _blob_ref_key
+
+        shared = redis_store.put_blob(b"shared-payload")
+        for h, fh in (("a" * 64, "1" * 64), ("b" * 64, "2" * 64)):
+            redis_store.put_commit(
+                Commit(
+                    hash=h,
+                    task_def=TaskDef(
+                        func_hash=fh, func_name="f", func_source="",
+                        args_hash="b" * 64, args_snapshot=b"",
+                    ),
+                    output_ref=shared,
+                    status=TaskStatus.COMPLETED,
+                )
+            )
+        # Simulate a lost/inconsistent ref counter for the shared blob.
+        _redis.Redis().delete(_blob_ref_key(shared.hash))
+
+        redis_store.delete_commit("a" * 64)
+
+        # Blob must survive: commit "b" still references it.
+        assert redis_store.get_blob(shared) == b"shared-payload"
+
     def test_delete_by_tags_no_collision_with_colon_in_key(
         self, redis_store: RedisStore
     ) -> None:
