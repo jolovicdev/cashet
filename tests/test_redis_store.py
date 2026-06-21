@@ -580,6 +580,36 @@ class TestRedisStoreWithClient:
         assert deleted == 1
         assert redis_store.get_commit("d" * 64) is None
 
+    def test_delete_by_tags_no_collision_with_colon_in_key(
+        self, redis_store: RedisStore
+    ) -> None:
+        # Tag key "a:b" (presence) must not collide with tag a="b" (value).
+        colon_key = Commit(
+            hash="a" * 64,
+            task_def=TaskDef(
+                func_hash="1" * 64, func_name="f", func_source="", args_hash="b" * 64,
+                args_snapshot=b"", tags={"a:b": "x"},
+            ),
+            tags={"a:b": "x"},
+            status=TaskStatus.COMPLETED,
+        )
+        value_pair = Commit(
+            hash="b" * 64,
+            task_def=TaskDef(
+                func_hash="2" * 64, func_name="f", func_source="", args_hash="b" * 64,
+                args_snapshot=b"", tags={"a": "b"},
+            ),
+            tags={"a": "b"},
+            status=TaskStatus.COMPLETED,
+        )
+        redis_store.put_commit(colon_key)
+        redis_store.put_commit(value_pair)
+
+        deleted = redis_store.delete_by_tags({"a:b": None})
+        assert deleted == 1
+        assert redis_store.get_commit("a" * 64) is None
+        assert redis_store.get_commit("b" * 64) is not None
+
     def test_delete_by_tags_bare_key(self, redis_store: RedisStore) -> None:
         for i, env in enumerate(["prod", "staging"]):
             task_def = TaskDef(

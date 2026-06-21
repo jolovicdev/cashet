@@ -63,11 +63,13 @@ def _status_key(status: str) -> str:
 
 
 def _tag_key(key: str) -> str:
-    return f"cashet:tag:{key}"
+    return f"cashet:tagk:{key}"
 
 
 def _tag_value_key(key: str, value: str) -> str:
-    return f"cashet:tag:{key}:{value}"
+    # Length-prefix the key so a ':' inside a tag key or value can never make
+    # two distinct (key, value) pairs collide onto the same set.
+    return f"cashet:tagv:{len(key)}:{key}:{value}"
 
 
 def _access_key() -> str:
