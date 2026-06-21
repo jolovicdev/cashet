@@ -357,11 +357,15 @@ def import_archive(path: str) -> None:
 
     client = _client()
     try:
-        count = client.import_archive(path)
+        result = client.import_archive(path)
     except (OSError, tarfile.TarError, ValueError) as e:
         console.print(f"[red]Import failed: {e}[/red]")
         raise SystemExit(1) from None
-    console.print(f"[green]Imported {count} commit(s) from {path}[/green]")
+    console.print(f"[green]Imported {result.imported} commit(s) from {path}[/green]")
+    if result.skipped:
+        console.print(
+            f"[yellow]Skipped {result.skipped} commit(s) with missing blobs[/yellow]"
+        )
 
 
 if __name__ == "__main__":

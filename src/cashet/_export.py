@@ -8,7 +8,7 @@ import tarfile
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from cashet.models import Commit, ObjectRef, StorageTier, TaskDef, TaskStatus
 from cashet.protocols import AsyncStore
@@ -164,8 +164,14 @@ def _is_safe_tar_member(name: str) -> bool:
     return ".." not in name.split("/")
 
 
-async def import_store(store: AsyncStore, tar_path: Path) -> int:
+class ImportResult(NamedTuple):
+    imported: int
+    skipped: int
+
+
+async def import_store(store: AsyncStore, tar_path: Path) -> ImportResult:
     imported = 0
+    skipped = 0
     with tarfile.open(tar_path, "r:gz") as tar:
         members: dict[str, tarfile.TarInfo] = {}
         for m in tar.getmembers():
@@ -257,6 +263,10 @@ async def import_store(store: AsyncStore, tar_path: Path) -> int:
                         missing_blobs.add(h)
                         has_missing = True
             if has_missing:
+                skipped += 1
+                logger.warning(
+                    "skipping commit with missing blob(s) hash=%s", commit.hash[:12]
+                )
                 continue
             commit.input_refs = [
                 blob_refs.get(r.hash, r) for r in commit.input_refs
@@ -267,4 +277,4 @@ async def import_store(store: AsyncStore, tar_path: Path) -> int:
                     commit.output_ref = blob_refs[out_h]
             await store.put_commit(commit)
             imported += 1
-    return imported
+    return ImportResult(imported=imported, skipped=skipped)

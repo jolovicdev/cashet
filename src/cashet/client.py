@@ -19,6 +19,7 @@ from cashet._client_base import (
     resolve_store_dir,
     set_task_metadata,
 )
+from cashet._export import ImportResult
 from cashet._runner import BlockingAsyncRunner
 from cashet.adapters import SyncStoreAdapter
 from cashet.async_client import AsyncClient
@@ -314,7 +315,7 @@ class Client:
     def export(self, path: str | Path) -> None:
         self._runner.call(self._async_client.export(path))
 
-    def import_archive(self, path: str | Path) -> int:
+    def import_archive(self, path: str | Path) -> ImportResult:
         return self._runner.call(self._async_client.import_archive(path))
 
     def close(self) -> None:
