@@ -297,9 +297,17 @@ def _should_hash_global_value(obj: Any, visited: set[int] | None = None) -> bool
         )
         visited.discard(obj_id)
         return result
-    if isinstance(obj, tuple | frozenset):
+    if isinstance(obj, tuple | frozenset | list | set):
         visited.add(obj_id)
         result = all(_should_hash_global_value(item, visited) for item in obj)
+        visited.discard(obj_id)
+        return result
+    if isinstance(obj, dict):
+        visited.add(obj_id)
+        result = all(
+            _should_hash_global_value(k, visited) and _should_hash_global_value(v, visited)
+            for k, v in obj.items()
+        )
         visited.discard(obj_id)
         return result
     return False

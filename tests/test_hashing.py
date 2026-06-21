@@ -493,6 +493,44 @@ class TestDynamicSource:
         assert ref1.load() == 20
         assert ref2.load() == 30
 
+    def test_exec_function_invalidates_on_dict_global_change(self, client: Client) -> None:
+        namespace: dict[str, Any] = {"CONFIG": {"factor": 2}}
+        exec("def f(x):\n    return x * CONFIG['factor']", namespace)
+        func = namespace["f"]
+        ref1 = client.submit(func, 10)
+
+        namespace["CONFIG"] = {"factor": 3}
+        ref2 = client.submit(func, 10)
+
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == 20
+        assert ref2.load() == 30
+
+    def test_exec_function_invalidates_on_list_global_change(self, client: Client) -> None:
+        namespace: dict[str, Any] = {"WEIGHTS": [1, 2]}
+        exec("def f():\n    return sum(WEIGHTS)", namespace)
+        func = namespace["f"]
+        ref1 = client.submit(func)
+
+        namespace["WEIGHTS"] = [1, 2, 3]
+        ref2 = client.submit(func)
+
+        assert ref1.hash != ref2.hash
+        assert ref1.load() == 3
+        assert ref2.load() == 6
+
+    def test_global_container_with_unstable_member_not_hashed(self, client: Client) -> None:
+        namespace: dict[str, Any] = {"REGISTRY": {"handler": object()}}
+        exec("def f():\n    return len(REGISTRY)", namespace)
+        func = namespace["f"]
+        ref1 = client.submit(func)
+
+        namespace["REGISTRY"] = {"handler": object()}
+        ref2 = client.submit(func)
+
+        assert ref1.hash == ref2.hash
+        assert ref1.load() == 1
+
     def test_comprehension_invalidates_on_global_value_change(self, client: Client) -> None:
         namespace: dict[str, Any] = {"MULTIPLIER": 2}
         exec("def f(xs):\n    return [x * MULTIPLIER for x in xs]", namespace)
