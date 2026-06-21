@@ -75,6 +75,62 @@ class TestServerSizeLimit:
         assert response.status_code == 200
 
 
+class TestServerValidation:
+    def test_log_bad_limit_returns_400(self, server_client: TestClient) -> None:
+        response = server_client.get("/log?limit=abc")
+        assert response.status_code == 400
+        assert "limit" in response.json()["error"]
+
+    def test_gc_bad_older_than_days_returns_400(self, server_client: TestClient) -> None:
+        response = server_client.post("/gc", json={"older_than_days": "soon"})
+        assert response.status_code == 400
+
+    def test_gc_invalid_json_returns_400(self, server_client: TestClient) -> None:
+        response = server_client.post(
+            "/gc", content=b"{not json", headers={"content-type": "application/json"}
+        )
+        assert response.status_code == 400
+
+    def test_gc_empty_body_uses_defaults(self, server_client: TestClient) -> None:
+        response = server_client.post("/gc")
+        assert response.status_code == 200
+        assert "deleted" in response.json()
+
+    def test_internal_error_returns_generic_500(
+        self, server_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client: Client = server_client.app.state.client  # type: ignore[attr-defined]
+
+        def boom() -> dict[str, int]:
+            raise RuntimeError("secret internal detail")
+
+        monkeypatch.setattr(client, "stats", boom)
+        response = server_client.get("/stats")
+        assert response.status_code == 500
+        assert response.json() == {"error": "Internal server error"}
+
+    async def test_async_log_bad_limit_returns_400(self, tmp_path: Path) -> None:
+        client = AsyncClient(store_dir=tmp_path / ".cashet")
+        app = create_async_app(client, tasks={"add": _add})
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            response = await ac.get("/log?limit=abc")
+        assert response.status_code == 400
+        await client.close()
+
+    async def test_async_gc_empty_body_uses_defaults(self, tmp_path: Path) -> None:
+        client = AsyncClient(store_dir=tmp_path / ".cashet")
+        app = create_async_app(client, tasks={"add": _add})
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            response = await ac.post("/gc")
+        assert response.status_code == 200
+        assert "deleted" in response.json()
+        await client.close()
+
+
 class TestServerSubmit:
     def test_submit_registered_task_with_json_args(self, server_client: TestClient) -> None:
         payload = {"task": "add", "args": [3, 4], "kwargs": {}}

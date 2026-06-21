@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import hmac
 import json
 import logging
@@ -51,6 +52,60 @@ def _too_large_response(max_size: int) -> _CustomJSONResponse:
     return _CustomJSONResponse(
         {"error": f"request body exceeds {max_size} bytes"}, status_code=413
     )
+
+
+class _BadRequestError(Exception):
+    pass
+
+
+def _query_int(request: Request, name: str, default: int) -> int:
+    raw = request.query_params.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise _BadRequestError(f"{name} must be an integer") from exc
+
+
+async def _json_body(request: Request) -> dict[str, Any]:
+    body = await request.body()
+    if not body:
+        return {}
+    data = json.loads(body)
+    if not isinstance(data, dict):
+        raise _BadRequestError("request body must be a JSON object")
+    return data
+
+
+def _gc_params(data: dict[str, Any]) -> tuple[float, int | None]:
+    older_than_days = data.get("older_than_days", 30)
+    if isinstance(older_than_days, bool) or not isinstance(older_than_days, int | float):
+        raise _BadRequestError("older_than_days must be a number")
+    max_size = data.get("max_size")
+    if max_size is not None and (isinstance(max_size, bool) or not isinstance(max_size, int)):
+        raise _BadRequestError("max_size must be an integer or null")
+    return older_than_days, max_size
+
+
+def _safe_handler(handler: Any) -> Any:
+    @functools.wraps(handler)
+    async def wrapper(request: Request) -> JSONResponse:
+        try:
+            return await handler(request)
+        except _BadRequestError as exc:
+            return _CustomJSONResponse({"error": str(exc)}, status_code=400)
+        except json.JSONDecodeError:
+            return _CustomJSONResponse({"error": "invalid JSON body"}, status_code=400)
+        except Exception:
+            logger.exception(
+                "request failed method=%s path=%s status=500",
+                request.method,
+                request.url.path,
+            )
+            return _CustomJSONResponse({"error": "Internal server error"}, status_code=500)
+
+    return wrapper
 
 
 def _reconstruct_func(data: dict[str, Any]) -> Callable[..., Any] | None:
@@ -280,7 +335,7 @@ async def _async_commit(request: Request) -> JSONResponse:
 async def _async_log(request: Request) -> JSONResponse:
     client: AsyncClient = request.app.state.client
     func_name = request.query_params.get("func")
-    limit = int(request.query_params.get("limit", "50"))
+    limit = _query_int(request, "limit", 50)
     status = request.query_params.get("status")
     start = time.perf_counter()
     commits = await client.log(func_name=func_name, limit=limit, status=status)
@@ -308,9 +363,7 @@ async def _async_gc(request: Request) -> JSONResponse:
     from datetime import timedelta
 
     client: AsyncClient = request.app.state.client
-    data = await request.json()
-    older_than_days = data.get("older_than_days", 30)
-    max_size = data.get("max_size")
+    older_than_days, max_size = _gc_params(await _json_body(request))
     start = time.perf_counter()
     deleted = await client.gc(timedelta(days=older_than_days), max_size_bytes=max_size)
     duration = int((time.perf_counter() - start) * 1000)
@@ -331,20 +384,28 @@ def create_async_app(
 ) -> Starlette:
     _validate_remote_code_options(allow_remote_code, require_token)
     routes = [
-        Route("/submit", _require_token(_async_submit, require_token), methods=["POST"]),
+        Route(
+            "/submit",
+            _require_token(_safe_handler(_async_submit), require_token),
+            methods=["POST"],
+        ),
         Route(
             "/result/{commit_hash}",
-            _require_token(_async_result, require_token),
+            _require_token(_safe_handler(_async_result), require_token),
             methods=["GET"],
         ),
         Route(
             "/commit/{commit_hash}",
-            _require_token(_async_commit, require_token),
+            _require_token(_safe_handler(_async_commit), require_token),
             methods=["GET"],
         ),
-        Route("/log", _require_token(_async_log, require_token), methods=["GET"]),
-        Route("/stats", _require_token(_async_stats, require_token), methods=["GET"]),
-        Route("/gc", _require_token(_async_gc, require_token), methods=["POST"]),
+        Route("/log", _require_token(_safe_handler(_async_log), require_token), methods=["GET"]),
+        Route(
+            "/stats",
+            _require_token(_safe_handler(_async_stats), require_token),
+            methods=["GET"],
+        ),
+        Route("/gc", _require_token(_safe_handler(_async_gc), require_token), methods=["POST"]),
     ]
 
     app = Starlette(
@@ -534,7 +595,7 @@ async def _commit(request: Request) -> JSONResponse:
 async def _log(request: Request) -> JSONResponse:
     client: Client = request.app.state.client
     func_name = request.query_params.get("func")
-    limit = int(request.query_params.get("limit", "50"))
+    limit = _query_int(request, "limit", 50)
     status = request.query_params.get("status")
     start = time.perf_counter()
 
@@ -569,9 +630,7 @@ async def _gc(request: Request) -> JSONResponse:
     from datetime import timedelta
 
     client: Client = request.app.state.client
-    data = await request.json()
-    older_than_days = data.get("older_than_days", 30)
-    max_size = data.get("max_size")
+    older_than_days, max_size = _gc_params(await _json_body(request))
     start = time.perf_counter()
 
     def _run() -> JSONResponse:
@@ -597,20 +656,28 @@ def create_app(
 ) -> Starlette:
     _validate_remote_code_options(allow_remote_code, require_token)
     routes = [
-        Route("/submit", _require_token(_submit, require_token), methods=["POST"]),
+        Route(
+            "/submit",
+            _require_token(_safe_handler(_submit), require_token),
+            methods=["POST"],
+        ),
         Route(
             "/result/{commit_hash}",
-            _require_token(_result, require_token),
+            _require_token(_safe_handler(_result), require_token),
             methods=["GET"],
         ),
         Route(
             "/commit/{commit_hash}",
-            _require_token(_commit, require_token),
+            _require_token(_safe_handler(_commit), require_token),
             methods=["GET"],
         ),
-        Route("/log", _require_token(_log, require_token), methods=["GET"]),
-        Route("/stats", _require_token(_stats, require_token), methods=["GET"]),
-        Route("/gc", _require_token(_gc, require_token), methods=["POST"]),
+        Route("/log", _require_token(_safe_handler(_log), require_token), methods=["GET"]),
+        Route(
+            "/stats",
+            _require_token(_safe_handler(_stats), require_token),
+            methods=["GET"],
+        ),
+        Route("/gc", _require_token(_safe_handler(_gc), require_token), methods=["POST"]),
     ]
     app = Starlette(
         routes=routes,
