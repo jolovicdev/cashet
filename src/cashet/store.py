@@ -558,16 +558,24 @@ class _SQLiteStoreCore:
                 deleted,
                 "size_limit" if max_size_bytes is not None else "ttl",
             )
-            c = self._connect()
-            mode = c.execute("PRAGMA auto_vacuum").fetchone()[0]
-            if mode == 2:
-                c.execute("PRAGMA incremental_vacuum")
-            else:
-                c.execute("VACUUM")
+            try:
+                self._vacuum()
+            except sqlite3.OperationalError:
+                # Reclaiming space is best-effort; a concurrent writer holding the
+                # lock must not undo an eviction whose deletes already committed.
+                logger.debug("vacuum skipped (db busy) after eviction")
         else:
             logger.debug("eviction found no candidates")
 
         return deleted
+
+    def _vacuum(self) -> None:
+        conn = self._connect()
+        mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+        if mode == 2:
+            conn.execute("PRAGMA incremental_vacuum")
+        else:
+            conn.execute("VACUUM")
 
     def _evict_to_size(self, current_bytes: int, max_size_bytes: int) -> int:
         pending_orphans: list[str] = []

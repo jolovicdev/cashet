@@ -653,6 +653,38 @@ class TestInlineStorage:
             blocker.execute("ROLLBACK")
             blocker.close()
 
+    def test_evict_survives_vacuum_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cashet.models import Commit, TaskDef, TaskStatus
+        from cashet.store import _SQLiteStoreCore
+
+        root = tmp_path / ".cashet"
+        core = _SQLiteStoreCore(root)
+        task_def = TaskDef(
+            func_hash="a", func_name="f", func_source="", args_hash="b", args_snapshot=b""
+        )
+        commit = Commit(
+            hash="c" * 64,
+            task_def=task_def,
+            output_ref=core.put_blob(b"v"),
+            status=TaskStatus.COMPLETED,
+        )
+        core.put_commit(commit)
+        core._connect().execute(
+            "UPDATE commits SET last_accessed_at = ? WHERE hash = ?",
+            ("2000-01-01T00:00:00+00:00", commit.hash),
+        )
+
+        def boom() -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(core, "_vacuum", boom)
+
+        deleted = core.evict(datetime.now(UTC))
+        assert deleted == 1
+        assert core.get_commit(commit.hash) is None
+
     def test_inline_stats(self, store_dir: Path) -> None:
         store = SQLiteStore(store_dir)
         store.put_blob(b"small")
