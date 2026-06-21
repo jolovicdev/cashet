@@ -21,6 +21,10 @@ class ClosureWarning(UserWarning):
     pass
 
 
+class UnhashableArgWarning(UserWarning):
+    pass
+
+
 _pickle_warning_issued = False
 
 
@@ -376,6 +380,36 @@ def hash_function(
     return h.hexdigest()
 
 
+def _slot_names(cls: type) -> list[str]:
+    names: list[str] = []
+    for klass in cls.__mro__:
+        slots = klass.__dict__.get("__slots__")
+        if slots is None:
+            continue
+        if isinstance(slots, str):
+            slots = (slots,)
+        for name in slots:
+            if name in ("__dict__", "__weakref__"):
+                continue
+            names.append(name)
+    return names
+
+
+_UNSET = object()
+
+
+def _object_state(obj: Any) -> dict[str, Any] | None:
+    state: dict[str, Any] = {}
+    instance_dict = getattr(obj, "__dict__", None)
+    if isinstance(instance_dict, dict):
+        state.update(instance_dict)
+    for name in _slot_names(type(obj)):
+        value = getattr(obj, name, _UNSET)
+        if value is not _UNSET:
+            state[name] = value
+    return state or None
+
+
 def _stable_repr_to(
     buf: io.StringIO, obj: Any, _visited: set[int] | None = None
 ) -> None:
@@ -453,18 +487,30 @@ def _stable_repr_to(
         buf.write(f"<type:{obj.__module__}.{obj.__qualname__}>")
     elif hasattr(obj, "__cashet_ref__"):
         buf.write(f"<ref:{obj.__cashet_ref__().hash}>")
-    elif hasattr(obj, "__dict__"):
-        obj_id = id(obj)
-        if obj_id in _visited:
-            buf.write(f"<{type(obj).__module__}.{type(obj).__qualname__}:...>")
-            return
-        _visited.add(obj_id)
-        buf.write(f"<{type(obj).__module__}.{type(obj).__qualname__}:")
-        _stable_repr_to(buf, obj.__dict__, _visited)
-        buf.write(">")
-        _visited.discard(obj_id)
     else:
-        buf.write(repr(obj))
+        state = _object_state(obj)
+        if state is not None:
+            obj_id = id(obj)
+            if obj_id in _visited:
+                buf.write(f"<{type(obj).__module__}.{type(obj).__qualname__}:...>")
+                return
+            _visited.add(obj_id)
+            buf.write(f"<{type(obj).__module__}.{type(obj).__qualname__}:")
+            _stable_repr_to(buf, state, _visited)
+            buf.write(">")
+            _visited.discard(obj_id)
+        else:
+            if type(obj).__repr__ is object.__repr__:
+                warnings.warn(
+                    f"Argument of type "
+                    f"{type(obj).__module__}.{type(obj).__qualname__} has no "
+                    f"__dict__/__slots__ and uses the default repr; it cannot be "
+                    f"hashed by value and will not cache reliably. Pass a "
+                    f"value-stable representation instead.",
+                    UnhashableArgWarning,
+                    stacklevel=2,
+                )
+            buf.write(repr(obj))
 
 
 def _stable_hash(

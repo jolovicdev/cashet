@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
 from cashet import Client
-from cashet.hashing import ClosureWarning, _ast_canonical, hash_function
+from cashet.hashing import (
+    ClosureWarning,
+    UnhashableArgWarning,
+    _ast_canonical,
+    hash_args,
+    hash_function,
+)
 
 
 class TestHashingEdgeCases:
@@ -121,6 +128,71 @@ class TestHashingEdgeCases:
         assert ref1.hash != ref2.hash
         assert ref1.load() == 1
         assert ref2.load() == 2
+
+
+class TestObjectStateHashing:
+    def test_slotted_objects_with_equal_state_hash_equal(self) -> None:
+        class Point:
+            __slots__ = ("x", "y")
+
+            def __init__(self, x: int, y: int) -> None:
+                self.x = x
+                self.y = y
+
+        assert hash_args(Point(1, 2)) == hash_args(Point(1, 2))
+
+    def test_slotted_objects_with_different_state_hash_differ(self) -> None:
+        class Point:
+            __slots__ = ("x", "y")
+
+            def __init__(self, x: int, y: int) -> None:
+                self.x = x
+                self.y = y
+
+        assert hash_args(Point(1, 2)) != hash_args(Point(1, 3))
+
+    def test_dataclass_with_slots_hashes_by_value(self) -> None:
+        @dataclass(slots=True)
+        class Config:
+            name: str
+            limit: int
+
+        assert hash_args(Config("a", 1)) == hash_args(Config("a", 1))
+        assert hash_args(Config("a", 1)) != hash_args(Config("a", 2))
+
+    def test_mixed_dict_and_slots_state_both_hashed(self) -> None:
+        class Base:
+            __slots__ = ("__dict__", "a")
+
+            def __init__(self, a: int, b: int) -> None:
+                self.a = a
+                self.b = b
+
+        assert hash_args(Base(1, 2)) == hash_args(Base(1, 2))
+        assert hash_args(Base(1, 2)) != hash_args(Base(1, 9))
+
+    def test_opaque_object_warns(self) -> None:
+        class Opaque:
+            __slots__ = ()
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            hash_args(Opaque())
+        unhashable = [x for x in w if issubclass(x.category, UnhashableArgWarning)]
+        assert len(unhashable) >= 1
+
+    def test_custom_repr_object_does_not_warn(self) -> None:
+        class Stable:
+            __slots__ = ()
+
+            def __repr__(self) -> str:
+                return "Stable()"
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            hash_args(Stable())
+        unhashable = [x for x in w if issubclass(x.category, UnhashableArgWarning)]
+        assert len(unhashable) == 0
 
 
 class TestASTNormalizedHashing:
