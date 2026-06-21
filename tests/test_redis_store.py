@@ -580,6 +580,21 @@ class TestRedisStoreWithClient:
         assert deleted == 1
         assert redis_store.get_commit("d" * 64) is None
 
+    def test_find_running_tracks_running_index(self, redis_store: RedisStore) -> None:
+        task_def = TaskDef(
+            func_hash="a" * 64, func_name="f", func_source="",
+            args_hash="b" * 64, args_snapshot=b"",
+        )
+        running = Commit(hash="a" * 64, task_def=task_def, status=TaskStatus.RUNNING)
+        redis_store.put_commit(running)
+        found = redis_store.find_running_by_fingerprint(task_def.fingerprint)
+        assert found is not None and found.hash == "a" * 64
+
+        # transition out of RUNNING clears the running claim
+        running.status = TaskStatus.COMPLETED
+        redis_store.put_commit(running)
+        assert redis_store.find_running_by_fingerprint(task_def.fingerprint) is None
+
     def test_delete_does_not_drop_blob_when_ref_counter_missing(
         self, redis_store: RedisStore
     ) -> None:
