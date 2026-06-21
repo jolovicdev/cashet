@@ -208,10 +208,13 @@ def hash_source(source: str) -> str:
 
 
 def _ast_canonical(source: str) -> str:
+    # ast.unparse normalizes whitespace and comments like ast.dump but, being
+    # source text rather than the internal AST repr, stays stable across Python
+    # versions whose ast.dump field set differs (e.g. type_params in 3.12).
     try:
         tree = ast.parse(source)
         _strip_docstrings(tree)
-        return ast.dump(tree)
+        return ast.unparse(tree)
     except SyntaxError:
         return source
 
@@ -230,6 +233,8 @@ def _strip_docstrings(node: ast.AST) -> None:
             and isinstance(child.body[0].value.value, str)
         ):
             child.body = child.body[1:]
+            if not child.body:
+                child.body = [ast.Pass()]
 
 
 def _is_stdlib_or_site_path(path: str) -> bool:

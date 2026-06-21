@@ -216,6 +216,19 @@ class TestASTNormalizedHashing:
         src2 = 'def foo(x):\n    """updated docs"""\n    return x'
         assert _ast_canonical(src1) == _ast_canonical(src2)
 
+    def test_only_docstring_function_does_not_crash(self) -> None:
+        src = 'def f():\n    """only docs"""'
+        out = _ast_canonical(src)
+        assert "only docs" not in out
+        assert _ast_canonical(src) == out
+
+    def test_canonical_form_is_parseable_source(self) -> None:
+        import ast
+
+        out = _ast_canonical("def f(x):\n    # note\n    return x+1")
+        # ast.unparse yields source text (round-trippable), unlike ast.dump.
+        ast.parse(out)
+
     def test_different_functions_different_hash(self) -> None:
         def add(x: int, y: int) -> int:
             return x + y
