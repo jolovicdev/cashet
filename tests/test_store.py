@@ -623,6 +623,36 @@ class TestInlineStorage:
         store.delete_commit(commit.hash)
         assert store.blob_exists(ref.hash) is False
 
+    def test_find_by_fingerprint_survives_locked_access_bump(self, tmp_path: Path) -> None:
+        from cashet.models import Commit, TaskDef, TaskStatus
+        from cashet.store import _SQLiteStoreCore
+
+        root = tmp_path / ".cashet"
+        core = _SQLiteStoreCore(root)
+        task_def = TaskDef(
+            func_hash="a", func_name="f", func_source="", args_hash="b", args_snapshot=b""
+        )
+        commit = Commit(
+            hash="c" * 64,
+            task_def=task_def,
+            output_ref=core.put_blob(b"v"),
+            status=TaskStatus.COMPLETED,
+        )
+        core.put_commit(commit)
+
+        conn = core._connect()
+        conn.execute("PRAGMA busy_timeout=100")
+        blocker = sqlite3.connect(str(root / "meta.db"), isolation_level=None)
+        blocker.execute("PRAGMA journal_mode=WAL")
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            found = core.find_by_fingerprint(task_def.fingerprint)
+            assert found is not None
+            assert found.hash == commit.hash
+        finally:
+            blocker.execute("ROLLBACK")
+            blocker.close()
+
     def test_inline_stats(self, store_dir: Path) -> None:
         store = SQLiteStore(store_dir)
         store.put_blob(b"small")

@@ -341,10 +341,15 @@ class _SQLiteStoreCore:
         ).fetchone()
         if row is None:
             return None
-        conn.execute(
-            "UPDATE commits SET last_accessed_at = ? WHERE hash = ?",
-            (now_iso, row["hash"]),
-        )
+        try:
+            conn.execute(
+                "UPDATE commits SET last_accessed_at = ? WHERE hash = ?",
+                (now_iso, row["hash"]),
+            )
+        except sqlite3.OperationalError:
+            # Access-time bump only feeds LRU ordering; never fail a cache hit
+            # because a concurrent writer holds the lock past busy_timeout.
+            logger.debug("last_accessed_at bump skipped (db locked) hash=%s", row["hash"][:12])
         return self._row_to_commit(row)
 
     def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
