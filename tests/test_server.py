@@ -74,6 +74,32 @@ class TestServerSizeLimit:
         response = tc.post("/submit", json={"task": "add", "args": [3, 4], "kwargs": {}})
         assert response.status_code == 200
 
+    def test_unauthenticated_rejected_before_buffering(self, tmp_path: Path) -> None:
+        client = Client(store_dir=tmp_path / ".cashet")
+        app = create_app(
+            client, tasks={"add": _add}, require_token="secret", max_content_length=200
+        )
+        tc = TestClient(app)
+
+        def body_chunks() -> Iterator[bytes]:
+            for _ in range(10):
+                yield b"x" * 100  # oversized, no Content-Length
+
+        # No token: rejected with 401 before the body is buffered (not 413).
+        response = tc.post("/submit", content=body_chunks())
+        assert response.status_code == 401
+
+    def test_authenticated_request_still_processed(self, tmp_path: Path) -> None:
+        client = Client(store_dir=tmp_path / ".cashet")
+        app = create_app(client, tasks={"add": _add}, require_token="secret")
+        tc = TestClient(app)
+        response = tc.post(
+            "/submit",
+            json={"task": "add", "args": [3, 4]},
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert response.status_code == 200
+
 
 class TestServerValidation:
     def test_log_bad_limit_returns_400(self, server_client: TestClient) -> None:

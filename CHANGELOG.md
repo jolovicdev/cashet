@@ -26,7 +26,9 @@
 - Make the Redis blob delete script idempotent against a missing reference
   counter so it cannot drop a blob another commit still references.
 - Enforce the HTTP server request size limit on the bytes actually received,
-  closing a bypass for chunked requests that omit `Content-Length`.
+  closing a bypass for chunked requests that omit `Content-Length`. On
+  token-protected servers, unauthenticated requests are now rejected before any
+  body is buffered.
 - Validate handler input (returning 400) and wrap every server handler in a
   generic 500 barrier so malformed input and internal errors no longer leak
   stack traces; `/gc` also accepts an empty body and falls back to defaults.

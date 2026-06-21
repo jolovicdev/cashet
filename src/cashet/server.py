@@ -200,13 +200,17 @@ def _decode_call(
     return tuple(args), kwargs, None
 
 
+def _token_authorized(auth: str, token: str) -> bool:
+    return auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], token)
+
+
 def _require_token(handler: Any, token: str | None) -> Any:
     if token is None:
         return handler
 
     async def wrapper(request: Request) -> JSONResponse:
         auth = request.headers.get("authorization", "")
-        if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:], token):
+        if not _token_authorized(auth, token):
             logger.warning(
                 "request unauthorized method=%s path=%s",
                 request.method,
@@ -416,6 +420,7 @@ def create_async_app(
     app.state.tasks = _server_tasks(client, tasks)
     app.state.allow_remote_code = allow_remote_code
     app.state.max_content_length = max_content_length
+    app.state.require_token = require_token
     return app
 
 
@@ -430,11 +435,24 @@ class _SizeLimitMiddleware:
             await self.app(scope, receive, send)
             return
         starlette_app = scope.get("app")
-        max_size = (
-            getattr(starlette_app.state, "max_content_length", _DEFAULT_MAX_CONTENT_LENGTH)
-            if starlette_app is not None
-            else _DEFAULT_MAX_CONTENT_LENGTH
-        )
+        state = starlette_app.state if starlette_app is not None else None
+        max_size = getattr(state, "max_content_length", _DEFAULT_MAX_CONTENT_LENGTH)
+
+        # Reject unauthenticated requests before buffering any body, so an
+        # unauthenticated client cannot force buffering up to max_content_length.
+        require_token = getattr(state, "require_token", None)
+        if require_token is not None:
+            auth = ""
+            for name, value in scope["headers"]:
+                if name == b"authorization":
+                    auth = value.decode("latin-1")
+                    break
+            if not _token_authorized(auth, require_token):
+                await _CustomJSONResponse(
+                    {"error": "unauthorized"}, status_code=401
+                )(scope, receive, send)
+                return
+
         for name, value in scope["headers"]:
             if name == b"content-length":
                 try:
@@ -687,4 +705,5 @@ def create_app(
     app.state.tasks = _server_tasks(client, tasks)
     app.state.allow_remote_code = allow_remote_code
     app.state.max_content_length = max_content_length
+    app.state.require_token = require_token
     return app
