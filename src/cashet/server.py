@@ -12,7 +12,6 @@ from typing import Any
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -48,24 +47,10 @@ def _validate_remote_code_options(
 _DEFAULT_MAX_CONTENT_LENGTH = 500 * 1024 * 1024
 
 
-def _limit_request_size(
-    request: Request,
-) -> JSONResponse | None:
-    max_size = getattr(request.app.state, "max_content_length", _DEFAULT_MAX_CONTENT_LENGTH)
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            size = int(content_length)
-        except ValueError:
-            return _CustomJSONResponse(
-                {"error": "invalid content-length"}, status_code=400
-            )
-        if size > max_size:
-            return _CustomJSONResponse(
-                {"error": f"request body exceeds {max_size} bytes"},
-                status_code=413,
-            )
-    return None
+def _too_large_response(max_size: int) -> _CustomJSONResponse:
+    return _CustomJSONResponse(
+        {"error": f"request body exceeds {max_size} bytes"}, status_code=413
+    )
 
 
 def _reconstruct_func(data: dict[str, Any]) -> Callable[..., Any] | None:
@@ -373,12 +358,59 @@ def create_async_app(
     return app
 
 
-class _SizeLimitMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Any) -> JSONResponse:
-        error = _limit_request_size(request)
-        if error is not None:
-            return error
-        return await call_next(request)
+class _SizeLimitMiddleware:
+    # Pure-ASGI so the body cap is enforced on bytes actually received, not on a
+    # client-supplied Content-Length that is absent for chunked requests.
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        starlette_app = scope.get("app")
+        max_size = (
+            getattr(starlette_app.state, "max_content_length", _DEFAULT_MAX_CONTENT_LENGTH)
+            if starlette_app is not None
+            else _DEFAULT_MAX_CONTENT_LENGTH
+        )
+        for name, value in scope["headers"]:
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    await _CustomJSONResponse(
+                        {"error": "invalid content-length"}, status_code=400
+                    )(scope, receive, send)
+                    return
+                if declared > max_size:
+                    await _too_large_response(max_size)(scope, receive, send)
+                    return
+                break
+
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                break
+            body.extend(message.get("body", b""))
+            if len(body) > max_size:
+                await _too_large_response(max_size)(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+
+        buffered = bytes(body)
+        replayed = False
+
+        async def replay_receive() -> Any:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": buffered, "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
 
 
 # Sync handlers run sync Client operations in threads so they don't block the event loop

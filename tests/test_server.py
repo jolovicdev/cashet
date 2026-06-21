@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -42,6 +43,36 @@ def server_client(tmp_path: Path) -> TestClient:
     client = Client(store_dir=tmp_path / ".cashet")
     app = create_app(client, tasks={"add": _add})
     return TestClient(app)
+
+
+class TestServerSizeLimit:
+    def _small_app(self, tmp_path: Path) -> TestClient:
+        client = Client(store_dir=tmp_path / ".cashet")
+        app = create_app(client, tasks={"add": _add}, max_content_length=200)
+        return TestClient(app)
+
+    def test_content_length_over_limit_rejected(self, tmp_path: Path) -> None:
+        tc = self._small_app(tmp_path)
+        payload = {"task": "add", "args": [1, 2], "pad": "x" * 500}
+        response = tc.post("/submit", json=payload)
+        assert response.status_code == 413
+        assert "exceeds" in response.json()["error"]
+
+    def test_chunked_request_without_content_length_rejected(self, tmp_path: Path) -> None:
+        tc = self._small_app(tmp_path)
+
+        def body_chunks() -> Iterator[bytes]:
+            for _ in range(10):
+                yield b"x" * 100  # 1000 bytes total, no Content-Length
+
+        response = tc.post("/submit", content=body_chunks())
+        assert response.status_code == 413
+        assert "exceeds" in response.json()["error"]
+
+    def test_request_within_limit_ok(self, tmp_path: Path) -> None:
+        tc = self._small_app(tmp_path)
+        response = tc.post("/submit", json={"task": "add", "args": [3, 4], "kwargs": {}})
+        assert response.status_code == 200
 
 
 class TestServerSubmit:
