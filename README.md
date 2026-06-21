@@ -1,18 +1,22 @@
 <h1 align="center">cashet</h1>
 
 <p align="center">
-  <strong>A Python memoization cache with Redis, async support, and an HTTP server.</strong><br>
-  Hash functions + args into cache keys. Results stored as immutable blobs. Chain outputs with DAG resolution.<br>
-  Run a function once — get the same result instantly every time after.
+  <strong>Content-addressable compute cache for Python: persistent function memoization with Redis, async, DAG pipelines, and an HTTP server.</strong><br>
+  Hash a function plus its arguments into a cache key, store the result as an immutable blob, and return it instantly on every later call.<br>
+  Think git for your function results.
+</p>
+
+<p align="center">
+  <em>Keywords: Python caching, memoization, disk cache, Redis cache, async asyncio, DAG pipeline, content-addressable, reproducible computation, joblib / lru_cache alternative.</em>
 </p>
 
 <p align="center">
   <a href="#install">Install</a> ·
-  <a href="#quickstart">Quick Start</a> ·
-  <a href="#why">Why</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#why-cashet">Why cashet</a> ·
   <a href="#use-cases">Use Cases</a> ·
   <a href="#cli">CLI</a> ·
-  <a href="#api">API</a> ·
+  <a href="#python-api">Python API</a> ·
   <a href="#how-it-works">How It Works</a>
 </p>
 
@@ -24,9 +28,15 @@
 
 ---
 
+## What is cashet
+
+cashet is a caching library for expensive Python functions. You submit a function and its arguments, cashet runs it once, stores the result as a content-addressed blob, and serves that result instantly on every later call with the same code and inputs. Caches persist across process restarts, can be shared across machines through Redis, and can be inspected, diffed, and chained from the CLI or the Python API.
+
+The cache key is a SHA-256 hash of the function's AST-normalized source plus its arguments. Comments, docstrings, and formatting do not invalidate the cache; only a real change to the code or the inputs does. Identical results are deduplicated to a single blob on disk, and every result is a git-like object you can inspect and chain into pipelines.
+
 ## Install
 
-**Global CLI tool** (recommended):
+Install as a global CLI tool:
 
 ```bash
 uv tool install cashet
@@ -34,13 +44,7 @@ uv tool install cashet
 pipx install cashet
 ```
 
-Then use the CLI anywhere:
-
-```bash
-cashet --help
-```
-
-**In a project** (library + CLI):
+Add to a project as a library and project-local CLI:
 
 ```bash
 uv add cashet
@@ -48,31 +52,15 @@ uv add cashet
 pip install cashet
 ```
 
-This installs `cashet` as both an importable Python library (`from cashet import Client`) and a project-local CLI (`uv run cashet`).
-
-**With Redis backend:**
+Optional backends:
 
 ```bash
-uv add "cashet[redis]"
-# or
-pip install "cashet[redis]"
-```
-
-**With HTTP server:**
-
-```bash
-uv add "cashet[server]"
-# or
-pip install "cashet[server]"
-```
-
-**All extras:**
-
-```bash
+uv add "cashet[redis]"     # shared cache via Redis
+uv add "cashet[server]"    # HTTP server
 uv add "cashet[redis,server]"
 ```
 
-**Develop / contribute:**
+Develop and contribute:
 
 ```bash
 git clone https://github.com/jolovicdev/cashet.git
@@ -81,37 +69,27 @@ uv sync --all-extras
 uv run pytest
 ```
 
-## Version Compatibility
-
-**0.2.x → 0.3.x: Hash format changed.** `hash_args` was unified with `serialize_args` to use a single canonical representation via `_stable_repr_to`. Same function + same arguments produce different cache fingerprints across the major version line. Caches created with 0.2.x **will not hit** on 0.3.x.
-
-**0.3.0 → 0.3.1:** Redis blob data keys renamed from `cashet:blob:{hash}` to `cashet:blob:data:{hash}` to fix a stats double-counting bug. Redis blob object/byte totals are maintained in `cashet:stats:blob` after a one-time backfill for existing caches. Function hashing also now includes defaults / keyword defaults in more cases, and custom object argument hashing includes the defining module. Existing 0.3.0 caches may miss after upgrading. Clear old caches before upgrading if you use Redis or rely on long-lived cache reuse across versions.
-
-**0.3.x → 0.4.0:** Added per-entry TTL and tag-based invalidation. SQLite stores auto-migrate (new `ttl_seconds` and `expires_at` columns). Redis stores encode new fields in commit JSON. Old caches are fully readable after upgrading.
-
-**Upgrading from an incompatible version:** either clear the cache (`cashet clear`) and rebuild, or point the new version at a fresh store directory.
-
 ## Quick Start
 
 ```python
 from cashet import Client
 
-client = Client()  # creates .cashet/ in current directory
+client = Client()  # creates .cashet/ in the current directory
 
 def expensive_transform(data, scale=1.0):
     # imagine this takes 10 minutes
     return [x * scale for x in data]
 
-# First call: runs the function
+# First call runs the function
 ref = client.submit(expensive_transform, [1, 2, 3], scale=2.0)
 print(ref.load())  # [2.0, 4.0, 6.0]
 
-# Second call with same args: instant — returns cached result
+# Same args again: instant, returns the cached result with no re-computation
 ref2 = client.submit(expensive_transform, [1, 2, 3], scale=2.0)
-print(ref2.load())  # [2.0, 4.0, 6.0] — no re-computation
+print(ref2.load())  # [2.0, 4.0, 6.0]
 ```
 
-You can also use `Client` as a context manager to ensure the store connection is closed cleanly:
+`Client` works as a context manager so the store connection closes cleanly:
 
 ```python
 with Client() as client:
@@ -119,50 +97,37 @@ with Client() as client:
     print(ref.load())
 ```
 
-Chain tasks into a pipeline where each step's output feeds into the next:
+### Pipelines
+
+Pass a result reference straight into the next task. Each step's output feeds the next, and cashet records the lineage:
 
 ```python
-from cashet import Client
-
 client = Client()
 
-def load_dataset(path):
-    return list(range(100))
-
-def normalize(data):
-    max_val = max(data)
-    return [x / max_val for x in data]
-
-def train_model(data, lr=0.01):
-    return {"loss": 0.05, "lr": lr, "samples": len(data)}
-
-# Step 1: load
 raw = client.submit(load_dataset, "data/train.csv")
-
-# Step 2: normalize (receives raw output as input)
-normalized = client.submit(normalize, raw)
-
-# Step 3: train (receives normalized output)
+normalized = client.submit(normalize, raw)            # receives raw's output
 model = client.submit(train_model, normalized, lr=0.001)
 
-print(model.load())  # {'loss': 0.05, 'lr': 0.001, 'samples': 100}
+print(model.load())
 ```
 
-Re-run the script — everything returns instantly from cache. Change one argument and only that step (and downstream) re-runs.
+Re-run the script and everything returns instantly from cache. Change one argument and only that step and the steps downstream of it re-run.
 
-**Shared cache with Redis** — multiple processes or machines share one cache:
+### Shared cache with Redis
+
+Multiple processes or machines share one cache:
 
 ```python
 from cashet import Client
 from cashet.redis_store import RedisStore
 
-client = Client(store=RedisStore("redis://localhost:6379"))
-
-# Any process on any machine using the same Redis gets cached results
+client = Client(store=RedisStore("redis://localhost:6379/0"))
 ref = client.submit(expensive_transform, [1, 2, 3], scale=2.0)
 ```
 
-**Async API** — drop-in `AsyncClient` for asyncio workflows:
+### Async
+
+`AsyncClient` is a drop-in for asyncio workflows and accepts both sync and async callables:
 
 ```python
 import asyncio
@@ -170,31 +135,16 @@ from cashet.async_client import AsyncClient
 
 async def main():
     client = AsyncClient()
-
-    def compute(x: int) -> int:
-        return x * 2
-
-    ref = await client.submit(compute, 21)
-    result = await ref.load()
-    print(result)  # 42
+    ref = await client.submit(lambda x: x * 2, 21)
+    print(await ref.load())  # 42
+    await client.close()
 
 asyncio.run(main())
 ```
 
-**HTTP server** — expose cache metadata and registered tasks over HTTP:
+### HTTP server
 
-```bash
-python -c "from cashet import Client; Client().serve(port=8000)"
-```
-
-```python
-# With auth token
-from cashet import Client
-client = Client()
-client.serve(port=8000, require_token="my-secret-token")
-```
-
-Register server-side tasks in the server process:
+Expose cache metadata and registered tasks over HTTP:
 
 ```python
 from cashet import Client
@@ -207,26 +157,19 @@ def double(x):
 client.serve(port=8000, tasks={"double": double})
 ```
 
-Submit JSON args from another process:
-
 ```python
 import requests
 
-r = requests.post("http://localhost:8000/submit", json={
-    "task": "double",
-    "args": [5],
-})
+requests.post("http://localhost:8000/submit", json={"task": "double", "args": [5]})
 ```
 
-Submitting Python source, dill payloads, or serializer-encoded args is disabled by default.
-For trusted internal clients only, enable the legacy remote-code path with both
-`allow_remote_code=True` and a non-empty `require_token=...`.
+By default the server only runs tasks registered in the server process. Submitting Python source, dill payloads, or serializer-encoded args is disabled unless you explicitly opt in (see [HTTP server endpoints](#http-server-endpoints)).
 
-## Why
+## Why cashet
 
-You already have caches (`functools.lru_cache`, `joblib.Memory`). Here's what's different:
+You already have `functools.lru_cache` and `joblib.Memory`. cashet adds persistence, sharing, provenance, and pipelines on top of memoization:
 
-| | lru_cache | joblib.Memory | **cashet** |
+| | lru_cache | joblib.Memory | cashet |
 |---|---|---|---|
 | AST-normalized hashing | No | No | Yes |
 | DAG / pipeline chaining | No | No | Yes |
@@ -241,359 +184,112 @@ You already have caches (`functools.lru_cache`, `joblib.Memory`). Here's what's 
 | HTTP server | No | No | Yes |
 | Persists across restarts | No | Yes | Yes |
 
-The core idea: **hash the function's AST-normalized source + arguments = unique cache key**. Comments, docstrings, and formatting changes don't invalidate the cache — only semantic changes do. Same function + same args = same result, stored immutably on disk. The result is a git-like blob you can inspect, diff, and chain.
+The core idea: hash the function's AST-normalized source plus its arguments into a unique cache key. Same function and same args give the same result, stored immutably on disk, that you can inspect, diff, and chain.
 
 ## Use Cases
 
-### 1. ML Experiment Tracking Without the Bloat
-
-You run 200 hyperparameter sweeps overnight. Half crash. You fix a bug and re-run. Without cashet, you re-process the dataset 200 times. With cashet:
+**ML experiment tracking.** Run many hyperparameter sweeps that share one expensive preprocessing step. `preprocess` runs once and every training job reuses its cached output. Use `TaskRef(index)` to wire one task's output into another within a batch:
 
 ```python
-from cashet import Client, TaskError, TaskRef
+from cashet import Client, TaskRef
 
 client = Client()
 
-def preprocess(dataset_path, image_size):
-    # 45 minutes of image resizing
-    ...
-
-def train(data, learning_rate, dropout):
-    ...
-
-# Batch submit with topological ordering
-# TaskRef(0) refers to the first task's output
 results = client.submit_many([
-    (preprocess, ("s3://my-bucket/images", 224)),
+    (preprocess, ("s3://bucket/images", 224)),
     (train, (TaskRef(0), 0.01, 0.2)),
-    (train, (TaskRef(0), 0.01, 0.5)),
     (train, (TaskRef(0), 0.001, 0.2)),
-    (train, (TaskRef(0), 0.001, 0.5)),
     (train, (TaskRef(0), 0.0001, 0.2)),
-    (train, (TaskRef(0), 0.0001, 0.5)),
 ])
 ```
 
-`preprocess` runs **once** — all 6 training jobs reuse its cached output. Re-run the script tomorrow and even the training results come from cache (same function + same args = instant).
+**Data pipeline debugging.** Your ETL job fails at step 5. Fix the function and re-run the script. Unchanged upstream steps return from cache; only the changed step and everything after it re-executes, because changing a function's source changes its hash and invalidates downstream entries.
 
-### 2. Data Pipeline Debugging
+**Reproducible notebooks.** Share a result hash and a colleague can inspect exactly how it was produced from their terminal with `cashet show <hash>` and retrieve it with `cashet get <hash> -o out.bin`.
 
-Your ETL pipeline fails at step 5. You fix a typo. Now you need to re-run steps 5-7 but steps 1-4 are unchanged and expensive:
-
-```python
-from cashet import Client
-
-client = Client()
-
-raw = client.submit(load_s3, "s3://logs/2024-05-01/")
-clean = client.submit(remove_pii, raw)
-enriched = client.submit(join_crm, clean, "select * from users")
-report = client.submit(generate_report, enriched)
-```
-
-Fix the `join_crm` function and re-run the script. Steps 1-2 return instantly from cache. Only step 3 onward re-executes. This works because cashet tracks which function produced which output — changing a function's source code changes its hash, invalidating downstream cache entries.
-
-### 3. Reproducible Notebook Results
-
-`cashet` is designed to work in Jupyter notebooks and IPython sessions. Share a result with a colleague and they can verify exactly how it was produced:
+**Incremental computation.** Process a large dataset in chunks with `client.map`. Already-processed chunks return instantly; add a new chunk and only that one runs:
 
 ```python
-# your notebook
-ref = client.submit(generate_forecast, date="2024-01-01", model="v3")
-print(f"Result hash: {ref.hash}")
+refs = client.map(process_chunk, range(100), source_file="data.parquet")
+results = [r.load() for r in refs]
 ```
-
-```bash
-# their terminal — inspect provenance
-cashet show <hash>
-
-# Output:
-# Hash:     a3b4c5d6...
-# Function: generate_forecast
-# Source:   def generate_forecast(date, model): ...
-# Args:     (('2024-01-01',), {'model': 'v3'})
-# Created:  2024-05-01T10:32:17
-
-# Retrieve the actual result
-cashet get <hash> -o forecast.csv
-```
-
-### 4. Incremental Computation
-
-Process a large dataset in chunks. Already-processed chunks return instantly:
-
-```python
-from cashet import Client
-
-client = Client()
-
-def process_chunk(chunk_id, source_file):
-    # expensive per-chunk processing
-    ...
-
-results = []
-for chunk_id in range(100):
-    ref = client.submit(process_chunk, chunk_id, "huge_file.parquet")
-    results.append(ref)
-```
-
-First run processes all 100 chunks. Second run (even after restarting Python) returns all 100 results instantly. Add a new chunk? Only that one runs.
 
 ## CLI
 
 ```bash
-# Show commit history
-cashet log
-
-# Filter by function name
-cashet log --func "preprocess"
-
-# Filter by tag
-cashet log --tag env=prod --tag experiment=run-1
-
-# Show full commit details (source code, args, error)
-cashet show <hash>
-
-# Retrieve a result (pretty-prints strings/dicts/lists)
-cashet get <hash>
-
-# Write a result to file
-cashet get <hash> -o output.bin
-
-# Compare two commits
-cashet diff <hash_a> <hash_b>
-
-# Show lineage of a result (same function+args over time)
-cashet history <hash>
-
-# Delete a specific commit
-cashet rm <hash>
-
-# Evict old cache entries and orphaned blobs
-cashet gc --older-than 30
-
-# Evict oldest entries until under a size limit
-cashet gc --max-size 1GB
-
-# Clear everything (alias for gc --older-than 0)
-cashet clear
-
-# Export all commits and blobs to a tar.gz archive
-cashet export backup.tar.gz
-
-# Import commits and blobs from a tar.gz archive
-cashet import backup.tar.gz
-
-# Storage statistics (includes disk size)
-cashet stats
-
-# Start the HTTP server
+cashet log                         # commit history
+cashet log --func preprocess       # filter by function
+cashet log --tag env=prod          # filter by tag
+cashet show <hash>                 # full commit details (source, args, error)
+cashet get <hash>                  # retrieve a result (pretty-prints str/dict/list)
+cashet get <hash> -o output.bin    # write a result to a file
+cashet diff <hash_a> <hash_b>      # compare two commits
+cashet history <hash>              # lineage of one function+args over time
+cashet rm <hash>                   # delete a commit
+cashet invalidate -t env=prod      # delete commits by tag
+cashet gc --older-than 30          # evict entries older than 30 days
+cashet gc --max-size 1GB           # evict oldest entries until under a size limit
+cashet clear                       # remove everything
+cashet export backup.tar.gz        # export commits and blobs to an archive
+cashet import backup.tar.gz        # import from an archive
+cashet stats                       # storage statistics
 cashet serve --host 127.0.0.1 --port 8000
-
-# Legacy unsafe remote-code mode requires auth
-cashet serve --require-token secret123 --allow-remote-code
 ```
 
-## API
+`cashet show`, `cashet get`, and `cashet rm` exit with a non-zero status when the commit is not found, so they compose in scripts.
 
-### `Client`
+## Python API
+
+### Client and AsyncClient
 
 ```python
 from cashet import Client
 
 client = Client(
-    store_dir=".cashet",       # where to store blobs + metadata (SQLiteStore)
-                               # falls back to $CASHET_DIR env var if set
-    store=None,                # or inject any Store implementation (SQLiteStore, RedisStore)
-    executor=None,             # or inject any Executor implementation
-    serializer=None,           # defaults to PickleSerializer
-    max_workers=1,             # max parallelism for submit_many (default: 1, sequential)
+    store_dir=".cashet",   # blob + metadata directory; falls back to $CASHET_DIR
+    store=None,            # or any Store (SQLiteStore, RedisStore, ...)
+    executor=None,         # or any Executor
+    serializer=None,       # defaults to PickleSerializer
+    max_workers=1,         # parallelism for submit_many (1 = sequential)
 )
 ```
 
-### `AsyncClient`
+`AsyncClient` (from `cashet.async_client`) mirrors `Client`: `submit`, `submit_many`, `map`, `log`, `show`, `get`, `diff`, `history`, `stats`, `gc`, `rm`, `clear`, `invalidate`, and `serve` are all `async def`. It returns `AsyncResultRef` with an `async load()`.
 
-```python
-import asyncio
-from cashet.async_client import AsyncClient
-
-async def main():
-    client = AsyncClient(
-        store_dir=".cashet",   # defaults to AsyncSQLiteStore
-        store=None,            # or AsyncRedisStore, or any AsyncStore
-        executor=None,         # defaults to AsyncLocalExecutor
-        serializer=None,       # defaults to PickleSerializer
-        max_workers=1,         # max parallelism for submit_many (default: 1, sequential)
-    )
-
-    async def square(x: int) -> int:
-        return x * x
-
-    ref = await client.submit(square, 5)
-    result = await ref.load()  # 25
-    await client.close()
-
-asyncio.run(main())
-```
-
-`AsyncClient` mirrors `Client` — `submit()`, `submit_many()`, `log()`, `show()`, `get()`, `stats()`, `gc()`, `rm()`, `clear()`, `serve()` are all `async def`. `submit()` accepts both sync and async callables, and returns `AsyncResultRef` with `async load()`. Chain tasks by passing `AsyncResultRef` as an argument.
-
-### HTTP Server
-
-```python
-# Start the server
-from cashet import Client
-client = Client()
-client.serve(host="127.0.0.1", port=8000)
-
-# With Bearer token authentication
-client.serve(host="0.0.0.0", port=8000, require_token="secret123")
-```
-
-Execute tasks over HTTP by registering callables in the server process and sending
-JSON arguments from another process:
-
-```python
-from cashet import Client
-
-client = Client()
-
-def add(x: int, y: int) -> int:
-    return x + y
-
-client.serve(port=8000, tasks={"add": add})
-```
-
-```python
-import requests
-
-r = requests.post("http://localhost:8000/submit", json={"task": "add", "args": [3, 4]})
-```
-
-Endpoints:
-
-| Method | Path | Description |
-|---|---|---|
-| POST | `/submit` | Submit a registered task for execution |
-| GET | `/result/{hash}` | Fetch deserialized result |
-| GET | `/commit/{hash}` | Commit metadata |
-| GET | `/log` | List commits (query: `?func=`, `?limit=`, `?status=`) |
-| GET | `/stats` | Storage statistics |
-| POST | `/gc` | Run garbage collection |
-
-Use `AsyncClient.serve()` for the async variant with `create_async_app()`.
-
-> **Security:** `/submit` does not execute client-supplied Python by default. The legacy
-> `func_source`, `func_b64`, `args_b64`, and `kwargs_b64` payloads require
-> `allow_remote_code=True` and a non-empty Bearer token. In the CLI, this is
-> `cashet serve --require-token secret123 --allow-remote-code`. That mode deserializes
-> and executes arbitrary Python, so expose it only to trusted clients.
-
-### Redis Backend
-
-```python
-from cashet import Client
-from cashet.redis_store import RedisStore
-
-# Sync
-client = Client(store=RedisStore("redis://localhost:6379/0"))
-
-# Async
-from cashet.async_client import AsyncClient
-from cashet.redis_store import AsyncRedisStore
-
-client = AsyncClient(store=AsyncRedisStore("redis://localhost:6379/0"))
-```
-
-Redis-backed stores support all operations — cache dedup, fingerprint lookup, history, eviction, and size-based GC. Cross-process claim dedup uses per-fingerprint Redis locks (`cashet:lock:{fingerprint}`) to prevent redundant execution across machines. Last-access eviction is indexed in Redis (`cashet:index:last_accessed`), blob stats are maintained in `cashet:stats:blob`, and blob ref counts (`cashet:blob:ref:{hash}`) enable orphan cleanup without scanning all commits.
-
-### Pluggable Backends
-
-Everything is protocol-based. Swap the store, executor, or serializer without touching your task code:
-
-```python
-from pathlib import Path
-
-from cashet import Client, Store, Executor, Serializer
-from cashet.store import SQLiteStore
-from cashet.executor import LocalExecutor
-
-# These are equivalent (the defaults):
-client = Client(store_dir=".cashet")
-
-# Explicit injection:
-client = Client(
-    store=SQLiteStore(Path(".cashet")),
-    executor=LocalExecutor(),
-)
-```
-
-**Store protocol** — implement this to use RocksDB, Redis, S3, or anything else:
-
-```python
-from cashet.protocols import Store
-
-class RedisStore:
-    def put_blob(self, data: bytes) -> ObjectRef: ...
-    def get_blob(self, ref: ObjectRef) -> bytes: ...
-    def put_commit(self, commit: Commit) -> None: ...
-    def get_commit(self, hash: str) -> Commit | None: ...
-    def find_by_fingerprint(self, fingerprint: str) -> Commit | None: ...
-    def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None: ...
-    def list_commits(self, ...) -> list[Commit]: ...
-    def get_history(self, hash: str) -> list[Commit]: ...
-    def stats(self) -> dict[str, int]: ...
-    def evict(self, older_than: datetime, max_size_bytes: int | None = None) -> int: ...
-    def delete_commit(self, hash: str) -> bool: ...
-    def close(self) -> None: ...
-
-client = Client(store=RedisStore("redis://localhost"))
-# Everything else works identically
-```
-
-**Executor protocol** — implement this for distributed execution (Celery, Kafka, RQ):
-
-```python
-from cashet.protocols import Executor
-
-class CeleryExecutor:
-    def submit(self, func, args, kwargs, task_def, store, serializer):
-        # Push to Celery, poll for result
-        ...
-
-client = Client(
-    store=RedisStore("redis://localhost"),
-    executor=CeleryExecutor(),
-)
-```
-
-**Serializer protocol** — already covered below.
-
-### `client.submit(func, *args, **kwargs) -> ResultRef`
-
-Submit a function for execution. Returns a `ResultRef` — a lazy handle to the result.
+### submit and ResultRef
 
 ```python
 ref = client.submit(my_func, arg1, arg2, key="value")
-ref.hash         # content hash of the result blob
-ref.commit_hash  # commit hash (use this for show/history/rm/get)
-ref.size         # size in bytes
-ref.load()       # deserialize and return the result
+ref.hash          # content hash of the result blob
+ref.commit_hash   # commit hash (use for show / history / rm / get)
+ref.size          # size in bytes
+ref.load()        # deserialize and return the result
 ```
 
-If the same function + same arguments have been submitted before, returns the cached result **without re-executing**.
+If the same function and arguments were submitted before, `submit` returns the cached result without re-executing. `ResultRef` is generic, so `submit` infers the return type from the function's annotation. Pass a `ResultRef` as an argument (including nested inside lists, tuples, sets, frozensets, and dicts) to chain tasks; it resolves to its output before execution.
 
-### `client.clear()`
+### Per-task options
 
-Remove all cache entries and orphaned blobs. Equivalent to `client.gc(timedelta(days=0))`.
+Each option is available per call (prefixed with `_`) and on the `@client.task` decorator:
 
 ```python
-client.clear()
+ref = client.submit(fetch_api, url, _retries=3, _timeout=30, _ttl=3600, _tags={"env": "prod"})
+
+@client.task(cache=False, retries=3, timeout=30, ttl=3600, tags={"team": "ml"})
+def fetch_api(url):
+    ...
+
+ref = my_task(url)  # decorated tasks are directly callable and return a ResultRef
 ```
 
-### `client.submit_many(tasks) -> list[ResultRef]`
+- `cache=False` runs the function every time but still records lineage (non-deterministic work).
+- `force=True` skips the cache and re-executes once.
+- `retries=N` retries failed attempts, then raises `TaskError` with the original traceback.
+- `timeout=seconds` bounds an attempt. Local timeouts are soft: cashet stops waiting and records a failure, but Python cannot kill running thread code, so keep task functions idempotent.
+- `ttl=seconds` expires a commit. Expired commits are skipped on lookup and removed at garbage collection.
+- `tags={...}` attach metadata for filtering. Tags are not part of the cache key.
 
-Submit a batch of tasks with automatic topological ordering. Use `TaskRef(index)` to wire outputs between tasks in the batch.
+### submit_many and map
 
 ```python
 from cashet import TaskRef
@@ -601,290 +297,107 @@ from cashet import TaskRef
 refs = client.submit_many([
     step1_func,
     (step2_func, (TaskRef(0),)),
-    (step3_func, (TaskRef(1), "extra_arg")),
-], max_workers=4)  # run independent tasks in parallel
-```
+    (step3_func, (TaskRef(1), "extra")),
+], max_workers=4)
 
-This enables parallel fan-out and ensures each task only runs after its dependencies.
-
-> **Note:** With the default `SQLiteStore`, parallel execution serializes on the SQLite write lock — `max_workers > 1` only benefits compute-heavy tasks where execution time dominates. For true parallel fan-out, use `RedisStore`.
-
-### `client.map(func, items, *args, **kwargs) -> list[ResultRef]`
-
-Map a function over an iterable with per-item caching. Each item becomes the first positional argument; additional `*args` and `**kwargs` are appended.
-
-```python
 refs = client.map(process_chunk, range(100), source_file="data.parquet")
-# refs[0].load() == process_chunk(0, source_file="data.parquet")
-
-results = [r.load() for r in refs]
 ```
 
-Already-computed items return instantly from cache. Add a new chunk later and only that item re-runs.
+`submit_many` orders tasks topologically and runs independent ones in parallel up to `max_workers`. With the default `SQLiteStore`, parallel execution serializes on the SQLite write lock, so `max_workers > 1` mainly helps compute-heavy tasks; use `RedisStore` for true fan-out across processes.
 
-**Opt out of caching:**
-
-```python
-# Per-call
-ref = client.submit(non_deterministic_func, _cache=False)
-
-# Per-function via decorator
-@client.task(cache=False)
-def random_score():
-    return random.random()
-```
-
-**Force re-execution (skip cache, always run):**
+### Inspecting, diffing, and eviction
 
 ```python
-# Per-call
-ref = client.submit(my_func, arg, _force=True)
+commits = client.log(func_name="preprocess", limit=10, status="failed", tags={"experiment": "v1"})
 
-# Per-function via decorator
-@client.task(force=True)
-def always_rerun():
-    ...
-```
-
-**Tag commits:**
-
-```python
-# Per-call
-ref = client.submit(train, data, lr=0.01, _tags={"experiment": "v1"})
-
-# Per-function via decorator
-@client.task(tags={"team": "ml"})
-def preprocess(raw):
-    ...
-```
-
-Tags are not part of the cache key — they are metadata for organization and filtering.
-
-**Retry flaky operations:**
-
-```python
-# Per-call
-ref = client.submit(fetch_api, url, _retries=3)
-
-# Per-function via decorator
-@client.task(retries=3)
-def fetch_api(url):
-    ...
-```
-
-Retries wait briefly between attempts. When retries are exhausted, `client.submit` raises `TaskError` with the original traceback included in the message.
-
-**Task timeouts:**
-
-```python
-# Per-call (seconds)
-ref = client.submit(slow_func, _timeout=30)
-
-# Per-function via decorator
-@client.task(timeout=30)
-def slow_func():
-    ...
-```
-
-Timeouts can be combined with retries — a timed-out attempt counts as a failure and will be retried. Local execution uses Python threads, so timeouts are soft: cashet stops waiting and records the attempt as failed, but Python cannot safely kill already-running thread code. Use idempotent task functions; hard cancellation belongs in a process/distributed executor such as a future Celery executor.
-
-**Per-entry TTL:**
-
-```python
-# Per-call (seconds)
-ref = client.submit(fetch_api_data, url, _ttl=3600)
-
-# Per-function via decorator
-@client.task(ttl=3600)
-def fetch_api_data(url):
-    ...
-```
-
-Commits expire automatically after the TTL. Expired commits are skipped by cache lookups and history queries but are not physically deleted until garbage collection runs.
-
-### `@client.task`
-
-Register a function with cashet metadata and make it directly callable:
-
-```python
-@client.task
-def my_func(x):
-    return x * 2
-
-ref = my_func(5)  # Returns ResultRef, same as client.submit(my_func, 5)
-ref.load()        # 10
-
-@client.task(cache=False, name="custom_task_name", tags={"env": "prod"})
-def other_func(x):
-    return x + 1
-```
-
-`client.submit(my_func, 5)` still works identically.
-
-### `client.log()`, `client.show()`, `client.get()`, `client.diff()`, `client.history()`, `client.rm()`, `client.gc()`
-
-```python
-# List commits
-commits = client.log(func_name="preprocess", limit=10)
-
-# Filter by status
-commits = client.log(status="failed")
-
-# Filter by tags
-commits = client.log(tags={"experiment": "v1"})
-
-# Get commit details
 commit = client.show(hash)
-commit.task_def.func_source  # the source code
-commit.task_def.args_snapshot  # the serialized args
-commit.parent_hash  # previous commit for same func+args
-commit.created_at
+commit.task_def.func_source     # the source code
+commit.task_def.args_snapshot   # the serialized args
+commit.parent_hash              # previous commit for the same func + args
 
-# Load a result by commit hash
 result = client.get(hash)
+diff = client.diff(hash_a, hash_b)   # {'func_changed': ..., 'args_changed': ..., 'output_changed': ...}
+history = client.history(hash)       # all runs of the same func + args
 
-# Diff two commits
-diff = client.diff(hash_a, hash_b)
-# {'func_changed': True, 'args_changed': False, 'output_changed': True, ...}
-
-# Get lineage (all runs of same func+args)
-history = client.history(hash)
-
-# Evict old entries (default: 30 days)
-evicted = client.gc()
-# Evict entries older than 7 days
 from datetime import timedelta
-evicted = client.gc(older_than=timedelta(days=7))
-# Evict oldest entries until under size limit
-evicted = client.gc(max_size_bytes=1024 * 1024 * 1024)  # 1GB
+client.gc(older_than=timedelta(days=7))
+client.gc(max_size_bytes=1024 ** 3)  # evict until under 1 GB
+client.invalidate(tags={"experiment": "v1"})
+client.clear()
 
-# Invalidate commits by tags
-deleted = client.invalidate(tags={"experiment": "v1"})
-# deleted = client.invalidate(tags={"experiment": None})  # any commit with 'experiment' tag
-
-# Storage stats
 stats = client.stats()
-# {
-#     'total_commits': 42,
-#     'completed_commits': 40,
-#     'stored_objects': 38,      # blob_objects + inline_objects
-#     'disk_bytes': 10485760,    # blob_bytes + inline_bytes
-#     'blob_objects': 35,
-#     'blob_bytes': 9437184,
-#     'inline_objects': 3,
-#     'inline_bytes': 1048576,
-# }
+# {'total_commits', 'completed_commits', 'stored_objects', 'disk_bytes',
+#  'blob_objects', 'blob_bytes', 'inline_objects', 'inline_bytes'}
 ```
 
-### `client.export(path)` / `client.import_archive(path)`
+### Export and import
 
-Export the entire cache to a portable `.tar.gz` archive and import it elsewhere. Blobs are content-addressable, so deduplication is preserved across stores.
+Export the whole cache to a portable archive and import it elsewhere. Blobs are content-addressed, so deduplication is preserved across stores. Use this for migrations (SQLite to Redis), CI cache warm-up, or backups.
 
 ```python
-# Export
 client.export("backup.tar.gz")
 
-# Import into a fresh store
 client2 = Client(store_dir=".cashet2")
-count = client2.import_archive("backup.tar.gz")
-print(f"Imported {count} commits")
+result = client2.import_archive("backup.tar.gz")
+print(f"imported {result.imported}, skipped {result.skipped}")
 ```
 
-Use this for migrations (SQLite → Redis), CI cache warm-up, or backups. Existing commits are skipped during import.
+`import_archive` verifies every blob's content hash and returns an `ImportResult(imported, skipped)`. Commits whose blobs are missing from the archive are skipped and reported rather than silently dropped; existing commits are skipped without re-import.
 
-### Jupyter & Notebook Support
-
-`cashet` works seamlessly in Jupyter notebooks, IPython, and the Python REPL. It uses a tiered source-resolution strategy:
-
-1. **`inspect.getsource()`** — for normal `.py` files
-2. **`dill.source.getsource()`** — for interactive sessions with live history
-3. **`dis.Bytecode` fallback** — for any live function, even after a kernel restart
-
-This means you can define functions in a notebook cell, rerun the cell with changes, and `cashet` will correctly invalidate the cache based on the new code.
+### HTTP server endpoints
 
 ```python
-# In a notebook cell
+from cashet import Client
+
 client = Client()
-
-def preprocess(data):
-    return [x * 2 for x in data]
-
-ref = client.submit(preprocess, [1, 2, 3])
+client.serve(host="127.0.0.1", port=8000, require_token="secret123")
 ```
 
-Change the cell body and rerun — the cache invalidates automatically.
+| Method | Path | Description |
+|---|---|---|
+| POST | `/submit` | Run a registered task |
+| GET | `/result/{hash}` | Fetch the deserialized result |
+| GET | `/commit/{hash}` | Commit metadata |
+| GET | `/log` | List commits (`?func=`, `?limit=`, `?status=`) |
+| GET | `/stats` | Storage statistics |
+| POST | `/gc` | Run garbage collection |
 
-### Thread Safety
+When `require_token` is set, every request needs an `Authorization: Bearer <token>` header. Request bodies are size-limited (default 500 MB). Use `AsyncClient.serve()` for the native async server.
 
-`cashet` is safe to use from multiple threads and processes sharing the same store directory. Concurrent submissions of the same uncached task are deduplicated: the function executes **exactly once** and all callers receive the same cached result. This works across `multiprocessing.Process`, `ProcessPoolExecutor`, and multiple independent Python interpreters.
+> **Security.** `/submit` does not execute client-supplied Python by default. The legacy `func_source`, `func_b64`, `args_b64`, and `kwargs_b64` payloads require both `allow_remote_code=True` and a non-empty token (`cashet serve --require-token secret123 --allow-remote-code`). That mode deserializes and runs arbitrary Python, so expose it only to trusted clients.
 
-> **Note:** Cross-process dedup uses a 5-minute timeout by default. If a process dies while running a task, its claim is automatically reclaimed after that timeout so other workers are not blocked forever. You can adjust this via `LocalExecutor(running_ttl=...)`:
->
-> ```python
-> from datetime import timedelta
-> from cashet.executor import LocalExecutor
->
-> client = Client(executor=LocalExecutor(running_ttl=timedelta(minutes=10)))
-> ```
-
-```python
-import threading
-
-def worker():
-    c = Client()  # separate Client instance, same store
-    c.submit(expensive_func, arg)
-
-threads = [threading.Thread(target=worker) for _ in range(10)]
-for t in threads:
-    t.start()
-for t in threads:
-    t.join()
-# expensive_func ran only once
-```
-
-### `ResultRef`
-
-A lazy reference to a stored result. Pass it as an argument to chain tasks:
-
-```python
-step1 = client.submit(func_a, input_data)
-step2 = client.submit(func_b, step1)  # step1 auto-resolves to its output
-step3 = client.submit(func_c, {"payload": step2})  # nested refs resolve too
-```
-
-`ResultRef` is generic — `submit()` infers the return type from the function annotation:
-
-```python
-ref: ResultRef[int] = client.submit(double, 5)
-result = ref.load()  # typed as int
-```
-
-### Custom Serialization
+### Serialization
 
 ```python
 from cashet import Client, PickleSerializer, SafePickleSerializer, JsonSerializer
 
-# Default: pickle (handles arbitrary Python objects)
-client = Client(serializer=PickleSerializer())
-
-# Safe pickle: restricts deserialization to an allowlist of known types
-client = Client(serializer=SafePickleSerializer())
-
-# Allow custom classes through the allowlist
-client = Client(serializer=SafePickleSerializer(extra_classes=[MyClass]))
-
-# For JSON-safe data (dicts, lists, primitives)
-client = Client(serializer=JsonSerializer())
-
-# Or implement the Serializer protocol
-from cashet.hashing import Serializer
-
-class MySerializer:
-    def dumps(self, obj) -> bytes:
-        ...
-    def loads(self, data: bytes):
-        ...
+Client(serializer=PickleSerializer())                       # default, arbitrary Python objects
+Client(serializer=SafePickleSerializer())                   # restrict unpickling to an allowlist
+Client(serializer=SafePickleSerializer(extra_classes=[MyClass]))
+Client(serializer=JsonSerializer())                         # JSON-safe data
 ```
+
+Implement the `Serializer` protocol (`dumps`/`loads`) for MessagePack or any custom format.
+
+### Pluggable backends
+
+Everything is protocol-based, so you can swap the store, executor, or serializer without changing task code.
+
+```python
+from cashet import Client
+from cashet.store import SQLiteStore
+from cashet.executor import LocalExecutor
+
+client = Client(store=SQLiteStore(".cashet"), executor=LocalExecutor())
+```
+
+| Protocol | Default | Built-in alternatives | Implement for |
+|---|---|---|---|
+| `Store` | `SQLiteStore` | `RedisStore` | RocksDB, S3, Postgres |
+| `AsyncStore` | `AsyncSQLiteStore` | `AsyncRedisStore` | async variants |
+| `Executor` | `LocalExecutor` | | Celery, Kafka, RQ |
+| `AsyncExecutor` | `AsyncLocalExecutor` | | Celery, Kafka, RQ |
+| `Serializer` | `PickleSerializer` | `JsonSerializer`, `SafePickleSerializer` | MessagePack, custom |
 
 ## How It Works
 
@@ -892,76 +405,73 @@ class MySerializer:
 client.submit(func, arg1, arg2)
          │
          ▼
-  ┌─────────────────┐
-  │  Hash function   │  SHA256(AST-normalized source + dep versions + referenced user helpers)
+  ┌──────────────────┐
+  │  Hash function   │  SHA256(AST-normalized source + dep versions + referenced helpers)
   │  Hash arguments  │  SHA256(canonical repr of args/kwargs)
-  └────────┬────────┘
+  └────────┬─────────┘
            │
            ▼
-  ┌─────────────────┐
+  ┌──────────────────┐
   │  Fingerprint     │  func_hash:args_hash
   │  cache lookup    │  ← Store protocol (SQLiteStore, RedisStore, ...)
-  └────────┬────────┘
+  └────────┬─────────┘
            │
      ┌─────┴─────┐
-     │            │
-  CACHED       MISS
+   CACHED       MISS
      │            │
      ▼            ▼
-  Return ref   ← Executor protocol (LocalExecutor, CeleryExecutor, ...)
-               Execute function
-               Store result as blob → Store protocol
-               Record commit with parent lineage
-               Return ref
+  Return ref   Execute (Executor protocol), store result as a blob,
+               record a commit with parent lineage, return ref
 ```
 
-**Architecture (protocol-based):**
-
-| Protocol | Default | Built-in alternatives | Implement for |
-|---|---|---|---|
-| `Store` | `SQLiteStore` | `RedisStore` | RocksDB, S3, Postgres |
-| `AsyncStore` | `AsyncSQLiteStore` | `AsyncRedisStore` | async variants of above |
-| `Executor` | `LocalExecutor` | — | Celery, Kafka, RQ |
-| `AsyncExecutor` | `AsyncLocalExecutor` | — | Celery, Kafka, RQ |
-| `Serializer` | `PickleSerializer` | `JsonSerializer`, `SafePickleSerializer` | MessagePack, custom |
-
-**Storage layout** (in `.cashet/`):
+Storage layout under `.cashet/`:
 
 ```
 .cashet/
-├── objects/          # content-addressable blobs (like git objects)
-│   ├── a3/
-│   │   └── b4c5d6... # compressed result blob
-│   └── e7/
-│       └── f8g9h0...
-└── meta.db           # SQLite: commits, fingerprints, provenance, inline_objects
+├── objects/          # content-addressable blobs, like git objects
+│   └── a3/b4c5d6...   # compressed result blob
+└── meta.db           # SQLite: commits, fingerprints, provenance, inline objects
 ```
 
-**Small objects** (<1KB) are stored inline in `meta.db` instead of the filesystem. This reduces inode overhead for caches with many tiny results. Larger objects are stored as compressed blobs in `objects/` as usual.
+Small results (under 1 KB) are stored inline in `meta.db` to avoid inode overhead; larger results are compressed blobs in `objects/`.
 
-**Key design decisions:**
+### Key design decisions
 
-- **Closure variables are not hashed** and emit a `ClosureWarning` if present. Function identity is source code, defaults, keyword defaults, immutable referenced globals, and referenced helper functions; not arbitrary runtime state. If you need cache invalidation based on a mutable value, pass it as an explicit argument.
-- **Referenced user-defined helper functions are hashed recursively.** If your cached function calls or references a helper from your own project (via `co_names` / `globals`), that helper's source is included in the cache key. Change the helper and the caller's cache invalidates. Builtin and stdlib functions are skipped. This behavior is automatic and invisible — no decorators or imports needed.
-- **Nested refs resolve through containers.** `ResultRef` and `AsyncResultRef` values inside lists, tuples, sets, frozensets, and dicts are loaded before execution and recorded as commit input refs.
+- **Function identity is source code, not runtime state.** The hash covers AST-normalized source, default and keyword-default values, immutable referenced globals, and referenced user-defined helper functions. Change a helper and the caller's cache invalidates. Builtins and stdlib are skipped.
+- **Closure variables are not hashed** and emit a `ClosureWarning`. To invalidate on a mutable value, pass it as an explicit argument.
+- **Arguments are hashed by value, including objects.** Custom objects are hashed by their `__dict__` and `__slots__` state plus their class module and qualname, so same-named classes from different modules do not collide.
+- **Source is canonicalized with `ast.unparse`,** so comments, docstrings, and whitespace do not invalidate the cache, and hashes stay stable across Python versions.
 - **Blobs are deduplicated by content hash.** Identical results share one blob on disk.
-- **Source is hashed as an AST.** Comments, docstrings, and whitespace changes don't invalidate the cache.
-- **Custom object arguments include their class module and qualname** in the argument hash so same-named classes from different modules do not collide.
-- **Non-cached tasks get unique commit hashes** (timestamp salt) so they always re-execute but still record lineage.
-- **Parent tracking:** Each commit records the hash of the previous commit for the same function+args, forming a history chain you can traverse.
+- **Nested refs resolve through containers.** `ResultRef` values inside lists, tuples, sets, frozensets, and dicts are loaded before execution and recorded as commit inputs.
+- **Non-cached tasks get a timestamp-salted commit hash,** so they always re-execute while still recording lineage.
+
+### Concurrency
+
+cashet is safe across threads, processes, and machines that share one store. Concurrent submissions of the same uncached task are deduplicated: the function runs exactly once and all callers get the same result. Cross-process claims use file locks (SQLite) or per-fingerprint Redis locks, with a heartbeat lease so a crashed worker's claim is reclaimed (default 5 minutes, configurable via `LocalExecutor(running_ttl=...)`).
+
+### Notebooks
+
+cashet resolves function source through `inspect.getsource`, then `dill.source.getsource` for interactive sessions, then a bytecode fallback that survives a kernel restart. Edit a notebook cell, rerun it, and the cache invalidates on the new code.
 
 ## Configuration
 
-- **`CASHET_DIR`** — override the default `.cashet` store directory. Equivalent to passing `store_dir=`.
-- **`CASHET_LOG`** — set to `DEBUG`, `INFO`, `WARNING`, or `ERROR` to print log output to stderr with a `[cashet]` tag. Messages include task fingerprint, function name, commit hash, and duration inline — no structured logging backend needed.
+- **`CASHET_DIR`** overrides the default `.cashet` store directory, equivalent to `store_dir=`.
+- **`CASHET_LOG`** set to `DEBUG`, `INFO`, `WARNING`, or `ERROR` prints logs to stderr with a `[cashet]` tag, including fingerprint, function name, commit hash, and duration.
+
+## Version Compatibility
+
+Upgrading across a hash-format change does not corrupt anything; old entries simply miss and recompute on first access. To start clean, run `cashet clear` or point at a fresh store directory.
+
+- **0.4.4 to 0.4.5:** Hashing fixes (slotted-object state, referenced global containers, `ast.unparse` canonicalization) change function and argument cache keys, so results cached by earlier versions recompute on first access. The Redis tag index key scheme changed and is not migrated; rewrite affected commits to rebuild tag indexes. `import_archive` now returns `ImportResult(imported, skipped)` instead of a bare count.
+- **0.3.x to 0.4.0:** Added per-entry TTL and tag-based invalidation. SQLite auto-migrates; old caches stay readable.
+- **0.3.0 to 0.3.1:** Redis blob keys renamed to `cashet:blob:data:{hash}` and stats backfilled once. Clear Redis caches before upgrading if you rely on long-lived reuse.
+- **0.2.x to 0.3.x:** Hash format unified; caches from 0.2.x do not hit on 0.3.x.
 
 ## Project Status
 
-**Beta.** The core (hashing, DAG resolution, fingerprint dedup) is stable. Works reliably for single-machine, multiprocess, and multi-machine (Redis) workflows.
+Beta. The core (hashing, DAG resolution, fingerprint dedup) is stable and works for single-machine, multiprocess, and multi-machine (Redis) workflows.
 
-Built-in: `SQLiteStore` + `AsyncSQLiteStore`, `RedisStore` + `AsyncRedisStore`, `LocalExecutor` + `AsyncLocalExecutor`, `PickleSerializer` + `JsonSerializer` + `SafePickleSerializer`, HTTP server (`client.serve()`), CLI.
-
-Not yet built: RocksDB, S3 stores; Celery/Kafka executors. PRs welcome.
+Built in: `SQLiteStore` and `AsyncSQLiteStore`, `RedisStore` and `AsyncRedisStore`, `LocalExecutor` and `AsyncLocalExecutor`, `PickleSerializer`, `JsonSerializer`, and `SafePickleSerializer`, the HTTP server, and the CLI. Not yet built: RocksDB and S3 stores, Celery and Kafka executors. Pull requests welcome.
 
 ## License
 
