@@ -119,7 +119,7 @@ def show_cmd(hash: str) -> None:
         raise SystemExit(1) from None
     if commit is None:
         console.print(f"[red]Commit {hash} not found.[/red]")
-        return
+        raise SystemExit(1)
     out_hash = commit.output_ref.hash[:12] if commit.output_ref else "none"
     out_size = commit.output_ref.size if commit.output_ref else 0
     parent = commit.parent_hash[:12] if commit.parent_hash else "none"
@@ -164,7 +164,7 @@ def get_cmd(hash: str, output: str | None) -> None:
         raise SystemExit(1) from None
     if commit is None or commit.output_ref is None:
         console.print(f"[red]No result for {hash}[/red]")
-        return
+        raise SystemExit(1)
     ref = client.store.get_blob(commit.output_ref)
     if output:
         pathlib.Path(output).write_bytes(ref)
