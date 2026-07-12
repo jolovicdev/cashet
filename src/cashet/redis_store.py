@@ -151,13 +151,11 @@ class AsyncRedisStore:
         # newest completed commit wins, matching SQLiteStore.
         entries = await self._redis.zrevrange(fp_key(fingerprint), 0, -1, withscores=True)
         if any(score == float("inf") for _, score in entries):
-            await self._rescore_legacy_fingerprint_index(fingerprint, entries)
-            entries = await self._redis.zrevrange(
-                fp_key(fingerprint), 0, -1, withscores=True
-            )
+            candidates = await self._rescore_legacy_fingerprint_index(fingerprint, entries)
+        else:
+            candidates = [decode_hash(h) for h, _score in entries]
         now = datetime.now(UTC)
-        for h, _score in entries:
-            h_str = decode_hash(h)
+        for h_str in candidates:
             commit = await self.get_commit(h_str)
             if commit is None:
                 continue
@@ -171,19 +169,21 @@ class AsyncRedisStore:
 
     async def _rescore_legacy_fingerprint_index(
         self, fingerprint: str, entries: list[tuple[Any, float]]
-    ) -> None:
+    ) -> list[str]:
         # Indexes written before 0.5.0 scored this zset by expiry (infinity for
         # commits without a TTL), which would shadow every newer commit; rescore
-        # by created_at so recency ordering holds for pre-upgrade entries.
+        # by created_at so recency ordering holds for pre-upgrade entries, and
+        # return the rescored recency order so the lookup needs no re-read.
+        hashes = [decode_hash(h) for h, _score in entries]
+        bodies = await self._redis.mget([commit_key(h) for h in hashes])
         rescored: dict[str, float] = {}
-        for h, _score in entries:
-            h_str = decode_hash(h)
-            data = await self._redis.get(commit_key(h_str))
+        for h_str, data in zip(hashes, bodies, strict=True):
             if data is None:
                 continue
             rescored[h_str] = decode_commit(data).created_at.timestamp()
         if rescored:
             await self._redis.zadd(fp_key(fingerprint), rescored)
+        return sorted(rescored, key=lambda h: (rescored[h], h), reverse=True)
 
     async def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
         hashes = await self._redis.smembers(running_key(fingerprint))
@@ -332,12 +332,15 @@ class AsyncRedisStore:
                 deleted += 1
         now_ts = datetime.now(UTC).timestamp()
         expired_raw = await self._redis.zrangebyscore(expires_key(), "-inf", now_ts)
+        stale: list[str] = []
         for h in expired_raw:
             h_str = decode_hash(h)
             if await self.delete_commit(h_str):
                 deleted += 1
             else:
-                await self._redis.zrem(expires_key(), h_str)
+                stale.append(h_str)
+        if stale:
+            await self._redis.zrem(expires_key(), *stale)
         if max_size_bytes is not None:
             current_bytes = (await self._blob_storage_totals())[1]
             while current_bytes > max_size_bytes:

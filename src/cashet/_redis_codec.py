@@ -36,7 +36,6 @@ def commit_key(hash: str) -> str:
     return f"cashet:commit:{hash}"
 
 
-
 def blob_key(hash: str) -> str:
     return f"cashet:blob:data:{hash}"
 
@@ -279,5 +278,4 @@ def remove_commit_index_commands(pipe: Any, commit: Commit, resolved_hash: str) 
 
 
 def commit_hash_from_key(raw: Any) -> str:
-    key_str = raw.decode() if isinstance(raw, bytes) else str(raw)
-    return key_str.split(":")[-1]
+    return decode_hash(raw).split(":")[-1]
