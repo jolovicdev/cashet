@@ -243,7 +243,13 @@ def index_commit_commands(pipe: Any, commit: Commit) -> None:
     ts = commit.created_at.timestamp()
     pipe.zadd("cashet:index:all", {commit.hash: ts})
     pipe.zadd(fp_key(commit.fingerprint), {commit.hash: ts})
-    if commit.expires_at is not None:
+    # Index expiry only once the commit is terminal: expires_at is stamped at
+    # claim time, so a task outliving its TTL is expired while RUNNING, and
+    # expiry eviction must not delete a live claim out from under its worker.
+    if commit.expires_at is not None and commit.status not in (
+        TaskStatus.RUNNING,
+        TaskStatus.PENDING,
+    ):
         pipe.zadd(expires_key(), {commit.hash: commit.expires_at.timestamp()})
     else:
         pipe.zrem(expires_key(), commit.hash)

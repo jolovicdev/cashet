@@ -28,11 +28,12 @@ def make_commit(
     *,
     hours_ago: float = 0,
     expires_at: datetime | None = None,
+    status: TaskStatus = TaskStatus.COMPLETED,
 ) -> Commit:
     return Commit(
         hash=hash,
         task_def=task_def,
-        status=TaskStatus.COMPLETED,
+        status=status,
         created_at=datetime.now(UTC) - timedelta(hours=hours_ago),
         expires_at=expires_at,
     )

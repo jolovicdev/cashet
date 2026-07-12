@@ -377,6 +377,22 @@ class TestRedisStoreProtocol:
         assert redis_store.get_commit("c" * 64) is None
         assert redis_store.get_commit("d" * 64) is not None
 
+    def test_evict_spares_running_commit_with_expired_ttl(
+        self, redis_store: RedisStore
+    ) -> None:
+        running = make_commit(
+            "c" * 64,
+            make_task_def(),
+            hours_ago=2,
+            expires_at=datetime.now(UTC) - timedelta(hours=1),
+            status=TaskStatus.RUNNING,
+        )
+        redis_store.put_commit(running)
+        assert redis_store.evict(datetime.now(UTC) - timedelta(days=30)) == 0
+        fetched = redis_store.get_commit("c" * 64)
+        assert fetched is not None
+        assert fetched.status is TaskStatus.RUNNING
+
     def test_evict_backfills_partial_last_access_index(self, redis_store: RedisStore) -> None:
         old = datetime.now(UTC) - timedelta(days=10)
         hashes = ["c" * 64, "d" * 64]

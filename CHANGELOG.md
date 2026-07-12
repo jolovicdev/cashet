@@ -17,7 +17,9 @@ bugs are fixed. Read the Notes before upgrading shared stores.
   breaking, so after a force re-run later calls could keep serving the older
   result. Legacy index entries are rescored in place on first lookup.
 - Garbage collection removes TTL-expired commits on both stores instead of
-  keeping them until they age past the access-time cutoff.
+  keeping them until they age past the access-time cutoff. Running and pending
+  commits are exempt from expiry eviction: their TTL clock starts at claim
+  time, so a task outliving its TTL must not be deleted mid-execution.
 - A store error during a heartbeat renewal no longer kills the lease loop
   (which let another worker reclaim and double-run a live task) and can no
   longer surface as an exception that destroys an already-computed result.

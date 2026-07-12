@@ -352,7 +352,14 @@ class SQLiteStoreCore:
     ) -> int:
         conn = self._connect(immediate=True)
         orphans: list[str] = []
-        evictable = "(last_accessed_at < ? OR (expires_at IS NOT NULL AND expires_at <= ?))"
+        # The expiry term must never delete a live claim: expires_at is stamped
+        # at claim time, so a task outliving its TTL is expired while RUNNING,
+        # and deleting it would let a second submission double-run it. Access
+        # age stays status-blind so a crashed worker's old claim still ages out.
+        evictable = (
+            "(last_accessed_at < ? OR (expires_at IS NOT NULL AND expires_at <= ? "
+            "AND status NOT IN ('running', 'pending')))"
+        )
         try:
             params = (older_than.isoformat(), datetime.now(UTC).isoformat())
             # The OR on expires_at defeats the last_accessed index, so evaluate

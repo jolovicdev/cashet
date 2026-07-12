@@ -797,6 +797,21 @@ class TestGarbageCollection:
         assert deleted == 0
         assert client.stats()["total_commits"] == 1
 
+    def test_gc_spares_running_commit_with_expired_ttl(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        running = make_commit(
+            "c" * 64,
+            make_task_def(),
+            hours_ago=2,
+            expires_at=datetime.now(UTC) - timedelta(hours=1),
+            status=TaskStatus.RUNNING,
+        )
+        store.put_commit(running)
+        assert store.evict(datetime.now(UTC) - timedelta(days=30)) == 0
+        fetched = store.get_commit("c" * 64)
+        assert fetched is not None
+        assert fetched.status is TaskStatus.RUNNING
+
     def test_gc_removes_ttl_expired_commits(self, client: Client) -> None:
         from freezegun import freeze_time
 
