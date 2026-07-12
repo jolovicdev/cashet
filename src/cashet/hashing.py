@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import datetime as _datetime
 import hashlib
 import inspect
@@ -11,6 +12,7 @@ import sys
 import textwrap
 import types
 import warnings
+import weakref
 from datetime import timedelta
 from functools import lru_cache
 from typing import Any, Protocol, runtime_checkable
@@ -171,7 +173,16 @@ def _bytecode_source(func: types.FunctionType) -> str:
     )
 
 
+# Keyed by the function object itself: a redefinition (new cell, reloaded
+# module) is a new object and misses, while repeat submissions of the same
+# function skip the source lookup and its file IO entirely.
+_source_cache: weakref.WeakKeyDictionary[types.FunctionType, str] = weakref.WeakKeyDictionary()
+
+
 def get_func_source(func: types.FunctionType) -> str:
+    cached = _source_cache.get(func)
+    if cached is not None:
+        return cached
     try:
         source = inspect.getsource(func)
     except OSError:
@@ -184,7 +195,10 @@ def get_func_source(func: types.FunctionType) -> str:
             pass
         if source is None:
             source = _bytecode_source(func)
-    return _normalize_source(source)
+    normalized = _normalize_source(source)
+    with contextlib.suppress(TypeError):
+        _source_cache[func] = normalized
+    return normalized
 
 
 def get_dep_versions(func: types.FunctionType) -> dict[str, str]:
@@ -207,6 +221,7 @@ def hash_source(source: str) -> str:
     return hashlib.sha256(source.encode()).hexdigest()
 
 
+@lru_cache(maxsize=1024)
 def _ast_canonical(source: str) -> str:
     # ast.unparse normalizes whitespace and comments like ast.dump but, being
     # source text rather than the internal AST repr, stays stable across Python
@@ -237,15 +252,20 @@ def _strip_docstrings(node: ast.AST) -> None:
                 child.body = [ast.Pass()]
 
 
-def _is_stdlib_or_site_path(path: str) -> bool:
-    resolved = os.path.abspath(path)
+@lru_cache(maxsize=1)
+def _stdlib_and_site_prefixes() -> tuple[str, ...]:
     stdlib_path = os.path.abspath(os.path.dirname(os.__file__))
     site_paths = [os.path.abspath(p) for p in site.getsitepackages() if p]
     user_site = site.getusersitepackages()
     if user_site:
         site_paths.append(os.path.abspath(user_site))
-    excluded = [stdlib_path, *site_paths]
-    for prefix in excluded:
+    return (stdlib_path, *site_paths)
+
+
+@lru_cache(maxsize=4096)
+def _is_stdlib_or_site_path(path: str) -> bool:
+    resolved = os.path.abspath(path)
+    for prefix in _stdlib_and_site_prefixes():
         try:
             if os.path.commonpath([resolved, prefix]) == prefix:
                 return True
