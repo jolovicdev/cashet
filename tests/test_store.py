@@ -410,7 +410,7 @@ class TestStoreOperations:
         assert len(log) == 3
 
     def test_fingerprint_lock_registry_is_striped(self, client: Client) -> None:
-        from cashet.store import _SQLITE_LOCKS
+        from cashet._locks import SQLITE_LOCKS
 
         def f(x: int) -> int:
             return x
@@ -418,7 +418,7 @@ class TestStoreOperations:
         for i in range(5):
             client.submit(f, i)
         root = str(client.store.root)
-        names = [Path(p).name for p in _SQLITE_LOCKS if p.startswith(root)]
+        names = [Path(p).name for p in SQLITE_LOCKS if p.startswith(root)]
         assert names
         assert all(len(name) == len(".lock-xx") for name in names)
 
@@ -719,11 +719,11 @@ class TestInlineStorage:
         assert store.blob_exists(ref.hash) is False
 
     def test_find_by_fingerprint_survives_locked_access_bump(self, tmp_path: Path) -> None:
+        from cashet._sqlite_core import SQLiteStoreCore
         from cashet.models import Commit, TaskDef, TaskStatus
-        from cashet.store import _SQLiteStoreCore
 
         root = tmp_path / ".cashet"
-        core = _SQLiteStoreCore(root)
+        core = SQLiteStoreCore(root)
         task_def = TaskDef(
             func_hash="a", func_name="f", func_source="", args_hash="b", args_snapshot=b""
         )
@@ -751,11 +751,11 @@ class TestInlineStorage:
     def test_evict_survives_vacuum_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from cashet._sqlite_core import SQLiteStoreCore
         from cashet.models import Commit, TaskDef, TaskStatus
-        from cashet.store import _SQLiteStoreCore
 
         root = tmp_path / ".cashet"
-        core = _SQLiteStoreCore(root)
+        core = SQLiteStoreCore(root)
         task_def = TaskDef(
             func_hash="a", func_name="f", func_source="", args_hash="b", args_snapshot=b""
         )
@@ -1495,7 +1495,7 @@ class TestMigrations:
         conn.close()
 
     def test_migration_from_base_schema(self, tmp_path: Path) -> None:
-        from cashet.store import _SQLiteStoreCore
+        from cashet._sqlite_core import SQLiteStoreCore
 
         root = tmp_path / ".cashet"
         root.mkdir()
@@ -1504,7 +1504,7 @@ class TestMigrations:
 
         self._build_base_db(str(db_path))
 
-        core = _SQLiteStoreCore(root)
+        core = SQLiteStoreCore(root)
         try:
             col_names = [
                 r[1]
@@ -1525,7 +1525,7 @@ class TestMigrations:
             core.close()
 
     def test_migration_idempotent(self, tmp_path: Path) -> None:
-        from cashet.store import _SQLiteStoreCore
+        from cashet._sqlite_core import SQLiteStoreCore
 
         root = tmp_path / ".cashet"
         root.mkdir()
@@ -1534,10 +1534,10 @@ class TestMigrations:
 
         self._build_base_db(str(db_path))
 
-        core1 = _SQLiteStoreCore(root)
+        core1 = SQLiteStoreCore(root)
         core1.close()
 
-        core2 = _SQLiteStoreCore(root)
+        core2 = SQLiteStoreCore(root)
         try:
             col_names = [
                 r[1]
@@ -1551,7 +1551,7 @@ class TestMigrations:
             core2.close()
 
     def test_operations_after_migration(self, tmp_path: Path) -> None:
-        from cashet.store import _SQLiteStoreCore
+        from cashet._sqlite_core import SQLiteStoreCore
 
         root = tmp_path / ".cashet"
         root.mkdir()
@@ -1560,7 +1560,7 @@ class TestMigrations:
 
         self._build_base_db(str(db_path))
 
-        core = _SQLiteStoreCore(root)
+        core = SQLiteStoreCore(root)
         try:
             from cashet.dag import build_commit, resolve_input_refs
             from cashet.hashing import build_task_def
@@ -1590,7 +1590,7 @@ class TestMigrations:
             core.close()
 
     def test_partial_migration_missing_retries_only(self, tmp_path: Path) -> None:
-        from cashet.store import _SQLiteStoreCore
+        from cashet._sqlite_core import SQLiteStoreCore
 
         root = tmp_path / ".cashet"
         root.mkdir()
@@ -1608,7 +1608,7 @@ class TestMigrations:
         )
         pre_conn.close()
 
-        core = _SQLiteStoreCore(root)
+        core = SQLiteStoreCore(root)
         try:
             col_names = [
                 r[1]
