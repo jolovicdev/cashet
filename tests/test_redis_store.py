@@ -10,13 +10,14 @@ import pytest
 from cashet import Client
 from cashet.models import Commit, TaskDef, TaskStatus
 from cashet.redis_store import RedisStore, _access_key, _commit_key
+from tests.helpers import redis_test_url
 
 pytestmark = pytest.mark.redis
 
 
 @pytest.fixture
 def redis_store() -> RedisStore:
-    store = RedisStore()
+    store = RedisStore(redis_test_url())
     store._flushdb()
     return store
 

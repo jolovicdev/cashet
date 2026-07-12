@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from cashet import Client
+from tests.helpers import redis_test_url
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -15,7 +16,7 @@ def pytest_configure(config: pytest.Config) -> None:
         return
     try:
         import redis
-        r = redis.from_url("redis://localhost:6379/0")
+        r = redis.from_url(redis_test_url())
         r.ping()
         r.close()
     except Exception:

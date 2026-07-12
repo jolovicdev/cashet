@@ -11,7 +11,7 @@ cashet is a content-addressable compute cache with git semantics. Python functio
 - Install with HTTP server: `uv sync --extra server`
 - Install with all extras: `uv sync --all-extras`
 - Run tests: `uv run pytest tests/ -v`
-- Redis tests auto-detect: skipped if Redis isn't reachable at `localhost:6379`. Set `CASHET_REDIS=1` to skip auto-detection and force-enable.
+- Redis tests target `redis://localhost:6379/15` by default and FLUSH that database between tests. Override with `CASHET_TEST_REDIS_URL` (point it at a dedicated instance or database, never one holding data you care about). Skipped automatically if the target isn't reachable; set `CASHET_REDIS=1` to skip auto-detection and force-enable.
 - Start Redis for full suite: `docker run -d --name cashet-redis -p 6379:6379 redis:7-alpine`
 - Lint: `uv run ruff check src/ tests/`
 - Type check: `uv run pyright src/`
