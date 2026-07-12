@@ -14,7 +14,6 @@ from typing import Any
 from cashet.dag import (
     build_commit,
     find_existing_commit,
-    find_parent_hash,
     resolve_input_refs,
 )
 from cashet.models import Commit, ObjectRef, TaskDef, TaskStatus
@@ -119,11 +118,12 @@ class AsyncLocalExecutor:
 
         while True:
             async with _async_store_lock(store, fp):
-                if not task_def.force:
-                    existing = await find_existing_commit(store, task_def)
-                    if existing is not None:
-                        existing.status = TaskStatus.CACHED
-                        return existing, True
+                # One lookup serves both purposes: it is the cached result when
+                # allowed to reuse it, and the parent for the new claim otherwise.
+                latest = await store.find_by_fingerprint(fp)
+                if task_def.cache and not task_def.force and latest is not None:
+                    latest.status = TaskStatus.CACHED
+                    return latest, True
 
                 claim = await store.find_running_by_fingerprint(task_def.fingerprint)
                 if claim is not None:
@@ -150,13 +150,11 @@ class AsyncLocalExecutor:
                         break
                 else:
                     input_refs = resolve_input_refs(args, kwargs)
-                    if task_def.cache and not task_def.force:
-                        # find_existing_commit just missed under this lock and
-                        # runs the same query, so there is no parent to find.
-                        parent_hash = None
-                    else:
-                        parent_hash = await find_parent_hash(store, task_def)
-                    claim = build_commit(task_def, input_refs, parent_hash=parent_hash)
+                    claim = build_commit(
+                        task_def,
+                        input_refs,
+                        parent_hash=latest.hash if latest else None,
+                    )
                     claim.status = TaskStatus.RUNNING
                     await store.put_commit(claim)
                     logger.debug(

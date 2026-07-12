@@ -175,13 +175,6 @@ async def find_existing_commit(store: AsyncStore, task_def: TaskDef) -> Commit |
     return await store.find_by_fingerprint(task_def.fingerprint)
 
 
-async def find_parent_hash(store: AsyncStore, task_def: TaskDef) -> str | None:
-    existing = await store.find_by_fingerprint(task_def.fingerprint)
-    if existing is not None:
-        return existing.hash
-    return None
-
-
 def compute_commit_hash(
     task_def: TaskDef,
     input_refs: list[ObjectRef],
