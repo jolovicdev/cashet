@@ -235,13 +235,15 @@ def _require_token(handler: Any, token: str | None) -> Any:
 
 
 def _submit_options(data: dict[str, Any]) -> dict[str, Any]:
+    # Keys match the underscore-prefixed keyword parameters of Client.submit
+    # and AsyncClient.submit, so the ops adapters can splat them straight in.
     return {
-        "cache": data.get("cache", True),
-        "tags": data.get("tags", {}),
-        "retries": data.get("retries", 0),
-        "force": data.get("force", False),
-        "timeout": data.get("timeout"),
-        "ttl": data.get("ttl"),
+        "_cache": data.get("cache", True),
+        "_tags": data.get("tags", {}),
+        "_retries": data.get("retries", 0),
+        "_force": data.get("force", False),
+        "_timeout": data.get("timeout"),
+        "_ttl": data.get("ttl"),
     }
 
 
@@ -257,17 +259,7 @@ class _AsyncOps:
         kwargs: dict[str, Any],
         options: dict[str, Any],
     ) -> tuple[str, str, bytes]:
-        ref = await self.client.submit(
-            func,
-            *args,
-            _cache=options["cache"],
-            _tags=options["tags"],
-            _retries=options["retries"],
-            _force=options["force"],
-            _timeout=options["timeout"],
-            _ttl=options["ttl"],
-            **kwargs,
-        )
+        ref = await self.client.submit(func, *args, **options, **kwargs)
         result = await ref.load()
         return ref.commit_hash, ref.hash, self.serializer.dumps(result)
 
@@ -285,10 +277,8 @@ class _AsyncOps:
     async def stats(self) -> dict[str, int]:
         return await self.client.stats()
 
-    async def gc(self, older_than_days: float, max_size: int | None) -> int:
-        return await self.client.gc(
-            timedelta(days=older_than_days), max_size_bytes=max_size
-        )
+    async def gc(self, older_than: timedelta, max_size: int | None) -> int:
+        return await self.client.gc(older_than, max_size_bytes=max_size)
 
 
 class _SyncOps:
@@ -305,17 +295,7 @@ class _SyncOps:
         options: dict[str, Any],
     ) -> tuple[str, str, bytes]:
         def run() -> tuple[str, str, bytes]:
-            ref = self.client.submit(
-                func,
-                *args,
-                _cache=options["cache"],
-                _tags=options["tags"],
-                _retries=options["retries"],
-                _force=options["force"],
-                _timeout=options["timeout"],
-                _ttl=options["ttl"],
-                **kwargs,
-            )
+            ref = self.client.submit(func, *args, **options, **kwargs)
             result = ref.load()
             return ref.commit_hash, ref.hash, self.serializer.dumps(result)
 
@@ -339,12 +319,13 @@ class _SyncOps:
     async def stats(self) -> dict[str, int]:
         return await asyncio.to_thread(self.client.stats)
 
-    async def gc(self, older_than_days: float, max_size: int | None) -> int:
+    async def gc(self, older_than: timedelta, max_size: int | None) -> int:
         return await asyncio.to_thread(
-            lambda: self.client.gc(
-                timedelta(days=older_than_days), max_size_bytes=max_size
-            )
+            lambda: self.client.gc(older_than, max_size_bytes=max_size)
         )
+
+
+_ServerOps = _AsyncOps | _SyncOps
 
 
 def _log_request(request: Request, status_code: int, start: float) -> None:
@@ -367,7 +348,7 @@ def _log_request_failed(request: Request, start: float) -> None:
 
 
 async def _submit(request: Request) -> JSONResponse:
-    ops: _AsyncOps | _SyncOps = request.app.state.ops
+    ops: _ServerOps = request.app.state.ops
     data = await request.json()
     func, error = _resolve_func(
         data,
@@ -408,7 +389,7 @@ async def _submit(request: Request) -> JSONResponse:
 
 
 async def _result(request: Request) -> JSONResponse:
-    ops: _AsyncOps | _SyncOps = request.app.state.ops
+    ops: _ServerOps = request.app.state.ops
     commit_hash = request.path_params["commit_hash"]
     start = time.perf_counter()
     try:
@@ -424,7 +405,7 @@ async def _result(request: Request) -> JSONResponse:
 
 
 async def _commit(request: Request) -> JSONResponse:
-    ops: _AsyncOps | _SyncOps = request.app.state.ops
+    ops: _ServerOps = request.app.state.ops
     commit_hash = request.path_params["commit_hash"]
     start = time.perf_counter()
     c = await ops.show(commit_hash)
@@ -435,7 +416,7 @@ async def _commit(request: Request) -> JSONResponse:
 
 
 async def _log(request: Request) -> JSONResponse:
-    ops: _AsyncOps | _SyncOps = request.app.state.ops
+    ops: _ServerOps = request.app.state.ops
     func_name = request.query_params.get("func")
     limit = _query_int(request, "limit", 50)
     status = request.query_params.get("status")
@@ -446,7 +427,7 @@ async def _log(request: Request) -> JSONResponse:
 
 
 async def _stats(request: Request) -> JSONResponse:
-    ops: _AsyncOps | _SyncOps = request.app.state.ops
+    ops: _ServerOps = request.app.state.ops
     start = time.perf_counter()
     result = await ops.stats()
     _log_request(request, 200, start)
@@ -454,10 +435,10 @@ async def _stats(request: Request) -> JSONResponse:
 
 
 async def _gc(request: Request) -> JSONResponse:
-    ops: _AsyncOps | _SyncOps = request.app.state.ops
+    ops: _ServerOps = request.app.state.ops
     older_than_days, max_size = _gc_params(await _json_body(request))
     start = time.perf_counter()
-    deleted = await ops.gc(older_than_days, max_size)
+    deleted = await ops.gc(timedelta(days=older_than_days), max_size)
     _log_request(request, 200, start)
     return _CustomJSONResponse({"deleted": deleted})
 
@@ -531,8 +512,7 @@ class _SizeLimitMiddleware:
 
 
 def _build_app(
-    ops: _AsyncOps | _SyncOps,
-    client: Any,
+    ops: _ServerOps,
     require_token: str | None,
     tasks: TaskRegistry | None,
     allow_remote_code: bool,
@@ -567,9 +547,9 @@ def _build_app(
         routes=routes,
         middleware=[Middleware(_SizeLimitMiddleware)],
     )
-    app.state.client = client
+    app.state.client = ops.client
     app.state.ops = ops
-    app.state.tasks = _server_tasks(client, tasks)
+    app.state.tasks = _server_tasks(ops.client, tasks)
     app.state.allow_remote_code = allow_remote_code
     app.state.max_content_length = max_content_length
     app.state.require_token = require_token
@@ -585,7 +565,7 @@ def create_app(
     max_content_length: int = _DEFAULT_MAX_CONTENT_LENGTH,
 ) -> Starlette:
     return _build_app(
-        _SyncOps(client), client, require_token, tasks, allow_remote_code, max_content_length
+        _SyncOps(client), require_token, tasks, allow_remote_code, max_content_length
     )
 
 
@@ -598,5 +578,5 @@ def create_async_app(
     max_content_length: int = _DEFAULT_MAX_CONTENT_LENGTH,
 ) -> Starlette:
     return _build_app(
-        _AsyncOps(client), client, require_token, tasks, allow_remote_code, max_content_length
+        _AsyncOps(client), require_token, tasks, allow_remote_code, max_content_length
     )
