@@ -39,13 +39,15 @@ Protocol-based dependency injection via three pluggable protocols in `src/cashet
 - **Store** — metadata + blob storage. Default: `SQLiteStore` in `store.py`. Also: `RedisStore` and `AsyncRedisStore` in `redis_store.py`
 - **AsyncStore** — async protocol for IO-bound backends (Redis, S3, HTTP). Defined in `protocols.py`
 - **Executor** — runs functions. Default: `LocalExecutor` in `executor.py` (sync). Async variant: `AsyncLocalExecutor` in `async_executor.py`
-- **Serializer** — serialize/deserialize results. Default: `PickleSerializer` in `hashing.py`
+- **Serializer** — serialize/deserialize results. Default: `PickleSerializer` in `serializers.py` (re-exported from `hashing.py` for compatibility)
+
+Internal module layout: `store.py` holds only the public SQLite store classes; the engine lives in `_sqlite_core.py`, schema and migrations in `_sqlite_schema.py`, cross-process lock plumbing in `_locks.py`. `redis_store.py` holds the Redis store classes; the key scheme, commit codec, and index pipeline commands live in `_redis_codec.py`. Hash-prefix validation shared by both stores is in `_ids.py`.
 
 Data flow (sync): `Client.submit()` → `build_task_def()` hashes function source + args → `LocalExecutor.submit()` checks cache → runs if needed → `build_commit()` creates commit with parent lineage → blobs stored via `Store.put_blob()` with zlib compression (256B threshold).
 
 Async data flow: `AsyncClient.submit()` → `build_task_def()` → `AsyncLocalExecutor.submit()` checks cache via async store → runs function in thread via `asyncio.to_thread()` → stores result via async `AsyncStore.put_blob()`. Heartbeat and locking are asyncio-native.
 
-HTTP server: `client.serve(host, port, require_token=None)` exposes endpoints over HTTP. When `require_token` is set, all requests must include `Authorization: Bearer <token>`. Async server (`AsyncClient.serve()`) uses `create_async_app()` with native async handlers. Sync server (`Client.serve()`) uses `create_app()` which wraps sync Client calls in `asyncio.to_thread`.
+HTTP server: `client.serve(host, port, require_token=None)` exposes endpoints over HTTP. When `require_token` is set, all requests must include `Authorization: Bearer <token>`. One handler set serves both clients through an ops adapter in `server.py`: `create_async_app()` (from `AsyncClient.serve()`) calls `AsyncClient` natively, `create_app()` (from `Client.serve()`) wraps sync Client calls in `asyncio.to_thread`.
 
 ## Key design decisions
 
@@ -57,7 +59,7 @@ HTTP server: `client.serve(host, port, require_token=None)` exposes endpoints ov
 - `AsyncResultRef` is the async counterpart for `AsyncClient`.
 - IO-bound layers (Store, HTTP) are async. CPU-bound execution stays on threads via `asyncio.to_thread()`.
 - Redis blob data keys: `cashet:blob:data:{hash}`. Ref counters: `cashet:blob:ref:{hash}`. Per-fingerprint locks: `cashet:lock:{fingerprint}`.
-- Redis `delete_commit` uses a Lua script (`_DECR_DELETE_SCRIPT`) for atomic DECR + conditional DELETE of blob keys when ref count reaches zero, avoiding a TOCTOU race.
+- Redis `delete_commit` uses a Lua script (`DECR_DELETE_SCRIPT` in `_redis_codec.py`) for atomic DECR + conditional DELETE of blob keys when ref count reaches zero, avoiding a TOCTOU race.
 - Sync `Client` and async `AsyncClient` share common helpers extracted to `_client_base.py` (store dir resolution, task config, diff).
 
 ## Code style

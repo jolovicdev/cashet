@@ -60,6 +60,13 @@ Measured with `benchmarks/bench_hot_path.py` on one machine (medians,
 - Redis tests target `redis://localhost:6379/15` by default and honor
   `CASHET_TEST_REDIS_URL`. The suite flushes the target database, which
   previously defaulted to a shared database 0.
+- Internal modules reorganized; public import paths are unchanged.
+  Serializers moved from `cashet.hashing` to `cashet.serializers` (the old
+  imports still work via re-exports). `store.py` keeps the public SQLite
+  classes and delegates to `_sqlite_core`, `_sqlite_schema`, and `_locks`;
+  `redis_store.py` keeps the Redis classes and delegates its key scheme and
+  codec to `_redis_codec`. The HTTP server's duplicated sync and async
+  handlers were unified into one set behind an ops adapter.
 
 ### Notes
 - Argument hashes change for sets containing custom objects or single-element
