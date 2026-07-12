@@ -29,7 +29,6 @@ class SQLiteStoreCore:
         self.db_path = root / "meta.db"
         self.objects_dir.mkdir(parents=True, exist_ok=True)
         self._tls = threading.local()
-        self._lock = threading.Lock()
         logger.debug("initializing sqlite store path=%s", str(self.db_path))
         ensure_schema(self._connect())
 
@@ -180,20 +179,27 @@ class SQLiteStoreCore:
         ).fetchone()
         if row is None:
             return None
-        try:
-            # Bump at most once per granularity window: eviction cutoffs are
-            # measured in days, so hour-precision LRU keeps steady-state cache
-            # hits free of write transactions.
-            threshold = (now - _ACCESS_BUMP_GRANULARITY).isoformat()
-            conn.execute(
-                "UPDATE commits SET last_accessed_at = ? WHERE hash = ? "
-                "AND (last_accessed_at IS NULL OR last_accessed_at < ?)",
-                (now_iso, row["hash"], threshold),
-            )
-        except sqlite3.OperationalError:
-            # Access-time bump only feeds LRU ordering; never fail a cache hit
-            # because a concurrent writer holds the lock past busy_timeout.
-            logger.debug("last_accessed_at bump skipped (db locked) hash=%s", row["hash"][:12])
+        # Bump at most once per granularity window: eviction cutoffs are
+        # measured in days, so hour-precision LRU keeps steady-state cache hits
+        # free of write statements. Decide from the row already in hand (even a
+        # zero-row UPDATE would take the writer lock); the SQL predicate stays
+        # as the guard against a concurrent bump.
+        threshold = (now - _ACCESS_BUMP_GRANULARITY).isoformat()
+        last_accessed = row["last_accessed_at"]
+        if last_accessed is None or last_accessed < threshold:
+            try:
+                conn.execute(
+                    "UPDATE commits SET last_accessed_at = ? WHERE hash = ? "
+                    "AND (last_accessed_at IS NULL OR last_accessed_at < ?)",
+                    (now_iso, row["hash"], threshold),
+                )
+            except sqlite3.OperationalError:
+                # Access-time bump only feeds LRU ordering; never fail a cache
+                # hit because a concurrent writer holds the lock past
+                # busy_timeout.
+                logger.debug(
+                    "last_accessed_at bump skipped (db locked) hash=%s", row["hash"][:12]
+                )
         return row_to_commit(row)
 
     def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
@@ -349,36 +355,29 @@ class SQLiteStoreCore:
         evictable = "(last_accessed_at < ? OR (expires_at IS NOT NULL AND expires_at <= ?))"
         try:
             params = (older_than.isoformat(), datetime.now(UTC).isoformat())
+            # The OR on expires_at defeats the last_accessed index, so evaluate
+            # the predicate in one scan and delete by hash.
+            rows = conn.execute(
+                f"SELECT hash, output_hash, input_refs FROM commits WHERE {evictable}",
+                params,
+            ).fetchall()
+            evicted_hashes = [r[0] for r in rows]
             candidates: set[str] = set()
-            evicted_hashes = [
-                row[0]
-                for row in conn.execute(
-                    f"SELECT hash FROM commits WHERE {evictable}", params
-                )
-            ]
-            for row in conn.execute(
-                f"SELECT output_hash FROM commits "
-                f"WHERE {evictable} AND output_hash IS NOT NULL",
-                params,
-            ):
-                candidates.add(row[0])
-            for row in conn.execute(
-                f"SELECT input_refs FROM commits "
-                f"WHERE {evictable} AND input_refs IS NOT NULL",
-                params,
-            ):
-                for h in json.loads(row[0]):
-                    candidates.add(h)
+            for r in rows:
+                if r[1]:
+                    candidates.add(r[1])
+                if r[2]:
+                    candidates.update(json.loads(r[2]))
+            deleted = len(evicted_hashes)
             if evicted_hashes:
                 placeholders = ", ".join("?" for _ in evicted_hashes)
                 conn.execute(
                     f"UPDATE commits SET parent_hash = NULL WHERE parent_hash IN ({placeholders})",
                     evicted_hashes,
                 )
-            cursor = conn.execute(
-                f"DELETE FROM commits WHERE {evictable}", params
-            )
-            deleted = cursor.rowcount
+                conn.execute(
+                    f"DELETE FROM commits WHERE hash IN ({placeholders})", evicted_hashes
+                )
             if candidates:
                 orphans = self._find_orphan_objects(conn, candidates)
             conn.execute("COMMIT")
@@ -603,9 +602,7 @@ class SQLiteStoreCore:
             still_input.update(json.loads(row[0]))
         return [h for h in candidates if h not in still_output and h not in still_input]
 
-    def _delete_orphan_objects(self, conn: sqlite3.Connection | None, orphans: list[str]) -> int:
-        if conn is None:
-            conn = self._connect()
+    def _delete_orphan_objects(self, conn: sqlite3.Connection, orphans: list[str]) -> int:
         freed = 0
         for obj_hash in orphans:
             blob_path = self.objects_dir / obj_hash[:2] / obj_hash[2:]
