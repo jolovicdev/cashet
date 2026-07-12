@@ -103,19 +103,19 @@ class AsyncLocalExecutor:
     ) -> tuple[Commit, bool]:
         fp = task_def.fingerprint
         func_name = task_def.func_name
+        # Completed commits are immutable, so a hit needs no cross-process lock
+        # and no write; the claim loop below re-checks under the lock on a miss.
         if not task_def.force:
-            async with _async_store_lock(store, fp):
-                existing = await find_existing_commit(store, task_def)
-                if existing is not None:
-                    existing.status = TaskStatus.CACHED
-                    await store.put_commit(existing)
-                    logger.info(
-                        "task cached fingerprint=%s func=%s commit=%s",
-                        fp,
-                        func_name,
-                        existing.hash[:12],
-                    )
-                    return existing, True
+            existing = await find_existing_commit(store, task_def)
+            if existing is not None:
+                existing.status = TaskStatus.CACHED
+                logger.info(
+                    "task cached fingerprint=%s func=%s commit=%s",
+                    fp,
+                    func_name,
+                    existing.hash[:12],
+                )
+                return existing, True
 
         while True:
             async with _async_store_lock(store, fp):
@@ -123,7 +123,6 @@ class AsyncLocalExecutor:
                     existing = await find_existing_commit(store, task_def)
                     if existing is not None:
                         existing.status = TaskStatus.CACHED
-                        await store.put_commit(existing)
                         return existing, True
 
                 claim = await store.find_running_by_fingerprint(task_def.fingerprint)
@@ -151,7 +150,12 @@ class AsyncLocalExecutor:
                         break
                 else:
                     input_refs = resolve_input_refs(args, kwargs)
-                    parent_hash = await find_parent_hash(store, task_def)
+                    if task_def.cache and not task_def.force:
+                        # find_existing_commit just missed under this lock and
+                        # runs the same query, so there is no parent to find.
+                        parent_hash = None
+                    else:
+                        parent_hash = await find_parent_hash(store, task_def)
                     claim = build_commit(task_def, input_refs, parent_hash=parent_hash)
                     claim.status = TaskStatus.RUNNING
                     await store.put_commit(claim)

@@ -97,6 +97,17 @@ class TestDeduplication:
 
         assert ref1.hash == ref2.hash
 
+    def test_cache_hit_leaves_stored_status_completed(self, client: Client) -> None:
+        def expensive(x: int) -> int:
+            return x * x
+
+        client.submit(expensive, 5)
+        client.submit(expensive, 5)
+        client.submit(expensive, 5)
+        commits = client.log()
+        assert len(commits) == 1
+        assert commits[0].status is TaskStatus.COMPLETED
+
     def test_different_args_different_results(self, client: Client) -> None:
         def double(x: int) -> int:
             return x * 2
