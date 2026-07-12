@@ -9,7 +9,7 @@ import pytest
 
 from cashet import Client
 from cashet.models import Commit, TaskDef, TaskStatus
-from cashet.redis_store import RedisStore, _access_key, _commit_key
+from cashet.redis_store import RedisStore, _access_key, _commit_key, _fp_key
 from tests.helpers import redis_test_url
 
 pytestmark = pytest.mark.redis
@@ -63,6 +63,100 @@ class TestRedisStoreProtocol:
         found = redis_store.find_by_fingerprint(task_def.fingerprint)
         assert found is not None
         assert found.hash == commit.hash
+
+    def test_find_by_fingerprint_returns_newest_commit(self, redis_store: RedisStore) -> None:
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+        )
+        older = Commit(
+            hash="f" * 64,
+            task_def=task_def,
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(UTC) - timedelta(hours=2),
+        )
+        newer = Commit(
+            hash="0" * 64,
+            task_def=task_def,
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(UTC) - timedelta(hours=1),
+        )
+        redis_store.put_commit(older)
+        redis_store.put_commit(newer)
+        found = redis_store.find_by_fingerprint(task_def.fingerprint)
+        assert found is not None
+        assert found.hash == newer.hash
+
+    def test_find_by_fingerprint_skips_expired_newer_commit(
+        self, redis_store: RedisStore
+    ) -> None:
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+        )
+        older = Commit(
+            hash="f" * 64,
+            task_def=task_def,
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(UTC) - timedelta(hours=2),
+        )
+        newer = Commit(
+            hash="0" * 64,
+            task_def=task_def,
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(UTC) - timedelta(hours=1),
+            expires_at=datetime.now(UTC) - timedelta(minutes=5),
+        )
+        redis_store.put_commit(older)
+        redis_store.put_commit(newer)
+        found = redis_store.find_by_fingerprint(task_def.fingerprint)
+        assert found is not None
+        assert found.hash == older.hash
+
+    def test_find_by_fingerprint_heals_legacy_expiry_scores(
+        self, redis_store: RedisStore
+    ) -> None:
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+        )
+        older = Commit(
+            hash="f" * 64,
+            task_def=task_def,
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(UTC) - timedelta(hours=2),
+        )
+        newer = Commit(
+            hash="0" * 64,
+            task_def=task_def,
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(UTC) - timedelta(hours=1),
+        )
+        redis_store.put_commit(older)
+        redis_store.put_commit(newer)
+        redis_client = redis_store._async_store._redis  # pyright: ignore[reportPrivateUsage]
+        redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+            redis_client.zadd(
+                _fp_key(task_def.fingerprint),
+                {older.hash: float("inf"), newer.hash: float("inf")},
+            )
+        )
+        found = redis_store.find_by_fingerprint(task_def.fingerprint)
+        assert found is not None
+        assert found.hash == newer.hash
+        healed_score = redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+            redis_client.zscore(_fp_key(task_def.fingerprint), newer.hash)
+        )
+        assert healed_score == pytest.approx(newer.created_at.timestamp())
 
     def test_cached_put_commit_does_not_move_access_score_backwards(
         self, redis_store: RedisStore

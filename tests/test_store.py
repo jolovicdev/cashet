@@ -10,7 +10,7 @@ import pytest
 from cashet import Client, TaskError
 from cashet.executor import LocalExecutor
 from cashet.hashing import PickleSerializer, build_task_def
-from cashet.models import Commit, ObjectRef, StorageTier, TaskStatus
+from cashet.models import Commit, ObjectRef, StorageTier, TaskDef, TaskStatus
 from cashet.store import SQLiteStore
 
 
@@ -336,6 +336,33 @@ class TestProcessSafety:
 
 
 class TestStoreOperations:
+    def test_find_by_fingerprint_returns_newest_commit(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+        )
+        older = Commit(
+            hash="f" * 64,
+            task_def=task_def,
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(UTC) - timedelta(hours=2),
+        )
+        newer = Commit(
+            hash="0" * 64,
+            task_def=task_def,
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(UTC) - timedelta(hours=1),
+        )
+        store.put_commit(older)
+        store.put_commit(newer)
+        found = store.find_by_fingerprint(task_def.fingerprint)
+        assert found is not None
+        assert found.hash == newer.hash
+
     def test_log(self, client: Client) -> None:
         def f(x: int) -> int:
             return x

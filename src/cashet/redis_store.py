@@ -251,8 +251,7 @@ def _index_commit_commands(pipe: Any, commit: Commit) -> None:
     pipe.set(_commit_key(commit.hash), _encode_commit(commit))
     ts = commit.created_at.timestamp()
     pipe.zadd("cashet:index:all", {commit.hash: ts})
-    expires_ts = commit.expires_at.timestamp() if commit.expires_at else float("inf")
-    pipe.zadd(_fp_key(commit.fingerprint), {commit.hash: expires_ts})
+    pipe.zadd(_fp_key(commit.fingerprint), {commit.hash: ts})
     pipe.zadd(_func_key(commit.task_def.func_name), {commit.hash: ts})
     now_ts = datetime.now(UTC).timestamp()
     pipe.zadd(_access_key(), {commit.hash: now_ts})
@@ -396,19 +395,43 @@ class AsyncRedisStore:
         return _decode_commit(data)
 
     async def find_by_fingerprint(self, fingerprint: str) -> Commit | None:
-        now_ts = datetime.now(UTC).timestamp()
-        hashes = await self._redis.zrevrangebyscore(
-            _fp_key(fingerprint), max="+inf", min=f"({now_ts}"
-        )
-        for h in hashes:
-            h_str = h.decode() if isinstance(h, bytes) else h
+        # Scored by created_at, so descending order is recency order and the
+        # newest completed commit wins, matching SQLiteStore.
+        entries = await self._redis.zrevrange(_fp_key(fingerprint), 0, -1, withscores=True)
+        if any(score == float("inf") for _, score in entries):
+            await self._rescore_legacy_fingerprint_index(fingerprint, entries)
+            entries = await self._redis.zrevrange(
+                _fp_key(fingerprint), 0, -1, withscores=True
+            )
+        now = datetime.now(UTC)
+        for h, _score in entries:
+            h_str = _decode_hash(h)
             commit = await self.get_commit(h_str)
-            if commit is not None and commit.status in (TaskStatus.COMPLETED, TaskStatus.CACHED):
-                if commit.expires_at is not None and commit.expires_at <= datetime.now(UTC):
-                    continue
-                await self._touch_commit(h_str)
-                return commit
+            if commit is None:
+                continue
+            if commit.status not in (TaskStatus.COMPLETED, TaskStatus.CACHED):
+                continue
+            if commit.expires_at is not None and commit.expires_at <= now:
+                continue
+            await self._touch_commit(h_str)
+            return commit
         return None
+
+    async def _rescore_legacy_fingerprint_index(
+        self, fingerprint: str, entries: list[tuple[Any, float]]
+    ) -> None:
+        # Indexes written before 0.5.0 scored this zset by expiry (infinity for
+        # commits without a TTL), which would shadow every newer commit; rescore
+        # by created_at so recency ordering holds for pre-upgrade entries.
+        rescored: dict[str, float] = {}
+        for h, _score in entries:
+            h_str = _decode_hash(h)
+            data = await self._redis.get(_commit_key(h_str))
+            if data is None:
+                continue
+            rescored[h_str] = _decode_commit(data).created_at.timestamp()
+        if rescored:
+            await self._redis.zadd(_fp_key(fingerprint), rescored)
 
     async def find_running_by_fingerprint(self, fingerprint: str) -> Commit | None:
         hashes = await self._redis.smembers(_running_key(fingerprint))
