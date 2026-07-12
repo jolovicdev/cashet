@@ -425,6 +425,17 @@ def object_state(obj: Any) -> dict[str, Any] | None:
     return state or None
 
 
+def _stable_item_reprs(items: Any, _visited: set[int]) -> list[str]:
+    # Set ordering must come from the items' stable serialized form; raw repr
+    # can embed memory addresses, which reorder across processes.
+    reprs: list[str] = []
+    for item in items:
+        sub = io.StringIO()
+        _stable_repr_to(sub, item, _visited)
+        reprs.append(sub.getvalue())
+    return reprs
+
+
 def _stable_repr_to(
     buf: io.StringIO, obj: Any, _visited: set[int] | None = None
 ) -> None:
@@ -456,12 +467,7 @@ def _stable_repr_to(
             return
         _visited.add(obj_id)
         buf.write("{")
-        first = True
-        for item in sorted(obj, key=repr):
-            if not first:
-                buf.write(", ")
-            first = False
-            _stable_repr_to(buf, item, _visited)
+        buf.write(", ".join(sorted(_stable_item_reprs(obj, _visited))))
         buf.write("}")
         _visited.discard(obj_id)
     elif isinstance(obj, frozenset):
@@ -471,12 +477,7 @@ def _stable_repr_to(
             return
         _visited.add(obj_id)
         buf.write("frozenset({")
-        first = True
-        for item in sorted(obj, key=repr):
-            if not first:
-                buf.write(", ")
-            first = False
-            _stable_repr_to(buf, item, _visited)
+        buf.write(", ".join(sorted(_stable_item_reprs(obj, _visited))))
         buf.write("})")
         _visited.discard(obj_id)
     elif isinstance(obj, dict):
