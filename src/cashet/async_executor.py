@@ -207,23 +207,28 @@ class AsyncLocalExecutor:
 
         async def _heartbeat() -> None:
             interval = self._running_ttl.total_seconds() / 2
+            # A failed renewal leaves the claim halfway to stale; waiting a full
+            # interval would retry exactly at the staleness boundary, where any
+            # delay lets another worker reclaim a live task. Retry fast instead.
+            retry_interval = interval / 4
+            wait = interval
             while True:
                 try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                    await asyncio.wait_for(stop_event.wait(), timeout=wait)
                     break
                 except TimeoutError:
                     pass
                 if commit.status != TaskStatus.RUNNING:
                     break
-                # A transient store error must not kill the lease loop; the next
-                # interval retries and the claim stays renewable.
                 try:
                     async with _async_store_lock(store, commit.task_def.fingerprint):
                         if commit.status != TaskStatus.RUNNING:
                             break
                         commit.claimed_at = datetime.now(UTC)
                         await store.put_commit(commit)
+                    wait = interval
                 except Exception:
+                    wait = retry_interval
                     logger.warning(
                         "heartbeat renewal failed fingerprint=%s commit=%s",
                         commit.task_def.fingerprint,

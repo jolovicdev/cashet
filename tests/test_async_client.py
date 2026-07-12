@@ -446,3 +446,47 @@ class TestHeartbeatResilience:
         assert store.running_puts > 1
         commits = await client.log()
         assert commits[0].status is TaskStatus.COMPLETED
+
+    async def test_failed_renewal_retries_before_lease_thins(self, tmp_path: Path) -> None:
+        import asyncio
+        import time
+        from datetime import timedelta
+
+        from cashet.async_executor import AsyncLocalExecutor
+        from cashet.models import Commit, TaskStatus
+        from cashet.store import AsyncSQLiteStore
+
+        class FlakyOnceStore:
+            def __init__(self, inner: AsyncSQLiteStore) -> None:
+                self._inner = inner
+                self.running_puts = 0
+                self.renewal_times: list[float] = []
+
+            async def put_commit(self, commit: Commit) -> None:
+                if commit.status is TaskStatus.RUNNING:
+                    self.running_puts += 1
+                    if self.running_puts > 1:
+                        self.renewal_times.append(time.monotonic())
+                        if len(self.renewal_times) == 1:
+                            raise RuntimeError("transient store outage")
+                await self._inner.put_commit(commit)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+        store = FlakyOnceStore(AsyncSQLiteStore(tmp_path / ".cashet"))
+        client = AsyncClient(
+            store_dir=tmp_path / ".cashet",
+            store=store,  # type: ignore[arg-type]
+            executor=AsyncLocalExecutor(running_ttl=timedelta(seconds=0.4)),
+        )
+
+        async def slow_task() -> str:
+            await asyncio.sleep(0.5)
+            return "done"
+
+        ref = await client.submit(slow_task)
+        assert await ref.load() == "done"
+        assert len(store.renewal_times) >= 2
+        retry_gap = store.renewal_times[1] - store.renewal_times[0]
+        assert retry_gap < 0.15

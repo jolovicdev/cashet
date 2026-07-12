@@ -23,6 +23,8 @@ bugs are fixed. Read the Notes before upgrading shared stores.
 - A store error during a heartbeat renewal no longer kills the lease loop
   (which let another worker reclaim and double-run a live task) and can no
   longer surface as an exception that destroys an already-computed result.
+  Failed renewals retry on a quarter of the normal interval, so a single
+  transient error cannot leave the claim stale before the next attempt.
 - Set and frozenset arguments are ordered by their stable serialized form
   when hashing. Ordering by raw repr embedded memory addresses, so the same
   logical set could hash differently in another process.
