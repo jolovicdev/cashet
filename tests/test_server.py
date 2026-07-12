@@ -10,7 +10,7 @@ from starlette.testclient import TestClient
 
 from cashet.async_client import AsyncClient
 from cashet.client import Client
-from cashet.hashing import PickleSerializer
+from cashet.serializers import PickleSerializer
 from cashet.server import create_app, create_async_app
 
 

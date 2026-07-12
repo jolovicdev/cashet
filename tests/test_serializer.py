@@ -11,7 +11,7 @@ from tests.helpers import PickleableCustom
 
 class TestSerializer:
     def test_custom_serializer(self, store_dir: Path) -> None:
-        from cashet.hashing import JsonSerializer
+        from cashet.serializers import JsonSerializer
 
         client = Client(store_dir=store_dir, serializer=JsonSerializer())
 
@@ -67,11 +67,11 @@ class TestPickleWarning:
     def test_warns_once_per_process(self, store_dir: Path) -> None:
         import warnings
 
-        import cashet.hashing as hashing_mod
+        import cashet.serializers as serializers_mod
 
-        original = hashing_mod._pickle_warning_issued
+        original = serializers_mod._pickle_warning_issued
         try:
-            hashing_mod._pickle_warning_issued = False
+            serializers_mod._pickle_warning_issued = False
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
                 Client(store_dir=store_dir)
@@ -79,6 +79,6 @@ class TestPickleWarning:
                 pickle_warnings = [x for x in w if "PickleSerializer" in str(x.message)]
                 assert len(pickle_warnings) == 1
         finally:
-            hashing_mod._pickle_warning_issued = original
+            serializers_mod._pickle_warning_issued = original
 
 

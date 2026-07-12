@@ -23,9 +23,9 @@ from cashet.async_client import AsyncClient
 from cashet.async_executor import AsyncLocalExecutor
 from cashet.dag import ResultRef
 from cashet.executor import LocalExecutor
-from cashet.hashing import Serializer
 from cashet.models import Commit, TaskStatus
 from cashet.protocols import AsyncExecutor, AsyncStore, Executor, Store
+from cashet.serializers import Serializer
 from cashet.store import AsyncSQLiteStore, SQLiteStore
 
 T = TypeVar("T")

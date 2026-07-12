@@ -24,9 +24,10 @@ from cashet._client_base import (
 from cashet._export import ImportResult, export_store, import_store
 from cashet.async_executor import AsyncLocalExecutor
 from cashet.dag import AsyncResultRef
-from cashet.hashing import PickleSerializer, Serializer, build_task_def, warn_default_pickle
+from cashet.hashing import build_task_def
 from cashet.models import Commit, TaskError, TaskStatus
 from cashet.protocols import AsyncExecutor, AsyncStore
+from cashet.serializers import PickleSerializer, Serializer, warn_default_pickle
 from cashet.store import AsyncSQLiteStore
 
 T = TypeVar("T")

@@ -17,9 +17,9 @@ from cashet.dag import (
     find_parent_hash,
     resolve_input_refs,
 )
-from cashet.hashing import Serializer
 from cashet.models import Commit, ObjectRef, TaskDef, TaskStatus
 from cashet.protocols import AsyncStore
+from cashet.serializers import Serializer
 
 _DEFAULT_RUNNING_TTL = timedelta(seconds=300)
 _lock_cache: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()

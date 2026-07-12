@@ -6,9 +6,10 @@ import time
 from datetime import UTC, datetime
 from typing import Any, Generic, TypeVar
 
-from cashet.hashing import Serializer, object_state
+from cashet.hashing import object_state
 from cashet.models import Commit, ObjectRef, TaskDef, TaskStatus
 from cashet.protocols import AsyncStore
+from cashet.serializers import Serializer
 
 T = TypeVar("T")
 

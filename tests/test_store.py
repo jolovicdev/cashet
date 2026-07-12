@@ -9,8 +9,9 @@ import pytest
 
 from cashet import Client, TaskError
 from cashet.executor import LocalExecutor
-from cashet.hashing import PickleSerializer, build_task_def
+from cashet.hashing import build_task_def
 from cashet.models import Commit, ObjectRef, StorageTier, TaskDef, TaskStatus
+from cashet.serializers import PickleSerializer
 from cashet.store import SQLiteStore
 
 
