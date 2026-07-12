@@ -404,3 +404,45 @@ class TestAsyncDiff:
     async def test_diff_missing_commit_raises(self, async_client: AsyncClient) -> None:
         with pytest.raises(KeyError, match="not found"):
             await async_client.diff("deadbeef", "cafebabe")
+
+
+class TestHeartbeatResilience:
+    async def test_result_survives_failing_heartbeat_renewals(self, tmp_path: Path) -> None:
+        import asyncio
+        from datetime import timedelta
+
+        from cashet.async_executor import AsyncLocalExecutor
+        from cashet.models import Commit, TaskStatus
+        from cashet.store import AsyncSQLiteStore
+
+        class FlakyRenewalStore:
+            def __init__(self, inner: AsyncSQLiteStore) -> None:
+                self._inner = inner
+                self.running_puts = 0
+
+            async def put_commit(self, commit: Commit) -> None:
+                if commit.status is TaskStatus.RUNNING:
+                    self.running_puts += 1
+                    if self.running_puts > 1:
+                        raise RuntimeError("transient store outage")
+                await self._inner.put_commit(commit)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+        store = FlakyRenewalStore(AsyncSQLiteStore(tmp_path / ".cashet"))
+        client = AsyncClient(
+            store_dir=tmp_path / ".cashet",
+            store=store,  # type: ignore[arg-type]
+            executor=AsyncLocalExecutor(running_ttl=timedelta(milliseconds=200)),
+        )
+
+        async def slow_task() -> str:
+            await asyncio.sleep(0.35)
+            return "survived"
+
+        ref = await client.submit(slow_task)
+        assert await ref.load() == "survived"
+        assert store.running_puts > 1
+        commits = await client.log()
+        assert commits[0].status is TaskStatus.COMPLETED

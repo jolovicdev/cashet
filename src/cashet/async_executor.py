@@ -213,11 +213,21 @@ class AsyncLocalExecutor:
                     pass
                 if commit.status != TaskStatus.RUNNING:
                     break
-                async with _async_store_lock(store, commit.task_def.fingerprint):
-                    if commit.status != TaskStatus.RUNNING:
-                        break
-                    commit.claimed_at = datetime.now(UTC)
-                    await store.put_commit(commit)
+                # A transient store error must not kill the lease loop; the next
+                # interval retries and the claim stays renewable.
+                try:
+                    async with _async_store_lock(store, commit.task_def.fingerprint):
+                        if commit.status != TaskStatus.RUNNING:
+                            break
+                        commit.claimed_at = datetime.now(UTC)
+                        await store.put_commit(commit)
+                except Exception:
+                    logger.warning(
+                        "heartbeat renewal failed fingerprint=%s commit=%s",
+                        commit.task_def.fingerprint,
+                        commit.hash[:12],
+                        exc_info=True,
+                    )
 
         heartbeat_task = asyncio.create_task(_heartbeat())
 
@@ -286,7 +296,24 @@ class AsyncLocalExecutor:
                     commit.error,
                 )
             stop_event.set()
-            await asyncio.wait_for(heartbeat_task, timeout=self._running_ttl.total_seconds() * 2)
+            # The task's outcome is already decided; a misbehaving heartbeat must
+            # not raise past this point and destroy the result.
+            try:
+                await asyncio.wait_for(
+                    heartbeat_task, timeout=self._running_ttl.total_seconds() * 2
+                )
+            except TimeoutError:
+                logger.warning(
+                    "heartbeat did not stop in time fingerprint=%s commit=%s",
+                    commit.task_def.fingerprint,
+                    commit.hash[:12],
+                )
+            except Exception:
+                logger.exception(
+                    "heartbeat task failed fingerprint=%s commit=%s",
+                    commit.task_def.fingerprint,
+                    commit.hash[:12],
+                )
 
         return commit
 
