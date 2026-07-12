@@ -252,17 +252,33 @@ class TestServerSubmit:
         response = server_client.post("/submit", json={"args": [1]})
         assert response.status_code == 400
 
-    def test_submit_internal_error_is_generic(self, tmp_path: Path) -> None:
+    def test_submit_task_failure_returns_422_without_paths(self, tmp_path: Path) -> None:
         client = Client(store_dir=tmp_path / ".cashet")
         app = create_app(client, tasks={"boom": _boom})
         tc = TestClient(app)
         response = tc.post("/submit", json={"task": "boom"})
-        assert response.status_code == 500
-        assert response.json()["error"] == "Internal server error"
-        assert "secret internal path" not in response.text
+        assert response.status_code == 422
+        data = response.json()
+        assert data["error"] == "task failed"
+        assert data["detail"] == "RuntimeError: secret internal path"
+        assert 'File "' not in response.text
 
 
 class TestAsyncServerSubmit:
+    async def test_async_submit_task_failure_returns_422(self, tmp_path: Path) -> None:
+        client = AsyncClient(store_dir=tmp_path / ".cashet")
+        app = create_async_app(client, tasks={"boom": _boom})
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            response = await ac.post("/submit", json={"task": "boom"})
+        assert response.status_code == 422
+        data = response.json()
+        assert data["error"] == "task failed"
+        assert data["detail"] == "RuntimeError: secret internal path"
+        assert 'File "' not in response.text
+        await client.close()
+
     async def test_async_submit_registered_task_with_sqlite(self, tmp_path: Path) -> None:
         client = AsyncClient(store_dir=tmp_path / ".cashet")
         app = create_async_app(client, tasks={"add": _add})

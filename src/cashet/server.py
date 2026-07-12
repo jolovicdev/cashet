@@ -19,6 +19,7 @@ from starlette.routing import Route
 
 from cashet.async_client import AsyncClient
 from cashet.client import Client
+from cashet.models import TaskError
 
 logger = logging.getLogger("cashet")
 
@@ -51,6 +52,16 @@ _DEFAULT_MAX_CONTENT_LENGTH = 500 * 1024 * 1024
 def _too_large_response(max_size: int) -> _CustomJSONResponse:
     return _CustomJSONResponse(
         {"error": f"request body exceeds {max_size} bytes"}, status_code=413
+    )
+
+
+def _task_failed_response(exc: TaskError) -> _CustomJSONResponse:
+    # A failing task is the caller's error, not a server bug: surface the final
+    # traceback line ("ExceptionType: message") but never server file paths.
+    lines = str(exc).strip().splitlines()
+    detail = lines[-1] if lines else "task failed"
+    return _CustomJSONResponse(
+        {"error": "task failed", "detail": detail}, status_code=422
     )
 
 
@@ -279,6 +290,16 @@ async def _async_submit(request: Request) -> JSONResponse:
                 "result_b64": result_b64,
             }
         )
+    except TaskError as exc:
+        duration = int((time.perf_counter() - start) * 1000)
+        logger.info(
+            "request method=%s path=%s status=%d duration_ms=%d",
+            request.method,
+            request.url.path,
+            422,
+            duration,
+        )
+        return _task_failed_response(exc)
     except Exception:
         duration = int((time.perf_counter() - start) * 1000)
         logger.exception(
@@ -546,6 +567,8 @@ async def _submit(request: Request) -> JSONResponse:
                     "result_b64": result_b64,
                 }
             )
+        except TaskError as exc:
+            return _task_failed_response(exc)
         except Exception:
             logger.exception(
                 "request failed method=POST path=/submit status=500",
