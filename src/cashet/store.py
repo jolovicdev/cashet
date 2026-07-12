@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import threading
 import zlib
@@ -216,7 +217,14 @@ class _SQLiteStoreCore:
             compressed = zlib.compress(data, level=6)
             if len(compressed) < len(data):
                 stored = compressed
-        obj_path.write_bytes(stored)
+        # Write-then-rename so a crash mid-write can never leave a partial file
+        # at the content-addressed path, where the exists() dedup check above
+        # would treat it as the real blob forever.
+        tmp_path = obj_path.with_name(
+            f"{obj_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        tmp_path.write_bytes(stored)
+        os.replace(tmp_path, obj_path)
         logger.info(
             "blob stored hash=%s size=%d tier=blob compressed=%s",
             content_hash[:12],
@@ -253,8 +261,11 @@ class _SQLiteStoreCore:
         except zlib.error:
             pass
         if hashlib.sha256(raw).hexdigest() != ref.hash:
+            # The path is derived from the content hash, so a mismatched file is
+            # corrupt; removing it lets the next put_blob store it again.
+            obj_path.unlink(missing_ok=True)
             logger.error(
-                "blob integrity check failed hash=%s",
+                "corrupt blob removed hash=%s",
                 ref.hash[:12],
             )
             raise ValueError(f"Blob {ref.hash} integrity check failed")

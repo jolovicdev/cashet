@@ -570,6 +570,25 @@ class TestBlobIntegrity:
         with pytest.raises(ValueError, match="integrity check failed"):
             store.get_blob(fake_ref)
 
+    def test_corrupt_blob_self_heals_on_rewrite(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        data = b"partially written payload" * 100
+        ref = store.put_blob(data)
+        obj_path = store.objects_dir / ref.hash[:2] / ref.hash[2:]
+        obj_path.write_bytes(b"truncated junk")
+        with pytest.raises(ValueError, match="integrity check failed"):
+            store.get_blob(ref)
+        assert not obj_path.exists()
+        healed = store.put_blob(data)
+        assert healed.hash == ref.hash
+        assert store.get_blob(healed) == data
+
+    def test_put_blob_leaves_no_temp_files(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        store.put_blob(b"z" * 5000)
+        leftovers = list(store.objects_dir.rglob("*.tmp"))
+        assert leftovers == []
+
 
 class TestInlineStorage:
     def test_small_blob_uses_inline_tier(self, store_dir: Path) -> None:
