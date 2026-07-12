@@ -6,6 +6,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 import zlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,6 +19,7 @@ from cashet.models import Commit, ObjectRef, StorageTier, TaskStatus
 _BLOB_COMPRESS_THRESHOLD = 256
 _INLINE_THRESHOLD = 1024
 _ACCESS_BUMP_GRANULARITY = timedelta(hours=1)
+_TMP_SWEEP_AGE_SECONDS = 3600
 
 logger = logging.getLogger("cashet")
 
@@ -98,8 +100,12 @@ class SQLiteStoreCore:
         tmp_path = obj_path.with_name(
             f"{obj_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
         )
-        tmp_path.write_bytes(stored)
-        os.replace(tmp_path, obj_path)
+        try:
+            tmp_path.write_bytes(stored)
+            os.replace(tmp_path, obj_path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
         logger.info(
             "blob stored hash=%s size=%d tier=blob compressed=%s",
             content_hash[:12],
@@ -331,10 +337,27 @@ class SQLiteStoreCore:
         for p in self.objects_dir.iterdir():
             if p.is_dir():
                 for f in p.iterdir():
-                    if f.is_file():
+                    # A crashed writer's leftover temp file is not a stored
+                    # object; counting it would inflate size-based eviction's
+                    # target with bytes commit GC can never reclaim.
+                    if f.is_file() and not f.name.endswith(".tmp"):
                         obj_count += 1
                         total_bytes += f.stat().st_size
         return obj_count, total_bytes
+
+    def _sweep_stale_tmp_files(self) -> None:
+        # Age-gated so a concurrent writer's in-flight temp file survives; a
+        # healthy write lives milliseconds, an hour-old one is crash debris.
+        cutoff = time.time() - _TMP_SWEEP_AGE_SECONDS
+        for prefix_dir in self.objects_dir.iterdir():
+            if not prefix_dir.is_dir():
+                continue
+            for f in prefix_dir.glob("*.tmp"):
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink(missing_ok=True)
+                except OSError:
+                    continue
 
     def _inline_storage_totals(self, conn: sqlite3.Connection) -> tuple[int, int]:
         inline_row = conn.execute(
@@ -350,6 +373,7 @@ class SQLiteStoreCore:
     def evict(
         self, older_than: datetime, max_size_bytes: int | None = None
     ) -> int:
+        self._sweep_stale_tmp_files()
         conn = self._connect(immediate=True)
         orphans: list[str] = []
         # The expiry term must never delete a live claim: expires_at is stamped

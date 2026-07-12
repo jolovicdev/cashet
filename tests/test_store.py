@@ -644,6 +644,49 @@ class TestBlobIntegrity:
         leftovers = list(store.objects_dir.rglob("*.tmp"))
         assert leftovers == []
 
+    def test_put_blob_cleans_temp_file_on_failed_write(
+        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import cashet._sqlite_core as core_mod
+
+        store = SQLiteStore(store_dir)
+
+        def boom(src: object, dst: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(core_mod.os, "replace", boom)
+        with pytest.raises(OSError, match="disk full"):
+            store.put_blob(b"z" * 5000)
+        assert list(store.objects_dir.rglob("*.tmp")) == []
+
+    def test_stats_ignores_leftover_temp_files(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        ref = store.put_blob(b"z" * 5000)
+        before = store.stats()
+        orphan = store.objects_dir / ref.hash[:2] / "deadbeef.1.2.tmp"
+        orphan.write_bytes(b"crash debris")
+        after = store.stats()
+        assert after["blob_objects"] == before["blob_objects"]
+        assert after["blob_bytes"] == before["blob_bytes"]
+
+    def test_evict_sweeps_stale_temp_files(self, store_dir: Path) -> None:
+        import os
+        import time
+
+        store = SQLiteStore(store_dir)
+        store.put_blob(b"z" * 5000)
+        prefix_dir = next(p for p in store.objects_dir.iterdir() if p.is_dir())
+        stale = prefix_dir / "deadbeef.1.2.tmp"
+        stale.write_bytes(b"crash debris")
+        old = time.time() - 7200
+        os.utime(stale, (old, old))
+        fresh = prefix_dir / "cafebabe.3.4.tmp"
+        fresh.write_bytes(b"in-flight write")
+
+        store.evict(datetime.now(UTC) - timedelta(days=30))
+        assert not stale.exists()
+        assert fresh.exists()
+
 
 class TestInlineStorage:
     def test_small_blob_uses_inline_tier(self, store_dir: Path) -> None:

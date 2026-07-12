@@ -79,7 +79,9 @@ Measured with `benchmarks/bench_hot_path.py` on one machine (medians,
   older versions with a TTL can still order incorrectly until rewritten, and
   commits written before 0.5.0 are absent from the new expiry index, so they
   only age out by access time.
-- Blob writes now create short-lived `*.tmp` files inside `objects/`.
+- Blob writes create short-lived `*.tmp` files inside `objects/`. A failed
+  write removes its temp file, storage stats never count them, and garbage
+  collection sweeps any left behind by a crash once they are an hour old.
 
 ## 0.4.5 - 21.6.2026.
 
