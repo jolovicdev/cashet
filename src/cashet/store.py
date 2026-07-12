@@ -513,25 +513,26 @@ class _SQLiteStoreCore:
     ) -> int:
         conn = self._connect(immediate=True)
         orphans: list[str] = []
+        evictable = "(last_accessed_at < ? OR (expires_at IS NOT NULL AND expires_at <= ?))"
         try:
-            cutoff = older_than.isoformat()
+            params = (older_than.isoformat(), datetime.now(UTC).isoformat())
             candidates: set[str] = set()
             evicted_hashes = [
                 row[0]
                 for row in conn.execute(
-                    "SELECT hash FROM commits WHERE last_accessed_at < ?", (cutoff,)
+                    f"SELECT hash FROM commits WHERE {evictable}", params
                 )
             ]
             for row in conn.execute(
-                "SELECT output_hash FROM commits "
-                "WHERE last_accessed_at < ? AND output_hash IS NOT NULL",
-                (cutoff,),
+                f"SELECT output_hash FROM commits "
+                f"WHERE {evictable} AND output_hash IS NOT NULL",
+                params,
             ):
                 candidates.add(row[0])
             for row in conn.execute(
-                "SELECT input_refs FROM commits "
-                "WHERE last_accessed_at < ? AND input_refs IS NOT NULL",
-                (cutoff,),
+                f"SELECT input_refs FROM commits "
+                f"WHERE {evictable} AND input_refs IS NOT NULL",
+                params,
             ):
                 for h in json.loads(row[0]):
                     candidates.add(h)
@@ -542,7 +543,7 @@ class _SQLiteStoreCore:
                     evicted_hashes,
                 )
             cursor = conn.execute(
-                "DELETE FROM commits WHERE last_accessed_at < ?", (cutoff,)
+                f"DELETE FROM commits WHERE {evictable}", params
             )
             deleted = cursor.rowcount
             if candidates:

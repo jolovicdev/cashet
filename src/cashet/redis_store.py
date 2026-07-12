@@ -83,6 +83,10 @@ def _access_key() -> str:
     return "cashet:index:last_accessed"
 
 
+def _expires_key() -> str:
+    return "cashet:index:expires"
+
+
 def _blob_stats_key() -> str:
     return "cashet:stats:blob"
 
@@ -252,6 +256,10 @@ def _index_commit_commands(pipe: Any, commit: Commit) -> None:
     ts = commit.created_at.timestamp()
     pipe.zadd("cashet:index:all", {commit.hash: ts})
     pipe.zadd(_fp_key(commit.fingerprint), {commit.hash: ts})
+    if commit.expires_at is not None:
+        pipe.zadd(_expires_key(), {commit.hash: commit.expires_at.timestamp()})
+    else:
+        pipe.zrem(_expires_key(), commit.hash)
     pipe.zadd(_func_key(commit.task_def.func_name), {commit.hash: ts})
     now_ts = datetime.now(UTC).timestamp()
     pipe.zadd(_access_key(), {commit.hash: now_ts})
@@ -271,6 +279,7 @@ def _remove_commit_index_commands(pipe: Any, commit: Commit, resolved_hash: str)
     pipe.delete(_commit_key(resolved_hash))
     pipe.zrem("cashet:index:all", resolved_hash)
     pipe.zrem(_fp_key(commit.fingerprint), resolved_hash)
+    pipe.zrem(_expires_key(), resolved_hash)
     pipe.srem(_running_key(commit.fingerprint), resolved_hash)
     pipe.zrem(_func_key(commit.task_def.func_name), resolved_hash)
     pipe.zrem(_access_key(), resolved_hash)
@@ -578,6 +587,14 @@ class AsyncRedisStore:
                 continue
             if await self.delete_commit(h_str):
                 deleted += 1
+        now_ts = datetime.now(UTC).timestamp()
+        expired_raw = await self._redis.zrangebyscore(_expires_key(), "-inf", now_ts)
+        for h in expired_raw:
+            h_str = _decode_hash(h)
+            if await self.delete_commit(h_str):
+                deleted += 1
+            else:
+                await self._redis.zrem(_expires_key(), h_str)
         if max_size_bytes is not None:
             current_bytes = (await self._blob_storage_totals())[1]
             while current_bytes > max_size_bytes:

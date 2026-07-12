@@ -405,6 +405,36 @@ class TestRedisStoreProtocol:
         assert deleted == 1
         assert redis_store.get_commit("c" * 64) is None
 
+    def test_evict_removes_ttl_expired_commits(self, redis_store: RedisStore) -> None:
+        expired_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+        )
+        expired = Commit(
+            hash="c" * 64,
+            task_def=expired_def,
+            status=TaskStatus.COMPLETED,
+            created_at=datetime.now(UTC) - timedelta(hours=2),
+            expires_at=datetime.now(UTC) - timedelta(hours=1),
+        )
+        fresh_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="e" * 64,
+            args_snapshot=b"",
+        )
+        fresh = Commit(hash="d" * 64, task_def=fresh_def, status=TaskStatus.COMPLETED)
+        redis_store.put_commit(expired)
+        redis_store.put_commit(fresh)
+        deleted = redis_store.evict(datetime.now(UTC) - timedelta(days=30))
+        assert deleted == 1
+        assert redis_store.get_commit("c" * 64) is None
+        assert redis_store.get_commit("d" * 64) is not None
+
     def test_evict_backfills_partial_last_access_index(self, redis_store: RedisStore) -> None:
         old = datetime.now(UTC) - timedelta(days=10)
         hashes = ["c" * 64, "d" * 64]

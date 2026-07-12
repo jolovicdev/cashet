@@ -769,6 +769,23 @@ class TestGarbageCollection:
         assert deleted == 0
         assert client.stats()["total_commits"] == 1
 
+    def test_gc_removes_ttl_expired_commits(self, client: Client) -> None:
+        from freezegun import freeze_time
+
+        def make_val(x: int) -> int:
+            return x
+
+        with freeze_time("2026-01-01 00:00:00") as frozen:
+            client.submit(make_val, 1, _ttl=60)
+            client.submit(make_val, 2)
+            assert client.stats()["total_commits"] == 2
+
+            frozen.tick(3600)
+            deleted = client.gc(timedelta(days=30))
+            assert deleted == 1
+            assert client.stats()["total_commits"] == 1
+            assert client.log()[0].expires_at is None
+
     def test_gc_default_30_days(self, client: Client) -> None:
         def make_val(x: int) -> int:
             return x
