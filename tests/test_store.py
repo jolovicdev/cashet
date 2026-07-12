@@ -336,6 +336,42 @@ class TestProcessSafety:
 
 
 class TestStoreOperations:
+    def test_access_bump_throttled_to_granularity(self, store_dir: Path) -> None:
+        from freezegun import freeze_time
+
+        store = SQLiteStore(store_dir)
+        task_def = TaskDef(
+            func_hash="a" * 64,
+            func_name="f",
+            func_source="def f(): pass",
+            args_hash="b" * 64,
+            args_snapshot=b"",
+        )
+
+        def last_accessed() -> str:
+            row = store._connect().execute(  # pyright: ignore[reportPrivateUsage]
+                "SELECT last_accessed_at FROM commits WHERE hash = ?", ("c" * 64,)
+            ).fetchone()
+            return row[0]
+
+        with freeze_time("2026-01-01 00:00:00") as frozen:
+            commit = Commit(hash="c" * 64, task_def=task_def, status=TaskStatus.COMPLETED)
+            store.put_commit(commit)
+            initial = last_accessed()
+
+            frozen.tick(60)
+            assert store.find_by_fingerprint(task_def.fingerprint) is not None
+            assert last_accessed() == initial
+
+            frozen.tick(7200)
+            assert store.find_by_fingerprint(task_def.fingerprint) is not None
+            assert last_accessed() > initial
+
+    def test_connection_uses_normal_synchronous(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        mode = store._connect().execute("PRAGMA synchronous").fetchone()[0]  # pyright: ignore[reportPrivateUsage]
+        assert mode == 1
+
     def test_find_by_fingerprint_returns_newest_commit(self, store_dir: Path) -> None:
         store = SQLiteStore(store_dir)
         task_def = TaskDef(

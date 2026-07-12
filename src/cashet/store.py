@@ -18,6 +18,7 @@ from cashet.models import Commit, ObjectRef, StorageTier, TaskDef, TaskStatus
 
 _BLOB_COMPRESS_THRESHOLD = 256
 _INLINE_THRESHOLD = 1024
+_ACCESS_BUMP_GRANULARITY = timedelta(hours=1)
 
 logger = logging.getLogger("cashet")
 
@@ -76,6 +77,9 @@ class _SQLiteStoreCore:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
             conn.execute("PRAGMA journal_mode=WAL")
+            # NORMAL under WAL cannot corrupt the database; a power loss may
+            # drop the most recent commits, which a compute cache can recompute.
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=5000")
             self._tls.conn = conn
         if immediate:
@@ -353,9 +357,14 @@ class _SQLiteStoreCore:
         if row is None:
             return None
         try:
+            # Bump at most once per granularity window: eviction cutoffs are
+            # measured in days, so hour-precision LRU keeps steady-state cache
+            # hits free of write transactions.
+            threshold = (now - _ACCESS_BUMP_GRANULARITY).isoformat()
             conn.execute(
-                "UPDATE commits SET last_accessed_at = ? WHERE hash = ?",
-                (now_iso, row["hash"]),
+                "UPDATE commits SET last_accessed_at = ? WHERE hash = ? "
+                "AND (last_accessed_at IS NULL OR last_accessed_at < ?)",
+                (now_iso, row["hash"], threshold),
             )
         except sqlite3.OperationalError:
             # Access-time bump only feeds LRU ordering; never fail a cache hit
