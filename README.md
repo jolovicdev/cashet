@@ -234,9 +234,10 @@ cashet export backup.tar.gz        # export commits and blobs to an archive
 cashet import backup.tar.gz        # import from an archive
 cashet stats                       # storage statistics
 cashet serve --host 127.0.0.1 --port 8000
+cashet --store-dir /path/to/store log   # any command against another store
 ```
 
-`cashet show`, `cashet get`, and `cashet rm` exit with a non-zero status when the commit is not found, so they compose in scripts.
+`cashet show`, `cashet get`, and `cashet rm` exit with a non-zero status when the commit is not found, so they compose in scripts. Commands that operate on an existing store exit non-zero when the store directory does not exist instead of creating an empty one; `import` and `serve` create it. `--store-dir` overrides `$CASHET_DIR` and the `./.cashet` default.
 
 ## Python API
 
@@ -362,7 +363,7 @@ client.serve(host="127.0.0.1", port=8000, require_token="secret123")
 | GET | `/stats` | Storage statistics |
 | POST | `/gc` | Run garbage collection |
 
-When `require_token` is set, every request needs an `Authorization: Bearer <token>` header. Request bodies are size-limited (default 500 MB). Use `AsyncClient.serve()` for the native async server.
+When `require_token` is set, every request needs an `Authorization: Bearer <token>` header. Request bodies are size-limited (default 500 MB). A task that raises returns 422 with the exception line; 500 means the server itself failed. Use `AsyncClient.serve()` for the native async server.
 
 > **Security.** `/submit` does not execute client-supplied Python by default. The legacy `func_source`, `func_b64`, `args_b64`, and `kwargs_b64` payloads require both `allow_remote_code=True` and a non-empty token (`cashet serve --require-token secret123 --allow-remote-code`). That mode deserializes and runs arbitrary Python, so expose it only to trusted clients.
 
@@ -447,7 +448,7 @@ Small results (under 1 KB) are stored inline in `meta.db` to avoid inode overhea
 
 ### Concurrency
 
-cashet is safe across threads, processes, and machines that share one store. Concurrent submissions of the same uncached task are deduplicated: the function runs exactly once and all callers get the same result. Cross-process claims use file locks (SQLite) or per-fingerprint Redis locks, with a heartbeat lease so a crashed worker's claim is reclaimed (default 5 minutes, configurable via `LocalExecutor(running_ttl=...)`).
+cashet is safe across threads, processes, and machines that share one store. Concurrent submissions of the same uncached task are deduplicated: the function runs exactly once and all callers get the same result. Cross-process claims use file locks (SQLite) or per-fingerprint Redis locks, with a heartbeat lease so a crashed worker's claim is reclaimed (default 5 minutes, configurable via `LocalExecutor(running_ttl=...)`). Cache hits take no locks and perform no writes, so concurrent readers never contend.
 
 ### Notebooks
 
@@ -462,6 +463,7 @@ cashet resolves function source through `inspect.getsource`, then `dill.source.g
 
 Upgrading across a hash-format change does not corrupt anything; old entries simply miss and recompute on first access. To start clean, run `cashet clear` or point at a fresh store directory.
 
+- **0.4.5 to 0.5.0:** Argument hashes change for sets containing custom objects or single-element tuples; those entries recompute on first access. Cache hits no longer rewrite commit status to `cached`. The Redis fingerprint index is rescored to created_at ordering lazily on lookup; pre-0.5.0 TTL entries may order incorrectly until rewritten and are collected by access age only. SQLite opens with `synchronous=NORMAL`. The HTTP server returns 422 instead of 500 for task failures. CLI read commands require an existing store directory.
 - **0.4.4 to 0.4.5:** Hashing fixes (slotted-object state, referenced global containers, `ast.unparse` canonicalization) change function and argument cache keys, so results cached by earlier versions recompute on first access. The Redis tag index key scheme changed and is not migrated; rewrite affected commits to rebuild tag indexes. `import_archive` now returns `ImportResult(imported, skipped)` instead of a bare count.
 - **0.3.x to 0.4.0:** Added per-entry TTL and tag-based invalidation. SQLite auto-migrates; old caches stay readable.
 - **0.3.0 to 0.3.1:** Redis blob keys renamed to `cashet:blob:data:{hash}` and stats backfilled once. Clear Redis caches before upgrading if you rely on long-lived reuse.
