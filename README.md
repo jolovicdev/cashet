@@ -448,7 +448,7 @@ Small results (under 1 KB) are stored inline in `meta.db` to avoid inode overhea
 
 ### Concurrency
 
-cashet is safe across threads, processes, and machines that share one store. Concurrent submissions of the same uncached task are deduplicated: the function runs exactly once and all callers get the same result. Cross-process claims use file locks (SQLite) or per-fingerprint Redis locks, with a heartbeat lease so a crashed worker's claim is reclaimed (default 5 minutes, configurable via `LocalExecutor(running_ttl=...)`). Cache hits take no locks and perform no writes, so concurrent readers never contend.
+cashet is safe across threads, processes, and machines that share one store. Concurrent submissions of the same uncached task are deduplicated: the function runs exactly once and all callers get the same result. Cross-process claims use file locks (SQLite) or per-fingerprint Redis locks, with a heartbeat lease so a crashed worker's claim is reclaimed (default 5 minutes, configurable via `LocalExecutor(running_ttl=...)`). Cache hits take no locks. On SQLite a steady-state hit performs no writes at all; on Redis a hit updates the shared access index with a single ZADD, which is what lets every worker's hits feed one LRU.
 
 ### Notebooks
 

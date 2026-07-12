@@ -2,7 +2,7 @@
 
 ## 0.5.0 - 12.7.2026.
 
-Experimental correctness and performance release. Cache hits are read-only
+Experimental correctness and performance release. Cache hits are lock-free
 and roughly 10x faster; several data-integrity and cross-store consistency
 bugs are fixed. Read the Notes before upgrading shared stores.
 
@@ -40,8 +40,10 @@ Measured with `benchmarks/bench_hot_path.py` on one machine (medians,
 - hashing (`build_task_def`): 256 us to 10 us
 - cache miss (run + store): 8.2 ms to 2.7 ms
 
-- Cache hits are read-only: no fingerprint lock, no commit rewrite, and no
-  redundant parent query on the claim path.
+- Cache hits take no fingerprint lock, never rewrite the commit, and skip the
+  redundant parent query on the claim path. SQLite hits inside the access-bump
+  window perform no writes at all; Redis hits still update the shared access
+  index with one ZADD, which single-instance Redis absorbs cheaply.
 - `last_accessed_at` is bumped at most once per hour per commit. Eviction
   cutoffs are measured in days, so LRU eviction behavior is unchanged.
 - SQLite connections use `synchronous=NORMAL` under WAL: a power loss can
