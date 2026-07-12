@@ -875,10 +875,11 @@ class AsyncSQLiteStore:
         self._write_lock = asyncio.Lock()
 
     def _fingerprint_lock(self, fingerprint: str) -> _SQLiteFingerprintLock:
-        import hashlib
-
-        fp_hash = hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
-        return _SQLiteFingerprintLock(str(self._core.root / f".lock-{fp_hash}"))
+        # Striping bounds the process-global lock registry at 256 entries per
+        # store instead of one per fingerprint forever. Distinct fingerprints
+        # sharing a stripe only serialize their claim sections.
+        stripe = hashlib.sha256(fingerprint.encode()).hexdigest()[:2]
+        return _SQLiteFingerprintLock(str(self._core.root / f".lock-{stripe}"))
 
     @property
     def root(self) -> Path:

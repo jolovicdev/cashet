@@ -303,18 +303,16 @@ class AsyncRedisStore:
 
         self._redis: Any = aioredis.from_url(redis_url)
         self._lock_timeout = lock_timeout
-        self._async_locks: dict[str, Any] = {}
 
     def _fingerprint_lock(self, fingerprint: str) -> Any:
-        lock = self._async_locks.get(fingerprint)
-        if lock is None:
-            lock = self._redis.lock(
-                f"cashet:lock:{fingerprint}",
-                timeout=self._lock_timeout,
-                blocking_timeout=10,
-            )
-            self._async_locks[fingerprint] = lock
-        return lock
+        # A fresh Lock per acquisition: redis-py Lock objects carry per-holder
+        # token state, so caching one per fingerprint leaked memory and risked
+        # token confusion when two coroutines reused the same instance.
+        return self._redis.lock(
+            f"cashet:lock:{fingerprint}",
+            timeout=self._lock_timeout,
+            blocking_timeout=10,
+        )
 
     async def put_blob(self, data: bytes) -> ObjectRef:
         content_hash = hashlib.sha256(data).hexdigest()

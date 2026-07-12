@@ -373,6 +373,19 @@ class TestStoreOperations:
         log = client.log()
         assert len(log) == 3
 
+    def test_fingerprint_lock_registry_is_striped(self, client: Client) -> None:
+        from cashet.store import _SQLITE_LOCKS
+
+        def f(x: int) -> int:
+            return x
+
+        for i in range(5):
+            client.submit(f, i)
+        root = str(client.store.root)
+        names = [Path(p).name for p in _SQLITE_LOCKS if p.startswith(root)]
+        assert names
+        assert all(len(name) == len(".lock-xx") for name in names)
+
     def test_retries_roundtrip(self, client: Client) -> None:
         def stable() -> int:
             return 42
