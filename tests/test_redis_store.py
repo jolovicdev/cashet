@@ -11,7 +11,7 @@ from cashet import Client
 from cashet._redis_codec import access_key, commit_key, fp_key
 from cashet.models import Commit, TaskDef, TaskStatus
 from cashet.redis_store import RedisStore
-from tests.helpers import redis_test_url
+from tests.helpers import make_commit, make_task_def, redis_test_url
 
 pytestmark = pytest.mark.redis
 
@@ -66,25 +66,9 @@ class TestRedisStoreProtocol:
         assert found.hash == commit.hash
 
     def test_find_by_fingerprint_returns_newest_commit(self, redis_store: RedisStore) -> None:
-        task_def = TaskDef(
-            func_hash="a" * 64,
-            func_name="f",
-            func_source="def f(): pass",
-            args_hash="b" * 64,
-            args_snapshot=b"",
-        )
-        older = Commit(
-            hash="f" * 64,
-            task_def=task_def,
-            status=TaskStatus.COMPLETED,
-            created_at=datetime.now(UTC) - timedelta(hours=2),
-        )
-        newer = Commit(
-            hash="0" * 64,
-            task_def=task_def,
-            status=TaskStatus.COMPLETED,
-            created_at=datetime.now(UTC) - timedelta(hours=1),
-        )
+        task_def = make_task_def()
+        older = make_commit("f" * 64, task_def, hours_ago=2)
+        newer = make_commit("0" * 64, task_def, hours_ago=1)
         redis_store.put_commit(older)
         redis_store.put_commit(newer)
         found = redis_store.find_by_fingerprint(task_def.fingerprint)
@@ -94,24 +78,12 @@ class TestRedisStoreProtocol:
     def test_find_by_fingerprint_skips_expired_newer_commit(
         self, redis_store: RedisStore
     ) -> None:
-        task_def = TaskDef(
-            func_hash="a" * 64,
-            func_name="f",
-            func_source="def f(): pass",
-            args_hash="b" * 64,
-            args_snapshot=b"",
-        )
-        older = Commit(
-            hash="f" * 64,
-            task_def=task_def,
-            status=TaskStatus.COMPLETED,
-            created_at=datetime.now(UTC) - timedelta(hours=2),
-        )
-        newer = Commit(
-            hash="0" * 64,
-            task_def=task_def,
-            status=TaskStatus.COMPLETED,
-            created_at=datetime.now(UTC) - timedelta(hours=1),
+        task_def = make_task_def()
+        older = make_commit("f" * 64, task_def, hours_ago=2)
+        newer = make_commit(
+            "0" * 64,
+            task_def,
+            hours_ago=1,
             expires_at=datetime.now(UTC) - timedelta(minutes=5),
         )
         redis_store.put_commit(older)
@@ -123,25 +95,9 @@ class TestRedisStoreProtocol:
     def test_find_by_fingerprint_heals_legacy_expiry_scores(
         self, redis_store: RedisStore
     ) -> None:
-        task_def = TaskDef(
-            func_hash="a" * 64,
-            func_name="f",
-            func_source="def f(): pass",
-            args_hash="b" * 64,
-            args_snapshot=b"",
-        )
-        older = Commit(
-            hash="f" * 64,
-            task_def=task_def,
-            status=TaskStatus.COMPLETED,
-            created_at=datetime.now(UTC) - timedelta(hours=2),
-        )
-        newer = Commit(
-            hash="0" * 64,
-            task_def=task_def,
-            status=TaskStatus.COMPLETED,
-            created_at=datetime.now(UTC) - timedelta(hours=1),
-        )
+        task_def = make_task_def()
+        older = make_commit("f" * 64, task_def, hours_ago=2)
+        newer = make_commit("0" * 64, task_def, hours_ago=1)
         redis_store.put_commit(older)
         redis_store.put_commit(newer)
         redis_client = redis_store._async_store._redis  # pyright: ignore[reportPrivateUsage]
@@ -407,28 +363,13 @@ class TestRedisStoreProtocol:
         assert redis_store.get_commit("c" * 64) is None
 
     def test_evict_removes_ttl_expired_commits(self, redis_store: RedisStore) -> None:
-        expired_def = TaskDef(
-            func_hash="a" * 64,
-            func_name="f",
-            func_source="def f(): pass",
-            args_hash="b" * 64,
-            args_snapshot=b"",
-        )
-        expired = Commit(
-            hash="c" * 64,
-            task_def=expired_def,
-            status=TaskStatus.COMPLETED,
-            created_at=datetime.now(UTC) - timedelta(hours=2),
+        expired = make_commit(
+            "c" * 64,
+            make_task_def(),
+            hours_ago=2,
             expires_at=datetime.now(UTC) - timedelta(hours=1),
         )
-        fresh_def = TaskDef(
-            func_hash="a" * 64,
-            func_name="f",
-            func_source="def f(): pass",
-            args_hash="e" * 64,
-            args_snapshot=b"",
-        )
-        fresh = Commit(hash="d" * 64, task_def=fresh_def, status=TaskStatus.COMPLETED)
+        fresh = make_commit("d" * 64, make_task_def(args_hash="e" * 64))
         redis_store.put_commit(expired)
         redis_store.put_commit(fresh)
         deleted = redis_store.evict(datetime.now(UTC) - timedelta(days=30))
@@ -724,8 +665,6 @@ class TestRedisStoreWithClient:
     def test_delete_does_not_drop_blob_when_ref_counter_missing(
         self, redis_store: RedisStore
     ) -> None:
-        import redis as _redis
-
         from cashet._redis_codec import blob_ref_key
 
         shared = redis_store.put_blob(b"shared-payload")
@@ -741,8 +680,12 @@ class TestRedisStoreWithClient:
                     status=TaskStatus.COMPLETED,
                 )
             )
-        # Simulate a lost/inconsistent ref counter for the shared blob.
-        _redis.Redis().delete(blob_ref_key(shared.hash))
+        # Simulate a lost/inconsistent ref counter for the shared blob, on the
+        # same database the store under test uses.
+        redis_client = redis_store._async_store._redis  # pyright: ignore[reportPrivateUsage]
+        redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+            redis_client.delete(blob_ref_key(shared.hash))
+        )
 
         redis_store.delete_commit("a" * 64)
 

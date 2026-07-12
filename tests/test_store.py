@@ -10,9 +10,10 @@ import pytest
 from cashet import Client, TaskError
 from cashet.executor import LocalExecutor
 from cashet.hashing import build_task_def
-from cashet.models import Commit, ObjectRef, StorageTier, TaskDef, TaskStatus
+from cashet.models import Commit, ObjectRef, StorageTier, TaskStatus
 from cashet.serializers import PickleSerializer
 from cashet.store import SQLiteStore
+from tests.helpers import make_commit, make_task_def
 
 
 class TestProcessSafety:
@@ -341,13 +342,7 @@ class TestStoreOperations:
         from freezegun import freeze_time
 
         store = SQLiteStore(store_dir)
-        task_def = TaskDef(
-            func_hash="a" * 64,
-            func_name="f",
-            func_source="def f(): pass",
-            args_hash="b" * 64,
-            args_snapshot=b"",
-        )
+        task_def = make_task_def()
 
         def last_accessed() -> str:
             row = store._connect().execute(  # pyright: ignore[reportPrivateUsage]
@@ -356,8 +351,7 @@ class TestStoreOperations:
             return row[0]
 
         with freeze_time("2026-01-01 00:00:00") as frozen:
-            commit = Commit(hash="c" * 64, task_def=task_def, status=TaskStatus.COMPLETED)
-            store.put_commit(commit)
+            store.put_commit(make_commit("c" * 64, task_def))
             initial = last_accessed()
 
             frozen.tick(60)
@@ -375,25 +369,9 @@ class TestStoreOperations:
 
     def test_find_by_fingerprint_returns_newest_commit(self, store_dir: Path) -> None:
         store = SQLiteStore(store_dir)
-        task_def = TaskDef(
-            func_hash="a" * 64,
-            func_name="f",
-            func_source="def f(): pass",
-            args_hash="b" * 64,
-            args_snapshot=b"",
-        )
-        older = Commit(
-            hash="f" * 64,
-            task_def=task_def,
-            status=TaskStatus.COMPLETED,
-            created_at=datetime.now(UTC) - timedelta(hours=2),
-        )
-        newer = Commit(
-            hash="0" * 64,
-            task_def=task_def,
-            status=TaskStatus.COMPLETED,
-            created_at=datetime.now(UTC) - timedelta(hours=1),
-        )
+        task_def = make_task_def()
+        older = make_commit("f" * 64, task_def, hours_ago=2)
+        newer = make_commit("0" * 64, task_def, hours_ago=1)
         store.put_commit(older)
         store.put_commit(newer)
         found = store.find_by_fingerprint(task_def.fingerprint)
