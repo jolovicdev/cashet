@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import datetime as _datetime
 import hashlib
 import inspect
@@ -11,11 +12,17 @@ import sys
 import textwrap
 import types
 import warnings
+import weakref
 from datetime import timedelta
 from functools import lru_cache
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 from cashet.models import TaskDef
+from cashet.serializers import JsonSerializer as JsonSerializer
+from cashet.serializers import PickleSerializer as PickleSerializer
+from cashet.serializers import SafePickleSerializer as SafePickleSerializer
+from cashet.serializers import Serializer as Serializer
+from cashet.serializers import warn_default_pickle as warn_default_pickle
 
 
 class ClosureWarning(UserWarning):
@@ -24,136 +31,6 @@ class ClosureWarning(UserWarning):
 
 class UnhashableArgWarning(UserWarning):
     pass
-
-
-_pickle_warning_issued = False
-
-
-def warn_default_pickle() -> None:
-    global _pickle_warning_issued
-    if _pickle_warning_issued:
-        return
-    _pickle_warning_issued = True
-    import warnings
-
-    warnings.warn(
-        "Using PickleSerializer by default — arbitrary code execution risk on "
-        "untrusted cached results. Pass serializer=SafePickleSerializer() "
-        "for safer deserialization.",
-        stacklevel=3,
-    )
-
-
-@runtime_checkable
-class Serializer(Protocol):
-    def dumps(self, obj: Any) -> bytes: ...
-    def loads(self, data: bytes) -> Any: ...
-
-
-class PickleSerializer:
-    def __init__(self, protocol: int | None = None) -> None:
-        import pickle
-
-        self._pickle = pickle
-        self._protocol = protocol or pickle.HIGHEST_PROTOCOL
-
-    def dumps(self, obj: Any) -> bytes:
-        return self._pickle.dumps(obj, protocol=self._protocol)
-
-    def loads(self, data: bytes) -> Any:
-        return self._pickle.loads(data)
-
-
-class JsonSerializer:
-    def dumps(self, obj: Any) -> bytes:
-        import json
-
-        return json.dumps(obj, default=str, sort_keys=True).encode()
-
-    def loads(self, data: bytes) -> Any:
-        import json
-
-        return json.loads(data)
-
-
-class SafePickleSerializer:
-    _cached_allowlist: list[type] | None = None
-
-    def __init__(self, extra_classes: list[type] | None = None) -> None:
-        import pickle
-
-        self._pickle = pickle
-        self._allowed: dict[str, type] = {}
-        for cls in self._default_allowlist():
-            key = f"{cls.__module__}.{cls.__qualname__}"
-            self._allowed[key] = cls
-        if extra_classes:
-            for cls in extra_classes:
-                key = f"{cls.__module__}.{cls.__qualname__}"
-                self._allowed[key] = cls
-
-    def dumps(self, obj: Any) -> bytes:
-        return self._pickle.dumps(obj, protocol=self._pickle.HIGHEST_PROTOCOL)
-
-    def loads(self, data: bytes) -> Any:
-        import io
-        import pickle
-
-        allowed = self._allowed
-        blocked_msg = " — not in allowlist. Pass it via SafePickleSerializer(extra_classes=[...])."
-
-        class _RestrictedUnpickler(pickle.Unpickler):
-            def find_class(self, module: str, name: str) -> Any:  # type: ignore[override]
-                key = f"{module}.{name}"
-                if key in allowed:
-                    return allowed[key]
-                raise pickle.UnpicklingError(f"Blocked class {key}{blocked_msg}")
-
-        return _RestrictedUnpickler(io.BytesIO(data)).load()
-
-    @classmethod
-    def _default_allowlist(cls) -> list[type]:
-        if cls._cached_allowlist is not None:
-            return cls._cached_allowlist
-        import collections
-        import datetime
-
-        types_list: list[type] = [
-            type(None),
-            bool,
-            int,
-            float,
-            str,
-            bytes,
-            bytearray,
-            list,
-            dict,
-            tuple,
-            set,
-            frozenset,
-            slice,
-            range,
-            complex,
-            object,
-            type,
-            datetime.datetime,
-            datetime.date,
-            datetime.timedelta,
-            datetime.time,
-            datetime.timezone,
-            collections.OrderedDict,
-            collections.defaultdict,
-            collections.Counter,
-            collections.deque,
-        ]
-        try:
-            import numpy  # pyright: ignore[reportMissingImports]
-
-            types_list.append(numpy.ndarray)  # type: ignore[attr-defined]
-        except ImportError:
-            pass
-        cls._cached_allowlist = types_list
-        return types_list
 
 
 def _normalize_source(source: str) -> str:
@@ -171,7 +48,16 @@ def _bytecode_source(func: types.FunctionType) -> str:
     )
 
 
+# Keyed by the function object itself: a redefinition (new cell, reloaded
+# module) is a new object and misses, while repeat submissions of the same
+# function skip the source lookup and its file IO entirely.
+_source_cache: weakref.WeakKeyDictionary[types.FunctionType, str] = weakref.WeakKeyDictionary()
+
+
 def get_func_source(func: types.FunctionType) -> str:
+    cached = _source_cache.get(func)
+    if cached is not None:
+        return cached
     try:
         source = inspect.getsource(func)
     except OSError:
@@ -184,7 +70,10 @@ def get_func_source(func: types.FunctionType) -> str:
             pass
         if source is None:
             source = _bytecode_source(func)
-    return _normalize_source(source)
+    normalized = _normalize_source(source)
+    with contextlib.suppress(TypeError):
+        _source_cache[func] = normalized
+    return normalized
 
 
 def get_dep_versions(func: types.FunctionType) -> dict[str, str]:
@@ -207,6 +96,7 @@ def hash_source(source: str) -> str:
     return hashlib.sha256(source.encode()).hexdigest()
 
 
+@lru_cache(maxsize=1024)
 def _ast_canonical(source: str) -> str:
     # ast.unparse normalizes whitespace and comments like ast.dump but, being
     # source text rather than the internal AST repr, stays stable across Python
@@ -237,15 +127,20 @@ def _strip_docstrings(node: ast.AST) -> None:
                 child.body = [ast.Pass()]
 
 
-def _is_stdlib_or_site_path(path: str) -> bool:
-    resolved = os.path.abspath(path)
+@lru_cache(maxsize=1)
+def _stdlib_and_site_prefixes() -> tuple[str, ...]:
     stdlib_path = os.path.abspath(os.path.dirname(os.__file__))
     site_paths = [os.path.abspath(p) for p in site.getsitepackages() if p]
     user_site = site.getusersitepackages()
     if user_site:
         site_paths.append(os.path.abspath(user_site))
-    excluded = [stdlib_path, *site_paths]
-    for prefix in excluded:
+    return (stdlib_path, *site_paths)
+
+
+@lru_cache(maxsize=4096)
+def _is_stdlib_or_site_path(path: str) -> bool:
+    resolved = os.path.abspath(path)
+    for prefix in _stdlib_and_site_prefixes():
         try:
             if os.path.commonpath([resolved, prefix]) == prefix:
                 return True
@@ -425,6 +320,17 @@ def object_state(obj: Any) -> dict[str, Any] | None:
     return state or None
 
 
+def _stable_item_reprs(items: Any, _visited: set[int]) -> list[str]:
+    # Set ordering must come from the items' stable serialized form; raw repr
+    # can embed memory addresses, which reorder across processes.
+    reprs: list[str] = []
+    for item in items:
+        sub = io.StringIO()
+        _stable_repr_to(sub, item, _visited)
+        reprs.append(sub.getvalue())
+    return reprs
+
+
 def _stable_repr_to(
     buf: io.StringIO, obj: Any, _visited: set[int] | None = None
 ) -> None:
@@ -456,12 +362,7 @@ def _stable_repr_to(
             return
         _visited.add(obj_id)
         buf.write("{")
-        first = True
-        for item in sorted(obj, key=repr):
-            if not first:
-                buf.write(", ")
-            first = False
-            _stable_repr_to(buf, item, _visited)
+        buf.write(", ".join(sorted(_stable_item_reprs(obj, _visited))))
         buf.write("}")
         _visited.discard(obj_id)
     elif isinstance(obj, frozenset):
@@ -471,12 +372,7 @@ def _stable_repr_to(
             return
         _visited.add(obj_id)
         buf.write("frozenset({")
-        first = True
-        for item in sorted(obj, key=repr):
-            if not first:
-                buf.write(", ")
-            first = False
-            _stable_repr_to(buf, item, _visited)
+        buf.write(", ".join(sorted(_stable_item_reprs(obj, _visited))))
         buf.write("})")
         _visited.discard(obj_id)
     elif isinstance(obj, dict):

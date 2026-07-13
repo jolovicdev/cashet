@@ -8,13 +8,14 @@ import pytest_asyncio
 
 from cashet.models import Commit, TaskDef, TaskStatus
 from cashet.redis_store import AsyncRedisStore
+from tests.helpers import redis_test_url
 
 pytestmark = pytest.mark.redis
 
 
 @pytest_asyncio.fixture
 async def async_redis_store() -> AsyncRedisStore:
-    store = AsyncRedisStore()
+    store = AsyncRedisStore(redis_test_url())
     await store._redis.flushdb()
     return store
 

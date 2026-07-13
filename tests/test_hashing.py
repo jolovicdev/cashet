@@ -343,6 +343,25 @@ class TestProgressiveHash:
         ref2 = client.submit(identity, {1: 2})
         assert ref1.hash != ref2.hash
 
+    def test_set_hash_ignores_item_repr_order(self) -> None:
+        reprs: dict[int, str] = {}
+
+        class SlottedVal:
+            __slots__ = ("val",)
+
+            def __init__(self, val: int) -> None:
+                self.val = val
+
+            def __repr__(self) -> str:
+                return reprs[id(self)]
+
+        a1, b1 = SlottedVal(1), SlottedVal(2)
+        a2, b2 = SlottedVal(1), SlottedVal(2)
+        reprs[id(a1)], reprs[id(b1)] = "0", "1"
+        reprs[id(a2)], reprs[id(b2)] = "1", "0"
+        assert hash_args({a1, b1}) == hash_args({a2, b2})
+        assert hash_args(frozenset({a1, b1})) == hash_args(frozenset({a2, b2}))
+
 
 class TestRecursiveStructures:
     def test_recursive_list_does_not_crash(self, client: Client) -> None:

@@ -6,9 +6,9 @@ from typing import Any
 from cashet._runner import BlockingAsyncRunner
 from cashet.adapters import SyncStoreAdapter
 from cashet.async_executor import AsyncLocalExecutor
-from cashet.hashing import Serializer
 from cashet.models import Commit, TaskDef
 from cashet.protocols import Store
+from cashet.serializers import Serializer
 
 
 class LocalExecutor:

@@ -8,13 +8,20 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
+from cashet._client_base import resolve_store_dir
 from cashet.client import Client
 
 console = Console()
 
 
-def _client() -> Client:
-    return Client()
+def _client(require_store: bool = True) -> Client:
+    ctx = click.get_current_context(silent=True)
+    store_dir_opt = ctx.obj if ctx is not None else None
+    store_dir = resolve_store_dir(store_dir_opt, None)
+    if require_store and not store_dir.exists():
+        console.print(f"[red]No cashet store found at {store_dir}.[/red]")
+        raise SystemExit(1)
+    return Client(store_dir=store_dir)
 
 
 def _parse_tags(tags: tuple[str, ...]) -> dict[str, str | None] | None:
@@ -35,9 +42,15 @@ def _parse_tags(tags: tuple[str, ...]) -> dict[str, str | None] | None:
 
 
 @click.group()
-def main() -> None:
+@click.option(
+    "--store-dir",
+    default=None,
+    help="Store directory (defaults to $CASHET_DIR or ./.cashet)",
+)
+@click.pass_context
+def main(ctx: click.Context, store_dir: str | None) -> None:
     """cashet — content-addressable compute cache with git semantics"""
-    pass
+    ctx.obj = store_dir
 
 
 @main.command("serve")
@@ -53,7 +66,7 @@ def serve_cmd(
     host: str, port: int, require_token: str | None, allow_remote_code: bool
 ) -> None:
     """Start the HTTP server"""
-    client = _client()
+    client = _client(require_store=False)
     try:
         client.serve(
             host=host,
@@ -355,7 +368,7 @@ def import_archive(path: str) -> None:
     """Import commits and blobs from a tar.gz archive"""
     import tarfile
 
-    client = _client()
+    client = _client(require_store=False)
     try:
         result = client.import_archive(path)
     except (OSError, tarfile.TarError, ValueError) as e:

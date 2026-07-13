@@ -351,6 +351,49 @@ class TestExportImport:
         assert client2.get(ref.commit_hash) == 3
 
 
+class TestStoreDirResolution:
+    def test_read_command_does_not_create_store(
+        self, cli_runner: CliRunner, tmp_path: Path
+    ) -> None:
+        missing = tmp_path / ".cashet"
+        result = cli_runner.invoke(main, ["log"], env={"CASHET_DIR": str(missing)})
+        assert result.exit_code == 1
+        assert "No cashet store found" in result.output
+        assert not missing.exists()
+
+    def test_store_dir_flag_overrides_default(
+        self, cli_runner: CliRunner, store_dir: Path
+    ) -> None:
+        client = Client(store_dir=store_dir)
+
+        def val() -> int:
+            return 7
+
+        client.submit(val)
+        result = cli_runner.invoke(main, ["--store-dir", str(store_dir), "log"])
+        assert result.exit_code == 0
+        assert "completed" in result.output
+
+    def test_import_creates_missing_store(
+        self, cli_runner: CliRunner, store_dir: Path, tmp_path: Path
+    ) -> None:
+        client = Client(store_dir=store_dir)
+
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        ref = client.submit(add, 1, 2)
+        archive = tmp_path / "export.tar.gz"
+        client.export(archive)
+
+        fresh = tmp_path / "fresh-store"
+        result = cli_runner.invoke(
+            main, ["--store-dir", str(fresh), "import", str(archive)]
+        )
+        assert result.exit_code == 0
+        assert Client(store_dir=fresh).get(ref.commit_hash) == 3
+
+
 class TestInvalidate:
     def test_invalidate_deletes_matching(self, cli_runner: CliRunner, store_dir: Path) -> None:
         client = Client(store_dir=store_dir)

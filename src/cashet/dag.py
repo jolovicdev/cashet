@@ -6,9 +6,10 @@ import time
 from datetime import UTC, datetime
 from typing import Any, Generic, TypeVar
 
-from cashet.hashing import Serializer, object_state
+from cashet.hashing import object_state
 from cashet.models import Commit, ObjectRef, TaskDef, TaskStatus
 from cashet.protocols import AsyncStore
+from cashet.serializers import Serializer
 
 T = TypeVar("T")
 
@@ -172,13 +173,6 @@ async def find_existing_commit(store: AsyncStore, task_def: TaskDef) -> Commit |
     if not task_def.cache:
         return None
     return await store.find_by_fingerprint(task_def.fingerprint)
-
-
-async def find_parent_hash(store: AsyncStore, task_def: TaskDef) -> str | None:
-    existing = await store.find_by_fingerprint(task_def.fingerprint)
-    if existing is not None:
-        return existing.hash
-    return None
 
 
 def compute_commit_hash(

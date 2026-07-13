@@ -9,6 +9,7 @@ import logging
 import time
 import types
 from collections.abc import Callable, Mapping
+from datetime import timedelta
 from typing import Any
 
 from starlette.applications import Starlette
@@ -19,6 +20,7 @@ from starlette.routing import Route
 
 from cashet.async_client import AsyncClient
 from cashet.client import Client
+from cashet.models import Commit, TaskError
 
 logger = logging.getLogger("cashet")
 
@@ -51,6 +53,16 @@ _DEFAULT_MAX_CONTENT_LENGTH = 500 * 1024 * 1024
 def _too_large_response(max_size: int) -> _CustomJSONResponse:
     return _CustomJSONResponse(
         {"error": f"request body exceeds {max_size} bytes"}, status_code=413
+    )
+
+
+def _task_failed_response(exc: TaskError) -> _CustomJSONResponse:
+    # A failing task is the caller's error, not a server bug: surface the final
+    # traceback line ("ExceptionType: message") but never server file paths.
+    lines = str(exc).strip().splitlines()
+    detail = lines[-1] if lines else "task failed"
+    return _CustomJSONResponse(
+        {"error": "task failed", "detail": detail}, status_code=422
     )
 
 
@@ -222,8 +234,121 @@ def _require_token(handler: Any, token: str | None) -> Any:
     return wrapper
 
 
-async def _async_submit(request: Request) -> JSONResponse:
-    client: AsyncClient = request.app.state.client
+def _submit_options(data: dict[str, Any]) -> dict[str, Any]:
+    # Keys match the underscore-prefixed keyword parameters of Client.submit
+    # and AsyncClient.submit, so the ops adapters can splat them straight in.
+    return {
+        "_cache": data.get("cache", True),
+        "_tags": data.get("tags", {}),
+        "_retries": data.get("retries", 0),
+        "_force": data.get("force", False),
+        "_timeout": data.get("timeout"),
+        "_ttl": data.get("ttl"),
+    }
+
+
+class _AsyncOps:
+    def __init__(self, client: AsyncClient) -> None:
+        self.client = client
+        self.serializer: Any = client.serializer
+
+    async def submit_and_load(
+        self,
+        func: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        options: dict[str, Any],
+    ) -> tuple[str, str, bytes]:
+        ref = await self.client.submit(func, *args, **options, **kwargs)
+        result = await ref.load()
+        return ref.commit_hash, ref.hash, self.serializer.dumps(result)
+
+    async def get_result(self, commit_hash: str) -> bytes:
+        return self.serializer.dumps(await self.client.get(commit_hash))
+
+    async def show(self, commit_hash: str) -> Commit | None:
+        return await self.client.show(commit_hash)
+
+    async def log(
+        self, func_name: str | None, limit: int, status: str | None
+    ) -> list[Commit]:
+        return await self.client.log(func_name=func_name, limit=limit, status=status)
+
+    async def stats(self) -> dict[str, int]:
+        return await self.client.stats()
+
+    async def gc(self, older_than: timedelta, max_size: int | None) -> int:
+        return await self.client.gc(older_than, max_size_bytes=max_size)
+
+
+class _SyncOps:
+    # Sync Client calls run in threads so they never block the event loop.
+    def __init__(self, client: Client) -> None:
+        self.client = client
+        self.serializer: Any = client.serializer
+
+    async def submit_and_load(
+        self,
+        func: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        options: dict[str, Any],
+    ) -> tuple[str, str, bytes]:
+        def run() -> tuple[str, str, bytes]:
+            ref = self.client.submit(func, *args, **options, **kwargs)
+            result = ref.load()
+            return ref.commit_hash, ref.hash, self.serializer.dumps(result)
+
+        return await asyncio.to_thread(run)
+
+    async def get_result(self, commit_hash: str) -> bytes:
+        return await asyncio.to_thread(
+            lambda: self.serializer.dumps(self.client.get(commit_hash))
+        )
+
+    async def show(self, commit_hash: str) -> Commit | None:
+        return await asyncio.to_thread(self.client.show, commit_hash)
+
+    async def log(
+        self, func_name: str | None, limit: int, status: str | None
+    ) -> list[Commit]:
+        return await asyncio.to_thread(
+            lambda: self.client.log(func_name=func_name, limit=limit, status=status)
+        )
+
+    async def stats(self) -> dict[str, int]:
+        return await asyncio.to_thread(self.client.stats)
+
+    async def gc(self, older_than: timedelta, max_size: int | None) -> int:
+        return await asyncio.to_thread(
+            lambda: self.client.gc(older_than, max_size_bytes=max_size)
+        )
+
+
+_ServerOps = _AsyncOps | _SyncOps
+
+
+def _log_request(request: Request, status_code: int, start: float) -> None:
+    logger.info(
+        "request method=%s path=%s status=%d duration_ms=%d",
+        request.method,
+        request.url.path,
+        status_code,
+        int((time.perf_counter() - start) * 1000),
+    )
+
+
+def _log_request_failed(request: Request, start: float) -> None:
+    logger.exception(
+        "request failed method=%s path=%s status=500 duration_ms=%d",
+        request.method,
+        request.url.path,
+        int((time.perf_counter() - start) * 1000),
+    )
+
+
+async def _submit(request: Request) -> JSONResponse:
+    ops: _ServerOps = request.app.state.ops
     data = await request.json()
     func, error = _resolve_func(
         data,
@@ -235,193 +360,87 @@ async def _async_submit(request: Request) -> JSONResponse:
     if func is None:
         return _CustomJSONResponse({"error": "task required"}, status_code=400)
 
-    serializer = client.serializer
     args, kwargs, error = _decode_call(
-        data, serializer, request.app.state.allow_remote_code
+        data, ops.serializer, request.app.state.allow_remote_code
     )
     if error is not None:
         return error
 
-    cache = data.get("cache", True)
-    tags = data.get("tags", {})
-    retries = data.get("retries", 0)
-    force = data.get("force", False)
-    timeout = data.get("timeout")
-    ttl = data.get("ttl")
-
+    options = _submit_options(data)
     start = time.perf_counter()
     try:
-        ref = await client.submit(
-            func,
-            *args,
-            _cache=cache,
-            _tags=tags,
-            _retries=retries,
-            _force=force,
-            _timeout=timeout,
-            _ttl=ttl,
-            **kwargs,
+        commit_hash, blob_hash, payload = await ops.submit_and_load(
+            func, args, kwargs, options
         )
-        result = await ref.load()
-        result_b64 = base64.b64encode(serializer.dumps(result)).decode()
-        duration = int((time.perf_counter() - start) * 1000)
-        logger.info(
-            "request method=%s path=%s status=%d duration_ms=%d",
-            request.method,
-            request.url.path,
-            200,
-            duration,
-        )
-        return _CustomJSONResponse(
-            {
-                "commit_hash": ref.commit_hash,
-                "blob_hash": ref.hash,
-                "result_b64": result_b64,
-            }
-        )
+    except TaskError as exc:
+        _log_request(request, 422, start)
+        return _task_failed_response(exc)
     except Exception:
-        duration = int((time.perf_counter() - start) * 1000)
-        logger.exception(
-            "request failed method=%s path=%s status=500 duration_ms=%d",
-            request.method,
-            request.url.path,
-            duration,
-        )
+        _log_request_failed(request, start)
         return _CustomJSONResponse({"error": "Internal server error"}, status_code=500)
+    _log_request(request, 200, start)
+    return _CustomJSONResponse(
+        {
+            "commit_hash": commit_hash,
+            "blob_hash": blob_hash,
+            "result_b64": base64.b64encode(payload).decode(),
+        }
+    )
 
 
-async def _async_result(request: Request) -> JSONResponse:
-    client: AsyncClient = request.app.state.client
+async def _result(request: Request) -> JSONResponse:
+    ops: _ServerOps = request.app.state.ops
     commit_hash = request.path_params["commit_hash"]
     start = time.perf_counter()
     try:
-        result = await client.get(commit_hash)
-        serializer = client.serializer
-        result_b64 = base64.b64encode(serializer.dumps(result)).decode()
-        duration = int((time.perf_counter() - start) * 1000)
-        logger.info(
-            "request method=%s path=%s status=%d duration_ms=%d",
-            request.method, request.url.path, 200, duration,
-        )
-        return _CustomJSONResponse({"result_b64": result_b64})
+        payload = await ops.get_result(commit_hash)
     except (KeyError, ValueError):
-        duration = int((time.perf_counter() - start) * 1000)
-        logger.info(
-            "request method=%s path=%s status=%d duration_ms=%d",
-            request.method, request.url.path, 404, duration,
-        )
+        _log_request(request, 404, start)
         return _CustomJSONResponse({"error": "not found"}, status_code=404)
     except Exception:
-        duration = int((time.perf_counter() - start) * 1000)
-        logger.exception(
-            "request failed method=%s path=%s status=500 duration_ms=%d",
-            request.method, request.url.path, duration,
-        )
+        _log_request_failed(request, start)
         return _CustomJSONResponse({"error": "Internal server error"}, status_code=500)
+    _log_request(request, 200, start)
+    return _CustomJSONResponse({"result_b64": base64.b64encode(payload).decode()})
 
 
-async def _async_commit(request: Request) -> JSONResponse:
-    client: AsyncClient = request.app.state.client
+async def _commit(request: Request) -> JSONResponse:
+    ops: _ServerOps = request.app.state.ops
     commit_hash = request.path_params["commit_hash"]
     start = time.perf_counter()
-    c = await client.show(commit_hash)
-    status_code = 200 if c is not None else 404
-    duration = int((time.perf_counter() - start) * 1000)
-    logger.info(
-        "request method=%s path=%s status=%d duration_ms=%d",
-        request.method, request.url.path, status_code, duration,
-    )
+    c = await ops.show(commit_hash)
+    _log_request(request, 200 if c is not None else 404, start)
     if c is None:
         return _CustomJSONResponse({"error": "not found"}, status_code=404)
     return _CustomJSONResponse(c.summary())
 
 
-async def _async_log(request: Request) -> JSONResponse:
-    client: AsyncClient = request.app.state.client
+async def _log(request: Request) -> JSONResponse:
+    ops: _ServerOps = request.app.state.ops
     func_name = request.query_params.get("func")
     limit = _query_int(request, "limit", 50)
     status = request.query_params.get("status")
     start = time.perf_counter()
-    commits = await client.log(func_name=func_name, limit=limit, status=status)
-    duration = int((time.perf_counter() - start) * 1000)
-    logger.info(
-        "request method=%s path=%s status=%d duration_ms=%d",
-        request.method, request.url.path, 200, duration,
-    )
+    commits = await ops.log(func_name, limit, status)
+    _log_request(request, 200, start)
     return _CustomJSONResponse([c.summary() for c in commits])
 
 
-async def _async_stats(request: Request) -> JSONResponse:
-    client: AsyncClient = request.app.state.client
+async def _stats(request: Request) -> JSONResponse:
+    ops: _ServerOps = request.app.state.ops
     start = time.perf_counter()
-    result = await client.stats()
-    duration = int((time.perf_counter() - start) * 1000)
-    logger.info(
-        "request method=%s path=%s status=%d duration_ms=%d",
-        request.method, request.url.path, 200, duration,
-    )
+    result = await ops.stats()
+    _log_request(request, 200, start)
     return _CustomJSONResponse(result)
 
 
-async def _async_gc(request: Request) -> JSONResponse:
-    from datetime import timedelta
-
-    client: AsyncClient = request.app.state.client
+async def _gc(request: Request) -> JSONResponse:
+    ops: _ServerOps = request.app.state.ops
     older_than_days, max_size = _gc_params(await _json_body(request))
     start = time.perf_counter()
-    deleted = await client.gc(timedelta(days=older_than_days), max_size_bytes=max_size)
-    duration = int((time.perf_counter() - start) * 1000)
-    logger.info(
-        "request method=%s path=%s status=%d duration_ms=%d",
-        request.method, request.url.path, 200, duration,
-    )
+    deleted = await ops.gc(timedelta(days=older_than_days), max_size)
+    _log_request(request, 200, start)
     return _CustomJSONResponse({"deleted": deleted})
-
-
-def create_async_app(
-    client: AsyncClient,
-    require_token: str | None = None,
-    *,
-    tasks: TaskRegistry | None = None,
-    allow_remote_code: bool = False,
-    max_content_length: int = _DEFAULT_MAX_CONTENT_LENGTH,
-) -> Starlette:
-    _validate_remote_code_options(allow_remote_code, require_token)
-    routes = [
-        Route(
-            "/submit",
-            _require_token(_safe_handler(_async_submit), require_token),
-            methods=["POST"],
-        ),
-        Route(
-            "/result/{commit_hash}",
-            _require_token(_safe_handler(_async_result), require_token),
-            methods=["GET"],
-        ),
-        Route(
-            "/commit/{commit_hash}",
-            _require_token(_safe_handler(_async_commit), require_token),
-            methods=["GET"],
-        ),
-        Route("/log", _require_token(_safe_handler(_async_log), require_token), methods=["GET"]),
-        Route(
-            "/stats",
-            _require_token(_safe_handler(_async_stats), require_token),
-            methods=["GET"],
-        ),
-        Route("/gc", _require_token(_safe_handler(_async_gc), require_token), methods=["POST"]),
-    ]
-
-    app = Starlette(
-        routes=routes,
-        middleware=[Middleware(_SizeLimitMiddleware)],
-    )
-    app.state.client = client
-    app.state.tasks = _server_tasks(client, tasks)
-    app.state.allow_remote_code = allow_remote_code
-    app.state.max_content_length = max_content_length
-    app.state.require_token = require_token
-    return app
 
 
 class _SizeLimitMiddleware:
@@ -492,185 +511,12 @@ class _SizeLimitMiddleware:
         await self.app(scope, replay_receive, send)
 
 
-# Sync handlers run sync Client operations in threads so they don't block the event loop
-
-
-async def _submit(request: Request) -> JSONResponse:
-    client: Client = request.app.state.client
-    data = await request.json()
-    func, error = _resolve_func(
-        data,
-        request.app.state.tasks,
-        request.app.state.allow_remote_code,
-    )
-    if error is not None:
-        return error
-    if func is None:
-        return _CustomJSONResponse({"error": "task required"}, status_code=400)
-
-    serializer = client.serializer
-    args, kwargs, error = _decode_call(
-        data, serializer, request.app.state.allow_remote_code
-    )
-    if error is not None:
-        return error
-
-    cache = data.get("cache", True)
-    tags = data.get("tags", {})
-    retries = data.get("retries", 0)
-    force = data.get("force", False)
-    timeout = data.get("timeout")
-    ttl = data.get("ttl")
-
-    start = time.perf_counter()
-
-    def _run() -> JSONResponse:
-        try:
-            ref = client.submit(
-                func,
-                *args,
-                _cache=cache,
-                _tags=tags,
-                _retries=retries,
-                _force=force,
-                _timeout=timeout,
-                _ttl=ttl,
-                **kwargs,
-            )
-            result = ref.load()
-            result_b64 = base64.b64encode(serializer.dumps(result)).decode()
-            return _CustomJSONResponse(
-                {
-                    "commit_hash": ref.commit_hash,
-                    "blob_hash": ref.hash,
-                    "result_b64": result_b64,
-                }
-            )
-        except Exception:
-            logger.exception(
-                "request failed method=POST path=/submit status=500",
-            )
-            return _CustomJSONResponse({"error": "Internal server error"}, status_code=500)
-
-    response = await asyncio.to_thread(_run)
-    duration = int((time.perf_counter() - start) * 1000)
-    logger.info(
-        "request method=%s path=%s status=%d duration_ms=%d",
-        request.method, request.url.path, response.status_code, duration,
-    )
-    return response
-
-
-async def _result(request: Request) -> JSONResponse:
-    client: Client = request.app.state.client
-    commit_hash = request.path_params["commit_hash"]
-    start = time.perf_counter()
-
-    def _run() -> JSONResponse:
-        try:
-            result = client.get(commit_hash)
-            serializer = client.serializer
-            result_b64 = base64.b64encode(serializer.dumps(result)).decode()
-            return _CustomJSONResponse({"result_b64": result_b64})
-        except (KeyError, ValueError):
-            return _CustomJSONResponse({"error": "not found"}, status_code=404)
-        except Exception:
-            logger.exception(
-                "request failed method=%s path=%s status=500",
-                request.method, request.url.path,
-            )
-            return _CustomJSONResponse({"error": "Internal server error"}, status_code=500)
-
-    response = await asyncio.to_thread(_run)
-    duration = int((time.perf_counter() - start) * 1000)
-    logger.info(
-        "request method=%s path=%s status=%d duration_ms=%d",
-        request.method, request.url.path, response.status_code, duration,
-    )
-    return response
-
-
-async def _commit(request: Request) -> JSONResponse:
-    client: Client = request.app.state.client
-    commit_hash = request.path_params["commit_hash"]
-    start = time.perf_counter()
-
-    def _run() -> JSONResponse:
-        c = client.show(commit_hash)
-        if c is None:
-            return _CustomJSONResponse({"error": "not found"}, status_code=404)
-        return _CustomJSONResponse(c.summary())
-
-    response = await asyncio.to_thread(_run)
-    duration = int((time.perf_counter() - start) * 1000)
-    logger.info(
-        "request method=%s path=%s status=%d duration_ms=%d",
-        request.method, request.url.path, response.status_code, duration,
-    )
-    return response
-
-
-async def _log(request: Request) -> JSONResponse:
-    client: Client = request.app.state.client
-    func_name = request.query_params.get("func")
-    limit = _query_int(request, "limit", 50)
-    status = request.query_params.get("status")
-    start = time.perf_counter()
-
-    def _run() -> JSONResponse:
-        commits = client.log(func_name=func_name, limit=limit, status=status)
-        return _CustomJSONResponse([c.summary() for c in commits])
-
-    response = await asyncio.to_thread(_run)
-    duration = int((time.perf_counter() - start) * 1000)
-    logger.info(
-        "request method=%s path=%s status=%d duration_ms=%d",
-        request.method, request.url.path, response.status_code, duration,
-    )
-    return response
-
-
-async def _stats(request: Request) -> JSONResponse:
-    client: Client = request.app.state.client
-    start = time.perf_counter()
-    response = await asyncio.to_thread(
-        lambda: _CustomJSONResponse(client.stats())
-    )
-    duration = int((time.perf_counter() - start) * 1000)
-    logger.info(
-        "request method=%s path=%s status=%d duration_ms=%d",
-        request.method, request.url.path, response.status_code, duration,
-    )
-    return response
-
-
-async def _gc(request: Request) -> JSONResponse:
-    from datetime import timedelta
-
-    client: Client = request.app.state.client
-    older_than_days, max_size = _gc_params(await _json_body(request))
-    start = time.perf_counter()
-
-    def _run() -> JSONResponse:
-        deleted = client.gc(timedelta(days=older_than_days), max_size_bytes=max_size)
-        return _CustomJSONResponse({"deleted": deleted})
-
-    response = await asyncio.to_thread(_run)
-    duration = int((time.perf_counter() - start) * 1000)
-    logger.info(
-        "request method=%s path=%s status=%d duration_ms=%d",
-        request.method, request.url.path, response.status_code, duration,
-    )
-    return response
-
-
-def create_app(
-    client: Client,
-    require_token: str | None = None,
-    *,
-    tasks: TaskRegistry | None = None,
-    allow_remote_code: bool = False,
-    max_content_length: int = _DEFAULT_MAX_CONTENT_LENGTH,
+def _build_app(
+    ops: _ServerOps,
+    require_token: str | None,
+    tasks: TaskRegistry | None,
+    allow_remote_code: bool,
+    max_content_length: int,
 ) -> Starlette:
     _validate_remote_code_options(allow_remote_code, require_token)
     routes = [
@@ -701,9 +547,36 @@ def create_app(
         routes=routes,
         middleware=[Middleware(_SizeLimitMiddleware)],
     )
-    app.state.client = client
-    app.state.tasks = _server_tasks(client, tasks)
+    app.state.client = ops.client
+    app.state.ops = ops
+    app.state.tasks = _server_tasks(ops.client, tasks)
     app.state.allow_remote_code = allow_remote_code
     app.state.max_content_length = max_content_length
     app.state.require_token = require_token
     return app
+
+
+def create_app(
+    client: Client,
+    require_token: str | None = None,
+    *,
+    tasks: TaskRegistry | None = None,
+    allow_remote_code: bool = False,
+    max_content_length: int = _DEFAULT_MAX_CONTENT_LENGTH,
+) -> Starlette:
+    return _build_app(
+        _SyncOps(client), require_token, tasks, allow_remote_code, max_content_length
+    )
+
+
+def create_async_app(
+    client: AsyncClient,
+    require_token: str | None = None,
+    *,
+    tasks: TaskRegistry | None = None,
+    allow_remote_code: bool = False,
+    max_content_length: int = _DEFAULT_MAX_CONTENT_LENGTH,
+) -> Starlette:
+    return _build_app(
+        _AsyncOps(client), require_token, tasks, allow_remote_code, max_content_length
+    )

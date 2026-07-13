@@ -7,9 +7,10 @@ from typing import Any
 
 from cashet._client_base import resolve_task_config
 from cashet.dag import AsyncResultRef, TaskRef
-from cashet.hashing import Serializer, build_task_def
+from cashet.hashing import build_task_def
 from cashet.models import TaskError
 from cashet.protocols import AsyncStore
+from cashet.serializers import Serializer
 
 BatchKey = int | str
 NormalizedTask = tuple[

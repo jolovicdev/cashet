@@ -8,15 +8,17 @@ from typing import Any
 import pytest
 
 from cashet import Client
+from cashet._redis_codec import access_key, commit_key, fp_key
 from cashet.models import Commit, TaskDef, TaskStatus
-from cashet.redis_store import RedisStore, _access_key, _commit_key
+from cashet.redis_store import RedisStore
+from tests.helpers import make_commit, make_task_def, redis_test_url
 
 pytestmark = pytest.mark.redis
 
 
 @pytest.fixture
 def redis_store() -> RedisStore:
-    store = RedisStore()
+    store = RedisStore(redis_test_url())
     store._flushdb()
     return store
 
@@ -63,6 +65,56 @@ class TestRedisStoreProtocol:
         assert found is not None
         assert found.hash == commit.hash
 
+    def test_find_by_fingerprint_returns_newest_commit(self, redis_store: RedisStore) -> None:
+        task_def = make_task_def()
+        older = make_commit("f" * 64, task_def, hours_ago=2)
+        newer = make_commit("0" * 64, task_def, hours_ago=1)
+        redis_store.put_commit(older)
+        redis_store.put_commit(newer)
+        found = redis_store.find_by_fingerprint(task_def.fingerprint)
+        assert found is not None
+        assert found.hash == newer.hash
+
+    def test_find_by_fingerprint_skips_expired_newer_commit(
+        self, redis_store: RedisStore
+    ) -> None:
+        task_def = make_task_def()
+        older = make_commit("f" * 64, task_def, hours_ago=2)
+        newer = make_commit(
+            "0" * 64,
+            task_def,
+            hours_ago=1,
+            expires_at=datetime.now(UTC) - timedelta(minutes=5),
+        )
+        redis_store.put_commit(older)
+        redis_store.put_commit(newer)
+        found = redis_store.find_by_fingerprint(task_def.fingerprint)
+        assert found is not None
+        assert found.hash == older.hash
+
+    def test_find_by_fingerprint_heals_legacy_expiry_scores(
+        self, redis_store: RedisStore
+    ) -> None:
+        task_def = make_task_def()
+        older = make_commit("f" * 64, task_def, hours_ago=2)
+        newer = make_commit("0" * 64, task_def, hours_ago=1)
+        redis_store.put_commit(older)
+        redis_store.put_commit(newer)
+        redis_client = redis_store._async_store._redis  # pyright: ignore[reportPrivateUsage]
+        redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+            redis_client.zadd(
+                fp_key(task_def.fingerprint),
+                {older.hash: float("inf"), newer.hash: float("inf")},
+            )
+        )
+        found = redis_store.find_by_fingerprint(task_def.fingerprint)
+        assert found is not None
+        assert found.hash == newer.hash
+        healed_score = redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+            redis_client.zscore(fp_key(task_def.fingerprint), newer.hash)
+        )
+        assert healed_score == pytest.approx(newer.created_at.timestamp())
+
     def test_cached_put_commit_does_not_move_access_score_backwards(
         self, redis_store: RedisStore
     ) -> None:
@@ -81,17 +133,17 @@ class TestRedisStoreProtocol:
         )
         redis_store.put_commit(commit)
         old_score = redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
-            redis_store._async_store._redis.zscore(_access_key(), commit.hash)  # pyright: ignore[reportPrivateUsage]
+            redis_store._async_store._redis.zscore(access_key(), commit.hash)  # pyright: ignore[reportPrivateUsage]
         )
         found = redis_store.find_by_fingerprint(task_def.fingerprint)
         assert found is not None
         touched_score = redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
-            redis_store._async_store._redis.zscore(_access_key(), commit.hash)  # pyright: ignore[reportPrivateUsage]
+            redis_store._async_store._redis.zscore(access_key(), commit.hash)  # pyright: ignore[reportPrivateUsage]
         )
         found.status = TaskStatus.CACHED
         redis_store.put_commit(found)
         final_score = redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
-            redis_store._async_store._redis.zscore(_access_key(), commit.hash)  # pyright: ignore[reportPrivateUsage]
+            redis_store._async_store._redis.zscore(access_key(), commit.hash)  # pyright: ignore[reportPrivateUsage]
         )
         assert old_score is not None
         assert touched_score is not None
@@ -310,6 +362,37 @@ class TestRedisStoreProtocol:
         assert deleted == 1
         assert redis_store.get_commit("c" * 64) is None
 
+    def test_evict_removes_ttl_expired_commits(self, redis_store: RedisStore) -> None:
+        expired = make_commit(
+            "c" * 64,
+            make_task_def(),
+            hours_ago=2,
+            expires_at=datetime.now(UTC) - timedelta(hours=1),
+        )
+        fresh = make_commit("d" * 64, make_task_def(args_hash="e" * 64))
+        redis_store.put_commit(expired)
+        redis_store.put_commit(fresh)
+        deleted = redis_store.evict(datetime.now(UTC) - timedelta(days=30))
+        assert deleted == 1
+        assert redis_store.get_commit("c" * 64) is None
+        assert redis_store.get_commit("d" * 64) is not None
+
+    def test_evict_spares_running_commit_with_expired_ttl(
+        self, redis_store: RedisStore
+    ) -> None:
+        running = make_commit(
+            "c" * 64,
+            make_task_def(),
+            hours_ago=2,
+            expires_at=datetime.now(UTC) - timedelta(hours=1),
+            status=TaskStatus.RUNNING,
+        )
+        redis_store.put_commit(running)
+        assert redis_store.evict(datetime.now(UTC) - timedelta(days=30)) == 0
+        fetched = redis_store.get_commit("c" * 64)
+        assert fetched is not None
+        assert fetched.status is TaskStatus.RUNNING
+
     def test_evict_backfills_partial_last_access_index(self, redis_store: RedisStore) -> None:
         old = datetime.now(UTC) - timedelta(days=10)
         hashes = ["c" * 64, "d" * 64]
@@ -331,21 +414,21 @@ class TestRedisStoreProtocol:
             )
             redis_store.put_commit(commit)
             raw = redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
-                redis_store._async_store._redis.get(_commit_key(h))  # pyright: ignore[reportPrivateUsage]
+                redis_store._async_store._redis.get(commit_key(h))  # pyright: ignore[reportPrivateUsage]
             )
             data = json.loads(raw)
             data["last_accessed_at"] = old.isoformat()
             redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
                 redis_store._async_store._redis.set(  # pyright: ignore[reportPrivateUsage]
-                    _commit_key(h), json.dumps(data, separators=(",", ":")).encode()
+                    commit_key(h), json.dumps(data, separators=(",", ":")).encode()
                 )
             )
         redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
-            redis_store._async_store._redis.zrem(_access_key(), hashes[0])  # pyright: ignore[reportPrivateUsage]
+            redis_store._async_store._redis.zrem(access_key(), hashes[0])  # pyright: ignore[reportPrivateUsage]
         )
         redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
             redis_store._async_store._redis.zadd(  # pyright: ignore[reportPrivateUsage]
-                _access_key(), {hashes[1]: old.timestamp()}
+                access_key(), {hashes[1]: old.timestamp()}
             )
         )
 
@@ -598,9 +681,7 @@ class TestRedisStoreWithClient:
     def test_delete_does_not_drop_blob_when_ref_counter_missing(
         self, redis_store: RedisStore
     ) -> None:
-        import redis as _redis
-
-        from cashet.redis_store import _blob_ref_key
+        from cashet._redis_codec import blob_ref_key
 
         shared = redis_store.put_blob(b"shared-payload")
         for h, fh in (("a" * 64, "1" * 64), ("b" * 64, "2" * 64)):
@@ -615,8 +696,12 @@ class TestRedisStoreWithClient:
                     status=TaskStatus.COMPLETED,
                 )
             )
-        # Simulate a lost/inconsistent ref counter for the shared blob.
-        _redis.Redis().delete(_blob_ref_key(shared.hash))
+        # Simulate a lost/inconsistent ref counter for the shared blob, on the
+        # same database the store under test uses.
+        redis_client = redis_store._async_store._redis  # pyright: ignore[reportPrivateUsage]
+        redis_store._runner.call(  # pyright: ignore[reportPrivateUsage]
+            redis_client.delete(blob_ref_key(shared.hash))
+        )
 
         redis_store.delete_commit("a" * 64)
 

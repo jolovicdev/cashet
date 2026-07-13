@@ -9,9 +9,11 @@ import pytest
 
 from cashet import Client, TaskError
 from cashet.executor import LocalExecutor
-from cashet.hashing import PickleSerializer, build_task_def
+from cashet.hashing import build_task_def
 from cashet.models import Commit, ObjectRef, StorageTier, TaskStatus
+from cashet.serializers import PickleSerializer
 from cashet.store import SQLiteStore
+from tests.helpers import make_commit, make_task_def
 
 
 class TestProcessSafety:
@@ -336,6 +338,46 @@ class TestProcessSafety:
 
 
 class TestStoreOperations:
+    def test_access_bump_throttled_to_granularity(self, store_dir: Path) -> None:
+        from freezegun import freeze_time
+
+        store = SQLiteStore(store_dir)
+        task_def = make_task_def()
+
+        def last_accessed() -> str:
+            row = store._connect().execute(  # pyright: ignore[reportPrivateUsage]
+                "SELECT last_accessed_at FROM commits WHERE hash = ?", ("c" * 64,)
+            ).fetchone()
+            return row[0]
+
+        with freeze_time("2026-01-01 00:00:00") as frozen:
+            store.put_commit(make_commit("c" * 64, task_def))
+            initial = last_accessed()
+
+            frozen.tick(60)
+            assert store.find_by_fingerprint(task_def.fingerprint) is not None
+            assert last_accessed() == initial
+
+            frozen.tick(7200)
+            assert store.find_by_fingerprint(task_def.fingerprint) is not None
+            assert last_accessed() > initial
+
+    def test_connection_uses_normal_synchronous(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        mode = store._connect().execute("PRAGMA synchronous").fetchone()[0]  # pyright: ignore[reportPrivateUsage]
+        assert mode == 1
+
+    def test_find_by_fingerprint_returns_newest_commit(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        task_def = make_task_def()
+        older = make_commit("f" * 64, task_def, hours_ago=2)
+        newer = make_commit("0" * 64, task_def, hours_ago=1)
+        store.put_commit(older)
+        store.put_commit(newer)
+        found = store.find_by_fingerprint(task_def.fingerprint)
+        assert found is not None
+        assert found.hash == newer.hash
+
     def test_log(self, client: Client) -> None:
         def f(x: int) -> int:
             return x
@@ -345,6 +387,19 @@ class TestStoreOperations:
         client.submit(f, 3)
         log = client.log()
         assert len(log) == 3
+
+    def test_fingerprint_lock_registry_is_striped(self, client: Client) -> None:
+        from cashet._locks import SQLITE_LOCKS
+
+        def f(x: int) -> int:
+            return x
+
+        for i in range(5):
+            client.submit(f, i)
+        root = str(client.store.root)
+        names = [Path(p).name for p in SQLITE_LOCKS if p.startswith(root)]
+        assert names
+        assert all(len(name) == len(".lock-xx") for name in names)
 
     def test_retries_roundtrip(self, client: Client) -> None:
         def stable() -> int:
@@ -570,6 +625,68 @@ class TestBlobIntegrity:
         with pytest.raises(ValueError, match="integrity check failed"):
             store.get_blob(fake_ref)
 
+    def test_corrupt_blob_self_heals_on_rewrite(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        data = b"partially written payload" * 100
+        ref = store.put_blob(data)
+        obj_path = store.objects_dir / ref.hash[:2] / ref.hash[2:]
+        obj_path.write_bytes(b"truncated junk")
+        with pytest.raises(ValueError, match="integrity check failed"):
+            store.get_blob(ref)
+        assert not obj_path.exists()
+        healed = store.put_blob(data)
+        assert healed.hash == ref.hash
+        assert store.get_blob(healed) == data
+
+    def test_put_blob_leaves_no_temp_files(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        store.put_blob(b"z" * 5000)
+        leftovers = list(store.objects_dir.rglob("*.tmp"))
+        assert leftovers == []
+
+    def test_put_blob_cleans_temp_file_on_failed_write(
+        self, store_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import cashet._sqlite_core as core_mod
+
+        store = SQLiteStore(store_dir)
+
+        def boom(src: object, dst: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(core_mod.os, "replace", boom)
+        with pytest.raises(OSError, match="disk full"):
+            store.put_blob(b"z" * 5000)
+        assert list(store.objects_dir.rglob("*.tmp")) == []
+
+    def test_stats_ignores_leftover_temp_files(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        ref = store.put_blob(b"z" * 5000)
+        before = store.stats()
+        orphan = store.objects_dir / ref.hash[:2] / "deadbeef.1.2.tmp"
+        orphan.write_bytes(b"crash debris")
+        after = store.stats()
+        assert after["blob_objects"] == before["blob_objects"]
+        assert after["blob_bytes"] == before["blob_bytes"]
+
+    def test_evict_sweeps_stale_temp_files(self, store_dir: Path) -> None:
+        import os
+        import time
+
+        store = SQLiteStore(store_dir)
+        store.put_blob(b"z" * 5000)
+        prefix_dir = next(p for p in store.objects_dir.iterdir() if p.is_dir())
+        stale = prefix_dir / "deadbeef.1.2.tmp"
+        stale.write_bytes(b"crash debris")
+        old = time.time() - 7200
+        os.utime(stale, (old, old))
+        fresh = prefix_dir / "cafebabe.3.4.tmp"
+        fresh.write_bytes(b"in-flight write")
+
+        store.evict(datetime.now(UTC) - timedelta(days=30))
+        assert not stale.exists()
+        assert fresh.exists()
+
 
 class TestInlineStorage:
     def test_small_blob_uses_inline_tier(self, store_dir: Path) -> None:
@@ -624,11 +741,11 @@ class TestInlineStorage:
         assert store.blob_exists(ref.hash) is False
 
     def test_find_by_fingerprint_survives_locked_access_bump(self, tmp_path: Path) -> None:
+        from cashet._sqlite_core import SQLiteStoreCore
         from cashet.models import Commit, TaskDef, TaskStatus
-        from cashet.store import _SQLiteStoreCore
 
         root = tmp_path / ".cashet"
-        core = _SQLiteStoreCore(root)
+        core = SQLiteStoreCore(root)
         task_def = TaskDef(
             func_hash="a", func_name="f", func_source="", args_hash="b", args_snapshot=b""
         )
@@ -656,11 +773,11 @@ class TestInlineStorage:
     def test_evict_survives_vacuum_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        from cashet._sqlite_core import SQLiteStoreCore
         from cashet.models import Commit, TaskDef, TaskStatus
-        from cashet.store import _SQLiteStoreCore
 
         root = tmp_path / ".cashet"
-        core = _SQLiteStoreCore(root)
+        core = SQLiteStoreCore(root)
         task_def = TaskDef(
             func_hash="a", func_name="f", func_source="", args_hash="b", args_snapshot=b""
         )
@@ -722,6 +839,38 @@ class TestGarbageCollection:
         deleted = client.gc(timedelta(days=365))
         assert deleted == 0
         assert client.stats()["total_commits"] == 1
+
+    def test_gc_spares_running_commit_with_expired_ttl(self, store_dir: Path) -> None:
+        store = SQLiteStore(store_dir)
+        running = make_commit(
+            "c" * 64,
+            make_task_def(),
+            hours_ago=2,
+            expires_at=datetime.now(UTC) - timedelta(hours=1),
+            status=TaskStatus.RUNNING,
+        )
+        store.put_commit(running)
+        assert store.evict(datetime.now(UTC) - timedelta(days=30)) == 0
+        fetched = store.get_commit("c" * 64)
+        assert fetched is not None
+        assert fetched.status is TaskStatus.RUNNING
+
+    def test_gc_removes_ttl_expired_commits(self, client: Client) -> None:
+        from freezegun import freeze_time
+
+        def make_val(x: int) -> int:
+            return x
+
+        with freeze_time("2026-01-01 00:00:00") as frozen:
+            client.submit(make_val, 1, _ttl=60)
+            client.submit(make_val, 2)
+            assert client.stats()["total_commits"] == 2
+
+            frozen.tick(3600)
+            deleted = client.gc(timedelta(days=30))
+            assert deleted == 1
+            assert client.stats()["total_commits"] == 1
+            assert client.log()[0].expires_at is None
 
     def test_gc_default_30_days(self, client: Client) -> None:
         def make_val(x: int) -> int:
@@ -1383,7 +1532,7 @@ class TestMigrations:
         conn.close()
 
     def test_migration_from_base_schema(self, tmp_path: Path) -> None:
-        from cashet.store import _SQLiteStoreCore
+        from cashet._sqlite_core import SQLiteStoreCore
 
         root = tmp_path / ".cashet"
         root.mkdir()
@@ -1392,7 +1541,7 @@ class TestMigrations:
 
         self._build_base_db(str(db_path))
 
-        core = _SQLiteStoreCore(root)
+        core = SQLiteStoreCore(root)
         try:
             col_names = [
                 r[1]
@@ -1413,7 +1562,7 @@ class TestMigrations:
             core.close()
 
     def test_migration_idempotent(self, tmp_path: Path) -> None:
-        from cashet.store import _SQLiteStoreCore
+        from cashet._sqlite_core import SQLiteStoreCore
 
         root = tmp_path / ".cashet"
         root.mkdir()
@@ -1422,10 +1571,10 @@ class TestMigrations:
 
         self._build_base_db(str(db_path))
 
-        core1 = _SQLiteStoreCore(root)
+        core1 = SQLiteStoreCore(root)
         core1.close()
 
-        core2 = _SQLiteStoreCore(root)
+        core2 = SQLiteStoreCore(root)
         try:
             col_names = [
                 r[1]
@@ -1439,7 +1588,7 @@ class TestMigrations:
             core2.close()
 
     def test_operations_after_migration(self, tmp_path: Path) -> None:
-        from cashet.store import _SQLiteStoreCore
+        from cashet._sqlite_core import SQLiteStoreCore
 
         root = tmp_path / ".cashet"
         root.mkdir()
@@ -1448,7 +1597,7 @@ class TestMigrations:
 
         self._build_base_db(str(db_path))
 
-        core = _SQLiteStoreCore(root)
+        core = SQLiteStoreCore(root)
         try:
             from cashet.dag import build_commit, resolve_input_refs
             from cashet.hashing import build_task_def
@@ -1478,7 +1627,7 @@ class TestMigrations:
             core.close()
 
     def test_partial_migration_missing_retries_only(self, tmp_path: Path) -> None:
-        from cashet.store import _SQLiteStoreCore
+        from cashet._sqlite_core import SQLiteStoreCore
 
         root = tmp_path / ".cashet"
         root.mkdir()
@@ -1496,7 +1645,7 @@ class TestMigrations:
         )
         pre_conn.close()
 
-        core = _SQLiteStoreCore(root)
+        core = SQLiteStoreCore(root)
         try:
             col_names = [
                 r[1]

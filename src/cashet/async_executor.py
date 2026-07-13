@@ -14,12 +14,11 @@ from typing import Any
 from cashet.dag import (
     build_commit,
     find_existing_commit,
-    find_parent_hash,
     resolve_input_refs,
 )
-from cashet.hashing import Serializer
 from cashet.models import Commit, ObjectRef, TaskDef, TaskStatus
 from cashet.protocols import AsyncStore
+from cashet.serializers import Serializer
 
 _DEFAULT_RUNNING_TTL = timedelta(seconds=300)
 _lock_cache: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
@@ -103,28 +102,28 @@ class AsyncLocalExecutor:
     ) -> tuple[Commit, bool]:
         fp = task_def.fingerprint
         func_name = task_def.func_name
+        # Completed commits are immutable, so a hit needs no cross-process lock
+        # and no write; the claim loop below re-checks under the lock on a miss.
         if not task_def.force:
-            async with _async_store_lock(store, fp):
-                existing = await find_existing_commit(store, task_def)
-                if existing is not None:
-                    existing.status = TaskStatus.CACHED
-                    await store.put_commit(existing)
-                    logger.info(
-                        "task cached fingerprint=%s func=%s commit=%s",
-                        fp,
-                        func_name,
-                        existing.hash[:12],
-                    )
-                    return existing, True
+            existing = await find_existing_commit(store, task_def)
+            if existing is not None:
+                existing.status = TaskStatus.CACHED
+                logger.info(
+                    "task cached fingerprint=%s func=%s commit=%s",
+                    fp,
+                    func_name,
+                    existing.hash[:12],
+                )
+                return existing, True
 
         while True:
             async with _async_store_lock(store, fp):
-                if not task_def.force:
-                    existing = await find_existing_commit(store, task_def)
-                    if existing is not None:
-                        existing.status = TaskStatus.CACHED
-                        await store.put_commit(existing)
-                        return existing, True
+                # One lookup serves both purposes: it is the cached result when
+                # allowed to reuse it, and the parent for the new claim otherwise.
+                latest = await store.find_by_fingerprint(fp)
+                if task_def.cache and not task_def.force and latest is not None:
+                    latest.status = TaskStatus.CACHED
+                    return latest, True
 
                 claim = await store.find_running_by_fingerprint(task_def.fingerprint)
                 if claim is not None:
@@ -151,8 +150,11 @@ class AsyncLocalExecutor:
                         break
                 else:
                     input_refs = resolve_input_refs(args, kwargs)
-                    parent_hash = await find_parent_hash(store, task_def)
-                    claim = build_commit(task_def, input_refs, parent_hash=parent_hash)
+                    claim = build_commit(
+                        task_def,
+                        input_refs,
+                        parent_hash=latest.hash if latest else None,
+                    )
                     claim.status = TaskStatus.RUNNING
                     await store.put_commit(claim)
                     logger.debug(
@@ -205,19 +207,34 @@ class AsyncLocalExecutor:
 
         async def _heartbeat() -> None:
             interval = self._running_ttl.total_seconds() / 2
+            # A failed renewal leaves the claim halfway to stale; waiting a full
+            # interval would retry exactly at the staleness boundary, where any
+            # delay lets another worker reclaim a live task. Retry fast instead.
+            retry_interval = interval / 4
+            wait = interval
             while True:
                 try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                    await asyncio.wait_for(stop_event.wait(), timeout=wait)
                     break
                 except TimeoutError:
                     pass
                 if commit.status != TaskStatus.RUNNING:
                     break
-                async with _async_store_lock(store, commit.task_def.fingerprint):
-                    if commit.status != TaskStatus.RUNNING:
-                        break
-                    commit.claimed_at = datetime.now(UTC)
-                    await store.put_commit(commit)
+                try:
+                    async with _async_store_lock(store, commit.task_def.fingerprint):
+                        if commit.status != TaskStatus.RUNNING:
+                            break
+                        commit.claimed_at = datetime.now(UTC)
+                        await store.put_commit(commit)
+                    wait = interval
+                except Exception:
+                    wait = retry_interval
+                    logger.warning(
+                        "heartbeat renewal failed fingerprint=%s commit=%s",
+                        commit.task_def.fingerprint,
+                        commit.hash[:12],
+                        exc_info=True,
+                    )
 
         heartbeat_task = asyncio.create_task(_heartbeat())
 
@@ -286,7 +303,24 @@ class AsyncLocalExecutor:
                     commit.error,
                 )
             stop_event.set()
-            await asyncio.wait_for(heartbeat_task, timeout=self._running_ttl.total_seconds() * 2)
+            # The task's outcome is already decided; a misbehaving heartbeat must
+            # not raise past this point and destroy the result.
+            try:
+                await asyncio.wait_for(
+                    heartbeat_task, timeout=self._running_ttl.total_seconds() * 2
+                )
+            except TimeoutError:
+                logger.warning(
+                    "heartbeat did not stop in time fingerprint=%s commit=%s",
+                    commit.task_def.fingerprint,
+                    commit.hash[:12],
+                )
+            except Exception:
+                logger.exception(
+                    "heartbeat task failed fingerprint=%s commit=%s",
+                    commit.task_def.fingerprint,
+                    commit.hash[:12],
+                )
 
         return commit
 

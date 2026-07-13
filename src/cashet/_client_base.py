@@ -6,9 +6,9 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from cashet.hashing import Serializer
 from cashet.models import Commit, TaskStatus
 from cashet.protocols import AsyncStore
+from cashet.serializers import Serializer
 
 _DEFAULT_STORE_DIR = ".cashet"
 _CASHET_DIR_ENV = "CASHET_DIR"
